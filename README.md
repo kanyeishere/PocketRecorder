@@ -74,3 +74,13 @@ FFXIV_yyyyMMdd_HHmmss.mp4
 - 当前插件面向 Windows 环境，依赖 Dalamud API 15。
 - 首次使用自动 FFmpeg 下载时需要网络访问；也可以在设置窗口中填写已有的 `ffmpeg.exe` 路径。
 - 录制质量和性能取决于分辨率、帧率、码率和本机编码器能力。若硬件编码不可用，可切换到兼容模式。
+
+## 📄 许可 | License
+
+MIT
+
+---
+
+<p align="center">
+  <sub>Made with ❤️ by Wotou · <a href="https://github.com/kanyeishere/PocketStation">GitHub</a></sub>
+</p>
