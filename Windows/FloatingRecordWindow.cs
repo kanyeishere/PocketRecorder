@@ -59,10 +59,10 @@ internal sealed class FloatingRecordWindow : Window
                 ffmpegBusy
                     ? "正在下载必要组件"
                     : active
-                        ? "- 左键停止录制/n- 右键单击打开菜单/n- 右键按住拖动"
+                        ? "- 左键停止录制\n- 右键单击打开菜单\n- 右键按住拖动"
                         : busy
                             ? "保存中"
-                            : "- 左键开始录制/n- 右键单击打开菜单/n- 右键按住拖动");
+                            : "- 左键开始录制\n- 右键单击打开菜单\n- 右键按住拖动");
             ImGui.EndTooltip();
         }
 
