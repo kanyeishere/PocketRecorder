@@ -114,7 +114,7 @@ internal sealed class ConfigWindow : Window
                 _plugin.RecordingService.StartRecording();
             }
         }
-        ImGui.TextDisabled("快捷命令: /record toggle");
+        ImGui.TextDisabled("快捷命令: /pocketrecorder toggle 或 /pktr toggle");
     }
 
     private void DrawAutomationSettings(Configuration config)

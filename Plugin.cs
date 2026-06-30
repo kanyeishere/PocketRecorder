@@ -10,7 +10,8 @@ namespace Recorder;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    internal const string CommandName = "/record";
+    internal const string CommandName = "/pocketrecorder";
+    internal const string ShortCommandName = "/pktr";
 
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
@@ -45,9 +46,15 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw += OnUiBuilderDraw;
         PluginInterface.UiBuilder.OpenConfigUi += () => ConfigWindow.IsOpen = true;
 
-        CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
+        AddCommandHandler(CommandName);
+        AddCommandHandler(ShortCommandName);
+    }
+
+    private void AddCommandHandler(string commandName)
+    {
+        CommandManager.AddHandler(commandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "打开录制控制面板。参数: toggle, test start, test wipe, test leave。",
+            HelpMessage = "打开录制控制面板。参数: toggle, test start, test wipe, test leave。别名: /pktr",
         });
     }
 
@@ -86,6 +93,7 @@ public sealed class Plugin : IDalamudPlugin
         AutoDutyRecordingService.Dispose();
         RecordingService.Dispose();
         CommandManager.RemoveHandler(CommandName);
+        CommandManager.RemoveHandler(ShortCommandName);
         PluginInterface.UiBuilder.Draw -= OnUiBuilderDraw;
         WindowSystem.RemoveWindow(FloatingRecordWindow);
         WindowSystem.RemoveWindow(ConfigWindow);

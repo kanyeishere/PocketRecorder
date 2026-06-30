@@ -8,7 +8,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 5;
+    public int Version { get; set; } = 6;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
@@ -41,7 +41,7 @@ public class Configuration : IPluginConfiguration
     public bool IncludeOverlay { get; set; } = false;
 
     /// <summary>录制开始/停止快捷键命令文本。</summary>
-    public string ToggleCommand { get; set; } = "/record";
+    public string ToggleCommand { get; set; } = "/pocketrecorder";
 
     /// <summary>是否显示一键录制悬浮图标。</summary>
     public bool ShowFloatingRecordButton { get; set; } = true;
@@ -87,6 +87,18 @@ public class Configuration : IPluginConfiguration
             config.ShowFloatingRecordButton = true;
             config.AutoRecordEightPlayerDuty = true;
             config.Version = 5;
+            config.Save(pi);
+        }
+
+        if (config.Version < 6)
+        {
+            if (string.IsNullOrWhiteSpace(config.ToggleCommand) ||
+                config.ToggleCommand.Equals("/record", StringComparison.OrdinalIgnoreCase))
+            {
+                config.ToggleCommand = "/pocketrecorder";
+            }
+
+            config.Version = 6;
             config.Save(pi);
         }
 
