@@ -56,11 +56,6 @@ FFXIV_yyyyMMdd_HHmmss.mp4
 
 自动副本录制会使用副本名与起止时间命名，方便回看和归档。
 
-## 图标
-
-项目图标使用悬浮录制按钮同款图形，文件位于 `images/icon.png`，尺寸为 512x512 透明 PNG。
-
-`PocketRecorder.json` 中的 `IconUrl` 当前指向该项目内资产。发布到公开插件仓库时，建议将它替换为可公网访问的 raw 图片 URL。
 
 ## 注意事项
 
