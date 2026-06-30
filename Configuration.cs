@@ -1,5 +1,6 @@
 using Dalamud.Configuration;
 using Dalamud.Plugin;
+using Recorder.Encoding;
 using System;
 
 namespace Recorder;
@@ -7,7 +8,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 3;
+    public int Version { get; set; } = 4;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
@@ -30,8 +31,8 @@ public class Configuration : IPluginConfiguration
     /// <summary>视频编码器（如 h264_nvenc / hevc_nvenc / av1_nvenc / libx264）。</summary>
     public string VideoCodec { get; set; } = "auto";
 
-    /// <summary>编码器预设（如 p4 / veryfast）。</summary>
-    public string EncoderPreset { get; set; } = "p4";
+    /// <summary>编码器预设（auto 表示按实际编码器自动选择）。</summary>
+    public string EncoderPreset { get; set; } = "auto";
 
     /// <summary>低延迟模式（为 WebRTC 推流预留，启用后更短的 GOP 和更低的延迟）。</summary>
     public bool LowLatencyMode { get; set; } = false;
@@ -60,6 +61,15 @@ public class Configuration : IPluginConfiguration
             config.Save(pi);
         }
 
+        if (config.Version < 4)
+        {
+            if (config.VideoCodec == "auto")
+                config.EncoderPreset = "auto";
+
+            config.Version = 4;
+            config.Save(pi);
+        }
+
         return config;
     }
 
@@ -81,40 +91,22 @@ public class Configuration : IPluginConfiguration
         return string.IsNullOrWhiteSpace(FFmpegPath) ? "ffmpeg" : FFmpegPath;
     }
 
-    /// <summary>解析视频编码器。auto 模式根据硬件编码开关选择。</summary>
+    /// <summary>解析视频编码器。auto 模式在录制开始时由 FFmpegEncoderSelector 探测。</summary>
     public string ResolveVideoCodec()
     {
         if (VideoCodec != "auto")
             return VideoCodec;
 
-        return UseHardwareEncoder ? "h264_nvenc" : "libx264";
+        return UseHardwareEncoder ? "auto" : "libx264";
     }
 
     /// <summary>解析编码器预设。</summary>
     public string ResolvePreset()
     {
         var codec = ResolveVideoCodec();
-        if (string.IsNullOrEmpty(EncoderPreset))
-            return codec.StartsWith("libx") ? "ultrafast" : "p4";
+        if (codec == "auto")
+            return "auto";
 
-        if (codec.StartsWith("libx", StringComparison.OrdinalIgnoreCase) && IsNvencPreset(EncoderPreset))
-            return "ultrafast";
-
-        if (!codec.StartsWith("libx", StringComparison.OrdinalIgnoreCase) &&
-            (EncoderPreset.Equals("ultrafast", StringComparison.OrdinalIgnoreCase) ||
-             EncoderPreset.Equals("veryfast", StringComparison.OrdinalIgnoreCase)))
-        {
-            return "p4";
-        }
-
-        return EncoderPreset;
-    }
-
-    private static bool IsNvencPreset(string preset)
-    {
-        return preset.Length == 2 &&
-               preset[0] is 'p' or 'P' &&
-               preset[1] >= '1' &&
-               preset[1] <= '7';
+        return FFmpegEncoderSelector.ResolvePresetForCodec(codec, EncoderPreset);
     }
 }

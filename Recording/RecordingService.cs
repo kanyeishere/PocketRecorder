@@ -63,13 +63,16 @@ internal sealed class RecordingService : IDisposable
         string fileName = $"FFXIV_{DateTime.Now:yyyyMMdd_HHmmss}.mp4";
         _currentFilePath = Path.Combine(dir, fileName);
 
+        string ffmpegPath = config.GetEffectiveFFmpegPath();
+        EncoderSelection encoder = FFmpegEncoderSelector.Select(ffmpegPath, config);
+
         // 创建输出 sink（FFmpeg）
         _writer = new FFmpegWriter(
-            config.GetEffectiveFFmpegPath(),
+            ffmpegPath,
             config.VideoBitrate,
-            config.ResolveVideoCodec(),
-            config.ResolvePreset(),
-            config.UseHardwareEncoder);
+            encoder.Codec,
+            encoder.Preset,
+            encoder.IsHardware);
         _writer.SetOutputPath(_currentFilePath);
 
         // 创建并启动音频捕获（如果启用），以便获取音频格式
@@ -102,7 +105,7 @@ internal sealed class RecordingService : IDisposable
         _isRecording = false;
         _frameCount = 0;
         Plugin.Log.Info($"[Record] Preparation started → {_currentFilePath}");
-        Plugin.Log.Info($"[Record] Config: fps={_videoFps}, bitrate={config.VideoBitrate}, codec={config.ResolveVideoCodec()}, preset={config.ResolvePreset()}, audio={config.CaptureAudio}, hw={config.UseHardwareEncoder}");
+        Plugin.Log.Info($"[Record] Config: fps={_videoFps}, bitrate={config.VideoBitrate}, codec={encoder.Codec}, preset={encoder.Preset}, audio={config.CaptureAudio}, hw={encoder.IsHardware}, encoderReason={encoder.Reason}");
     }
 
     private void OnVideoFrame(VideoFrame frame)

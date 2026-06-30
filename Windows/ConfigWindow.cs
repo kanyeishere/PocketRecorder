@@ -1,5 +1,6 @@
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
+using Recorder.Encoding;
 using System;
 using System.IO;
 using System.Numerics;
@@ -117,9 +118,32 @@ internal sealed class ConfigWindow : Window
         ImGui.SliderInt("目标帧率", ref fps, 15, 60);
         config.TargetFps = fps;
 
-        bool hw = config.UseHardwareEncoder;
-        ImGui.Checkbox("使用硬件编码器", ref hw);
-        config.UseHardwareEncoder = hw;
+        string[] modes = { "自动", "兼容", "高级" };
+        int modeIdx = config.VideoCodec == "auto"
+            ? (config.UseHardwareEncoder ? 0 : 1)
+            : 2;
+        if (ImGui.Combo("编码模式", ref modeIdx, modes, modes.Length))
+        {
+            if (modeIdx == 0)
+            {
+                config.VideoCodec = "auto";
+                config.UseHardwareEncoder = true;
+                config.EncoderPreset = "auto";
+            }
+            else if (modeIdx == 1)
+            {
+                config.VideoCodec = "auto";
+                config.UseHardwareEncoder = false;
+                config.EncoderPreset = "auto";
+            }
+            else if (config.VideoCodec == "auto")
+            {
+                var encoder = FFmpegEncoderSelector.Select(config.GetEffectiveFFmpegPath(), config);
+                config.VideoCodec = encoder.Codec;
+                config.EncoderPreset = "auto";
+                config.UseHardwareEncoder = true;
+            }
+        }
 
         bool lowLat = config.LowLatencyMode;
         ImGui.Checkbox("低延迟模式 (WebRTC 预留)", ref lowLat);
@@ -141,7 +165,7 @@ internal sealed class ConfigWindow : Window
 
     private void DrawFFmpegSettings(Configuration config)
     {
-        ImGui.Text("FFmpeg 编码设置");
+        ImGui.Text("FFmpeg 设置");
 
         // FFmpeg 路径
         string ffmpegPath = config.FFmpegPath;
@@ -151,25 +175,35 @@ internal sealed class ConfigWindow : Window
         }
         ImGui.TextDisabled($"当前: {config.GetEffectiveFFmpegPath()}");
 
-        // 视频编码器
-        string[] codecs = { "auto", "libx264", "libx265", "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf" };
-        int codecIdx = Array.IndexOf(codecs, config.VideoCodec);
-        if (codecIdx < 0) codecIdx = 0;
-        if (ImGui.Combo("视频编码器", ref codecIdx, codecs, codecs.Length))
-        {
-            config.VideoCodec = codecs[codecIdx];
-        }
-        ImGui.TextDisabled($"实际: {config.ResolveVideoCodec()}");
+        ImGui.TextDisabled($"编码模式: {GetEncodingModeText(config)}");
 
-        // 编码预设
-        string preset = config.EncoderPreset;
-        if (ImGui.InputText("预设 (NVENC: p1-p7 / x264: ultrafast-slow)", ref preset, 64))
+        if (config.VideoCodec != "auto")
         {
-            config.EncoderPreset = preset;
-        }
-        ImGui.TextDisabled($"实际: {config.ResolvePreset()}");
+            string[] codecs = { "libx264", "libx265", "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf" };
+            int codecIdx = Array.IndexOf(codecs, config.VideoCodec);
+            if (codecIdx < 0) codecIdx = 0;
+            if (ImGui.Combo("视频编码器", ref codecIdx, codecs, codecs.Length))
+            {
+                config.VideoCodec = codecs[codecIdx];
+            }
 
-        ImGui.TextDisabled("auto 会按硬件编码开关选择 h264_nvenc 或 libx264。若驱动异常，可手动切回 libx264。");
+            string preset = config.EncoderPreset;
+            if (ImGui.InputText("预设 (auto=推荐)", ref preset, 64))
+            {
+                config.EncoderPreset = preset;
+            }
+            ImGui.TextDisabled($"实际预设: {config.ResolvePreset()}");
+        }
+    }
+
+    private static string GetEncodingModeText(Configuration config)
+    {
+        if (config.VideoCodec != "auto")
+            return $"高级 ({config.VideoCodec})";
+
+        return config.UseHardwareEncoder
+            ? "自动选择硬件编码器，失败时回退兼容模式"
+            : "兼容模式";
     }
 
     private void DrawOutputSettings(Configuration config)
