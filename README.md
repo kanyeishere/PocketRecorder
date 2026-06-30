@@ -1,4 +1,6 @@
+<p align="center">
 # Pocket Recorder
+</p>
 <p align="center">
 <img src="images/icon.png" width="96" alt="Pocket Recorder icon">
 </p>
