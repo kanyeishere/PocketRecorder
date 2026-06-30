@@ -16,6 +16,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
     [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
+    [PluginService] internal static IChatGui ChatGui { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider GameInterop { get; private set; } = null!;
     [PluginService] internal static IFramework Framework { get; private set; } = null!;
     [PluginService] internal static IClientState ClientState { get; private set; } = null!;
@@ -54,33 +55,297 @@ public sealed class Plugin : IDalamudPlugin
     {
         CommandManager.AddHandler(commandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "打开录制控制面板。参数: toggle, test start, test wipe, test leave。别名: /pktr",
+            HelpMessage = "Pocket Recorder: start, end, toggle, status, autorecord on/off/toggle, floating on/off/toggle, fps, bitrate, audio, output, config, help。",
         });
     }
 
     private void OnCommand(string command, string args)
     {
         string trimmed = args.Trim();
-        if (trimmed.Equals("toggle", StringComparison.OrdinalIgnoreCase))
-        {
-            RecordingService.ToggleRecording();
-        }
-        else if (trimmed.Equals("test start", StringComparison.OrdinalIgnoreCase))
-        {
-            AutoDutyRecordingService.StartTestCountdown();
-        }
-        else if (trimmed.Equals("test wipe", StringComparison.OrdinalIgnoreCase))
-        {
-            AutoDutyRecordingService.StopTestAsWipe();
-        }
-        else if (trimmed.Equals("test leave", StringComparison.OrdinalIgnoreCase))
-        {
-            AutoDutyRecordingService.StopTestAsLeave();
-        }
-        else
+        if (string.IsNullOrWhiteSpace(trimmed))
         {
             ConfigWindow.IsOpen = !ConfigWindow.IsOpen;
+            return;
         }
+
+        string[] parts = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        string action = parts[0].ToLowerInvariant();
+
+        switch (action)
+        {
+            case "start":
+            case "begin":
+                StartRecordingFromCommand();
+                break;
+
+            case "end":
+            case "stop":
+                StopRecordingFromCommand();
+                break;
+
+            case "toggle":
+                RecordingService.ToggleRecording();
+                Print($"录制状态: {GetPhaseText(RecordingService.Phase)}");
+                break;
+
+            case "status":
+            case "state":
+                PrintStatus();
+                break;
+
+            case "autorecord":
+            case "auto":
+                HandleAutoRecordCommand(parts);
+                break;
+
+            case "floating":
+            case "float":
+            case "icon":
+                HandleFloatingCommand(parts);
+                break;
+
+            case "fps":
+                HandleFpsCommand(parts);
+                break;
+
+            case "bitrate":
+            case "br":
+                HandleBitrateCommand(parts);
+                break;
+
+            case "audio":
+                HandleAudioCommand(parts);
+                break;
+
+            case "output":
+            case "folder":
+            case "dir":
+                OpenOutputDirectory();
+                break;
+
+            case "config":
+            case "settings":
+            case "open":
+                ConfigWindow.IsOpen = true;
+                Print("已打开设置窗口。");
+                break;
+
+            case "help":
+            case "?":
+                PrintHelp();
+                break;
+
+            default:
+                Print($"未知指令: {parts[0]}");
+                PrintHelp();
+                break;
+        }
+    }
+
+    private void StartRecordingFromCommand()
+    {
+        var phase = RecordingService.Phase;
+        if (phase != RecordingPhase.Idle)
+        {
+            Print($"无法开始录制，当前状态: {GetPhaseText(phase)}。");
+            return;
+        }
+
+        Print(RecordingService.StartRecording()
+            ? "开始录制。"
+            : "开始录制失败，请查看日志。");
+    }
+
+    private void StopRecordingFromCommand()
+    {
+        var phase = RecordingService.Phase;
+        if (phase == RecordingPhase.Idle)
+        {
+            Print("当前没有正在进行的录制。");
+            return;
+        }
+
+        if (phase == RecordingPhase.Finalizing)
+        {
+            Print("录制正在保存中。");
+            return;
+        }
+
+        RecordingService.StopRecording();
+        Print("停止录制，正在保存。");
+    }
+
+    private void HandleAutoRecordCommand(string[] parts)
+    {
+        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            Print($"8 人副本自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}");
+            return;
+        }
+
+        bool? enabled = ParseSwitch(parts[1], Config.AutoRecordEightPlayerDuty);
+        if (enabled == null)
+        {
+            Print("用法: autorecord on | off | toggle | status");
+            return;
+        }
+
+        Config.AutoRecordEightPlayerDuty = enabled.Value;
+        Config.Save(PluginInterface);
+        Print($"8 人副本自动录制已{(enabled.Value ? "开启" : "关闭")}。");
+    }
+
+    private void HandleFloatingCommand(string[] parts)
+    {
+        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            Print($"悬浮录制按钮: {OnOff(Config.ShowFloatingRecordButton)}。");
+            return;
+        }
+
+        bool? enabled = ParseSwitch(parts[1], Config.ShowFloatingRecordButton);
+        if (enabled == null)
+        {
+            Print("用法: floating on | off | toggle | status");
+            return;
+        }
+
+        Config.ShowFloatingRecordButton = enabled.Value;
+        FloatingRecordWindow.IsOpen = enabled.Value;
+        Config.Save(PluginInterface);
+        Print($"悬浮录制按钮已{(enabled.Value ? "显示" : "隐藏")}。");
+    }
+
+    private void HandleFpsCommand(string[] parts)
+    {
+        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            Print($"目标帧率: {Config.TargetFps} FPS。");
+            return;
+        }
+
+        if (!int.TryParse(parts[1], out int fps) || fps is < 15 or > 144)
+        {
+            Print("用法: fps 15-144");
+            return;
+        }
+
+        Config.TargetFps = fps;
+        Config.Save(PluginInterface);
+        Print($"目标帧率已设为 {fps} FPS，下次录制生效。");
+    }
+
+    private void HandleBitrateCommand(string[] parts)
+    {
+        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            Print($"视频码率: {Config.VideoBitrate / 1_000_000} Mbps。");
+            return;
+        }
+
+        if (!int.TryParse(parts[1], out int bitrateMbps) || bitrateMbps is < 1 or > 100)
+        {
+            Print("用法: bitrate 1-100");
+            return;
+        }
+
+        Config.VideoBitrate = bitrateMbps * 1_000_000;
+        Config.Save(PluginInterface);
+        Print($"视频码率已设为 {bitrateMbps} Mbps，下次录制生效。");
+    }
+
+    private void HandleAudioCommand(string[] parts)
+    {
+        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            Print($"系统音频录制: {OnOff(Config.CaptureAudio)}。");
+            return;
+        }
+
+        bool? enabled = ParseSwitch(parts[1], Config.CaptureAudio);
+        if (enabled == null)
+        {
+            Print("用法: audio on | off | toggle | status");
+            return;
+        }
+
+        Config.CaptureAudio = enabled.Value;
+        Config.Save(PluginInterface);
+        Print($"系统音频录制已{(enabled.Value ? "开启" : "关闭")}，下次录制生效。");
+    }
+
+    private void OpenOutputDirectory()
+    {
+        string dir = Config.GetEffectiveOutputDirectory(PluginInterface);
+        try
+        {
+            if (!System.IO.Directory.Exists(dir))
+                System.IO.Directory.CreateDirectory(dir);
+
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = dir,
+                UseShellExecute = true,
+                Verb = "open",
+            });
+
+            Print($"已打开输出目录: {dir}");
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Failed to open output directory: {ex}");
+            Print($"打开输出目录失败: {ex.Message}");
+        }
+    }
+
+    private void PrintStatus()
+    {
+        string elapsed = RecordingService.Phase == RecordingPhase.Recording
+            ? $"，时长 {RecordingService.Elapsed:hh\\:mm\\:ss}，帧数 {RecordingService.FrameCount}"
+            : string.Empty;
+
+        Print($"录制状态: {GetPhaseText(RecordingService.Phase)}{elapsed}。");
+        Print($"8 人副本自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}");
+        Print($"参数: {Config.TargetFps} FPS / {Config.VideoBitrate / 1_000_000} Mbps / 音频 {OnOff(Config.CaptureAudio)}。");
+    }
+
+    private static bool? ParseSwitch(string value, bool currentValue)
+    {
+        return value.ToLowerInvariant() switch
+        {
+            "on" or "enable" or "enabled" or "1" or "true" or "yes" => true,
+            "off" or "disable" or "disabled" or "0" or "false" or "no" => false,
+            "toggle" => !currentValue,
+            _ => null,
+        };
+    }
+
+    private static string GetPhaseText(RecordingPhase phase)
+    {
+        return phase switch
+        {
+            RecordingPhase.Idle => "待机",
+            RecordingPhase.Preparing => "准备中",
+            RecordingPhase.Recording => "录制中",
+            RecordingPhase.Finalizing => "保存中",
+            _ => phase.ToString(),
+        };
+    }
+
+    private static string OnOff(bool enabled) => enabled ? "开启" : "关闭";
+
+    private static void Print(string message)
+    {
+        ChatGui.Print($"[Pocket Recorder] {message}");
+    }
+
+    private static void PrintHelp()
+    {
+        Print("命令: start, end, toggle, status, config, output");
+        Print("自动录制: autorecord on/off/toggle/status");
+        Print("悬浮按钮: floating on/off/toggle/status");
+        Print("参数: fps 60, bitrate 32, audio on/off/toggle/status");
+        Print("短命令同样可用: /pktr start, /pktr end");
     }
 
     private void OnUiBuilderDraw()

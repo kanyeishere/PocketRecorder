@@ -23,7 +23,6 @@ internal sealed class AutoDutyRecordingService : IDisposable
     private DateTime _recordEndTime;
     private string _recordDutyName = string.Empty;
     private string? _pendingTemporaryPath;
-    private bool _testScenarioActive;
 
     public AutoDutyRecordingService(Plugin plugin, IClientState clientState, IDutyState dutyState, IFramework framework)
     {
@@ -45,9 +44,7 @@ internal sealed class AutoDutyRecordingService : IDisposable
             lock (_sync)
             {
                 if (_autoRecordingActive)
-                    return _testScenarioActive
-                        ? $"自动录制测试中: {_recordDutyName}"
-                        : $"自动录制中: {_recordDutyName}";
+                    return $"自动录制中: {_recordDutyName}";
 
                 if (IsEightPlayerDuty())
                     return "等待倒计时";
@@ -66,36 +63,6 @@ internal sealed class AutoDutyRecordingService : IDisposable
         }
     }
 
-    public bool IsTestScenarioActive
-    {
-        get
-        {
-            lock (_sync)
-                return _testScenarioActive;
-        }
-    }
-
-    public bool StartTestCountdown()
-    {
-        bool started = TryStartAutoRecording("自动录制测试", true);
-        if (started)
-            Plugin.Log.Info("[AutoDuty] Test countdown started.");
-
-        return started;
-    }
-
-    public void StopTestAsWipe()
-    {
-        Plugin.Log.Info("[AutoDuty] Test wipe requested.");
-        StopAutoRecording("test wipe");
-    }
-
-    public void StopTestAsLeave()
-    {
-        Plugin.Log.Info("[AutoDuty] Test leave requested.");
-        StopAutoRecording("test leave");
-    }
-
     private void OnFrameworkUpdate(IFramework framework)
     {
         if (!_plugin.Config.AutoRecordEightPlayerDuty)
@@ -108,10 +75,10 @@ internal sealed class AutoDutyRecordingService : IDisposable
         if (!countdownStarted || !IsEightPlayerDuty())
             return;
 
-        TryStartAutoRecording(null, false);
+        TryStartAutoRecording();
     }
 
-    private bool TryStartAutoRecording(string? forcedDutyName, bool isTestScenario)
+    private bool TryStartAutoRecording()
     {
         lock (_sync)
         {
@@ -120,14 +87,12 @@ internal sealed class AutoDutyRecordingService : IDisposable
 
             _recordStartTime = DateTime.Now;
             _recordEndTime = DateTime.MinValue;
-            _recordDutyName = SanitizeFileName(string.IsNullOrWhiteSpace(forcedDutyName) ? GetDutyName() : forcedDutyName);
+            _recordDutyName = GetDutyName();
             _pendingTemporaryPath = CreateTemporaryOutputPath(_recordDutyName, _recordStartTime);
-            _testScenarioActive = isTestScenario;
 
             if (!_plugin.RecordingService.StartRecording(_pendingTemporaryPath, OnRecordingFinished))
             {
                 _pendingTemporaryPath = null;
-                _testScenarioActive = false;
                 return false;
             }
 
@@ -188,7 +153,6 @@ internal sealed class AutoDutyRecordingService : IDisposable
             _recordDutyName = string.Empty;
             _recordEndTime = DateTime.MinValue;
             _pendingTemporaryPath = null;
-            _testScenarioActive = false;
         }
 
         if (!args.Saved || !File.Exists(args.OutputPath))

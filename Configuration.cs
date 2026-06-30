@@ -8,16 +8,16 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 6;
+    public int Version { get; set; } = 7;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
 
     /// <summary>目标视频码率（bps），0 表示由编码器自动选择。</summary>
-    public int VideoBitrate { get; set; } = 8_000_000;
+    public int VideoBitrate { get; set; } = 32_000_000;
 
     /// <summary>目标帧率上限。</summary>
-    public int TargetFps { get; set; } = 30;
+    public int TargetFps { get; set; } = 60;
 
     /// <summary>是否录制音频。</summary>
     public bool CaptureAudio { get; set; } = true;
@@ -99,6 +99,18 @@ public class Configuration : IPluginConfiguration
             }
 
             config.Version = 6;
+            config.Save(pi);
+        }
+
+        if (config.Version < 7)
+        {
+            if (config.VideoBitrate == 8_000_000)
+                config.VideoBitrate = 32_000_000;
+
+            if (config.TargetFps == 30)
+                config.TargetFps = 60;
+
+            config.Version = 7;
             config.Save(pi);
         }
 
