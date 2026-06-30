@@ -52,24 +52,24 @@ internal sealed class FloatingRecordWindow : Window
         if (pressed && !busy)
             _plugin.RecordingService.ToggleRecording();
 
-        if (ImGui.IsItemHovered())
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem))
         {
             ImGui.BeginTooltip();
             ImGui.TextUnformatted(
                 ffmpegBusy
                     ? "正在下载必要组件"
                     : active
-                        ? "左键停止录制，右键拖动"
+                        ? "- 左键停止录制/n- 右键单击打开菜单/n- 右键按住拖动"
                         : busy
                             ? "保存中"
-                            : "左键开始录制，右键拖动");
+                            : "- 左键开始录制/n- 右键单击打开菜单/n- 右键按住拖动");
             ImGui.EndTooltip();
         }
 
         HandleRightMouseDrag();
 
         if (!_suppressContextMenuThisFrame &&
-            ImGui.BeginPopupContextItem("PocketRecorderFloatingMenu", ImGuiPopupFlags.MouseButtonRight))
+            ImGui.BeginPopup("PocketRecorderFloatingMenu"))
         {
             if (ImGui.MenuItem("打开设置"))
                 _plugin.ConfigWindow.IsOpen = true;
@@ -160,7 +160,8 @@ internal sealed class FloatingRecordWindow : Window
     {
         if (!_rightDragStartedOnButton)
         {
-            if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem) &&
+                ImGui.IsMouseClicked(ImGuiMouseButton.Right))
             {
                 _rightDragStartedOnButton = true;
                 _wasDragging = false;
@@ -183,6 +184,7 @@ internal sealed class FloatingRecordWindow : Window
             else
             {
                 Position = _rightDragStartWindowPos;
+                ImGui.OpenPopup("PocketRecorderFloatingMenu");
             }
 
             _rightDragStartedOnButton = false;
