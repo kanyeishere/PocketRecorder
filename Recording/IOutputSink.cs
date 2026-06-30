@@ -22,9 +22,9 @@ internal interface IOutputSink : IDisposable
     void WriteAudioPacket(AudioPacket packet);
 
     /// <summary>停止写入并完成输出。</summary>
-    void Stop();
+    void Stop(TimeSpan? finalVideoDuration = null);
 }
 
-internal sealed record VideoFormat(int Width, int Height, int Fps);
+internal sealed record VideoFormat(int Width, int Height, int Fps, VideoPixelFormat PixelFormat);
 
 internal sealed record AudioFormat(int SampleRate, int Channels, int BitsPerSample, bool IsFloat);

@@ -7,7 +7,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 2;
+    public int Version { get; set; } = 3;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
@@ -22,7 +22,7 @@ public class Configuration : IPluginConfiguration
     public bool CaptureAudio { get; set; } = true;
 
     /// <summary>是否优先使用硬件编码器。</summary>
-    public bool UseHardwareEncoder { get; set; } = false;
+    public bool UseHardwareEncoder { get; set; } = true;
 
     /// <summary>FFmpeg 可执行文件路径，空则从 PATH 查找。</summary>
     public string FFmpegPath { get; set; } = string.Empty;
@@ -31,7 +31,7 @@ public class Configuration : IPluginConfiguration
     public string VideoCodec { get; set; } = "auto";
 
     /// <summary>编码器预设（如 p4 / veryfast）。</summary>
-    public string EncoderPreset { get; set; } = "ultrafast";
+    public string EncoderPreset { get; set; } = "p4";
 
     /// <summary>低延迟模式（为 WebRTC 推流预留，启用后更短的 GOP 和更低的延迟）。</summary>
     public bool LowLatencyMode { get; set; } = false;
@@ -45,17 +45,18 @@ public class Configuration : IPluginConfiguration
     public static Configuration Load(IDalamudPluginInterface pi)
     {
         var config = (pi.GetPluginConfig() as Configuration) ?? new Configuration();
-        if (config.Version < 2)
+        if (config.Version < 3)
         {
-            config.UseHardwareEncoder = false;
-            config.TargetFps = Math.Min(config.TargetFps, 30);
-            if ((config.VideoCodec == "auto" || config.VideoCodec.Equals("libx264", StringComparison.OrdinalIgnoreCase)) &&
-                (string.IsNullOrEmpty(config.EncoderPreset) || config.EncoderPreset.Equals("veryfast", StringComparison.OrdinalIgnoreCase) || IsNvencPreset(config.EncoderPreset)))
+            config.UseHardwareEncoder = true;
+            if (config.VideoCodec == "auto" &&
+                (string.IsNullOrEmpty(config.EncoderPreset) ||
+                 config.EncoderPreset.Equals("veryfast", StringComparison.OrdinalIgnoreCase) ||
+                 config.EncoderPreset.Equals("ultrafast", StringComparison.OrdinalIgnoreCase)))
             {
-                config.EncoderPreset = "ultrafast";
+                config.EncoderPreset = "p4";
             }
 
-            config.Version = 2;
+            config.Version = 3;
             config.Save(pi);
         }
 
@@ -80,13 +81,13 @@ public class Configuration : IPluginConfiguration
         return string.IsNullOrWhiteSpace(FFmpegPath) ? "ffmpeg" : FFmpegPath;
     }
 
-    /// <summary>解析视频编码器。auto 模式优先使用稳定的软件编码器。</summary>
+    /// <summary>解析视频编码器。auto 模式根据硬件编码开关选择。</summary>
     public string ResolveVideoCodec()
     {
         if (VideoCodec != "auto")
             return VideoCodec;
 
-        return "libx264";
+        return UseHardwareEncoder ? "h264_nvenc" : "libx264";
     }
 
     /// <summary>解析编码器预设。</summary>
@@ -98,6 +99,13 @@ public class Configuration : IPluginConfiguration
 
         if (codec.StartsWith("libx", StringComparison.OrdinalIgnoreCase) && IsNvencPreset(EncoderPreset))
             return "ultrafast";
+
+        if (!codec.StartsWith("libx", StringComparison.OrdinalIgnoreCase) &&
+            (EncoderPreset.Equals("ultrafast", StringComparison.OrdinalIgnoreCase) ||
+             EncoderPreset.Equals("veryfast", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "p4";
+        }
 
         return EncoderPreset;
     }

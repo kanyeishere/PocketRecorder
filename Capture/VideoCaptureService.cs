@@ -506,16 +506,12 @@ internal sealed unsafe class VideoCaptureService : IDisposable
                         DiagnosePixels(buffer, (int)width, (int)height, dstStride);
                     }
 
-                    // RGBA → BGRA 转换
-                    bool isRGBA = format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM ||
-                                  format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                                  format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS;
-                    if (isRGBA)
-                    {
-                        SwapRedBlue(buffer, (int)width, (int)height, dstStride);
-                        if (diagnoseThisBackend)
-                            Plugin.Log.Info("[Video] Applied RGBA→BGRA swap.");
-                    }
+                    VideoPixelFormat pixelFormat =
+                        format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM ||
+                        format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                        format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS
+                            ? VideoPixelFormat.Rgba
+                            : VideoPixelFormat.Bgra;
 
                     // 空帧（RGBA 全 0）通常表示 GPU 读回失败；不要把它送进编码器。
                     if (isEmptyFrame)
@@ -532,7 +528,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
                         _consecutiveBlackFrames = 0;
 
                         long timestampHns = timestampTicks * 10_000_000L / Stopwatch.Frequency;
-                        frame = new VideoFrame(buffer, (int)width, (int)height, dstStride, timestampHns);
+                        frame = new VideoFrame(buffer, (int)width, (int)height, dstStride, timestampHns, pixelFormat);
                     }
                 }
             }
@@ -905,19 +901,6 @@ internal sealed unsafe class VideoCaptureService : IDisposable
         _multithreadContext = IntPtr.Zero;
     }
 
-    private static void SwapRedBlue(byte[] buffer, int width, int height, int stride)
-    {
-        int rowEnd = height * stride;
-        for (int row = 0; row < rowEnd; row += stride)
-        {
-            int rowLimit = row + width * 4;
-            for (int px = row; px < rowLimit; px += 4)
-            {
-                (buffer[px], buffer[px + 2]) = (buffer[px + 2], buffer[px]);
-            }
-        }
-    }
-
     public void Dispose()
     {
         if (_disposed) return;
@@ -932,4 +915,10 @@ internal sealed unsafe class VideoCaptureService : IDisposable
 }
 
 /// <summary>一帧视频画面的数据。</summary>
-internal sealed record VideoFrame(byte[] Data, int Width, int Height, int Stride, long TimestampHns);
+internal enum VideoPixelFormat
+{
+    Bgra,
+    Rgba,
+}
+
+internal sealed record VideoFrame(byte[] Data, int Width, int Height, int Stride, long TimestampHns, VideoPixelFormat PixelFormat);

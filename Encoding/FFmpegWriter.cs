@@ -25,10 +25,14 @@ internal sealed class FFmpegWriter : IOutputSink
     private bool _hasAudio;
     private bool _stopped;
     private int _frameCount;
+    private int _inputFrameCount;
+    private int _duplicatedFrameCount;
+    private int _droppedFrameCount;
     private int _audioPackets;
+    private TimeSpan? _finalVideoDuration;
 
     // 异步写入队列
-    private BlockingCollection<byte[]>? _videoQueue;
+    private BlockingCollection<VideoFrame>? _videoQueue;
     private Thread? _videoWriterThread;
     private BlockingCollection<byte[]>? _audioQueue;
     private Thread? _audioWriterThread;
@@ -55,8 +59,15 @@ internal sealed class FFmpegWriter : IOutputSink
 
     public void Start(VideoFormat video, AudioFormat? audio)
     {
-        _videoFps = video.Fps;
+        _videoFps = Math.Max(1, video.Fps);
         _hasAudio = audio != null;
+        _stopped = false;
+        _frameCount = 0;
+        _inputFrameCount = 0;
+        _duplicatedFrameCount = 0;
+        _droppedFrameCount = 0;
+        _audioPackets = 0;
+        _finalVideoDuration = null;
 
         // 确保输出目录
         string? dir = Path.GetDirectoryName(_outputPath);
@@ -68,12 +79,10 @@ internal sealed class FFmpegWriter : IOutputSink
         args.Add("-y"); // 覆盖
 
         // ── 视频输入：stdin rawvideo ──
-        // FFmpeg 的 bgra = B8G8R8A8，内存顺序 B,G,R,A
-        // Dalamud backbuffer 是 R8G8B8A8，VideoCaptureService 已做 RGBA→BGRA 交换
         args.Add("-f"); args.Add("rawvideo");
-        args.Add("-pix_fmt"); args.Add("bgra");
-        args.Add("-s"); args.Add($"{video.Width}x{video.Height}");
-        args.Add("-r"); args.Add($"{video.Fps}");
+        args.Add("-pix_fmt"); args.Add(GetFFmpegPixelFormat(video.PixelFormat));
+        args.Add("-video_size"); args.Add($"{video.Width}x{video.Height}");
+        args.Add("-framerate"); args.Add($"{_videoFps}");
         args.Add("-i"); args.Add("-");
 
         // ── 音频输入：命名管道 ──
@@ -166,10 +175,11 @@ internal sealed class FFmpegWriter : IOutputSink
         };
         _process.BeginErrorReadLine();
 
-        Plugin.Log!.Info($"[FFmpeg] Process started (PID={_process.Id}), codec={_videoCodec}, {video.Width}x{video.Height}@{video.Fps}fps");
+        Plugin.Log!.Info($"[FFmpeg] Process started (PID={_process.Id}), codec={_videoCodec}, pix_fmt={GetFFmpegPixelFormat(video.PixelFormat)}, {video.Width}x{video.Height}@{_videoFps}fps");
 
         // 启动异步写入线程
-        _videoQueue = new BlockingCollection<byte[]>(MaxQueueSize);
+        Plugin.Log!.Info($"[FFmpeg] Video timing: rawvideo CFR stream synthesized from capture timestamps at {_videoFps}fps.");
+        _videoQueue = new BlockingCollection<VideoFrame>(MaxQueueSize);
         _videoWriterThread = new Thread(VideoWriterLoop)
         {
             IsBackground = true,
@@ -203,23 +213,46 @@ internal sealed class FFmpegWriter : IOutputSink
         return Math.Min(8, Math.Max(4, cpuThreads / 3));
     }
 
+    private static string GetFFmpegPixelFormat(VideoPixelFormat pixelFormat)
+    {
+        return pixelFormat == VideoPixelFormat.Rgba ? "rgba" : "bgra";
+    }
+
     public void WriteVideoFrame(VideoFrame frame)
     {
         if (_stopped || _videoQueue == null) return;
 
+        bool added = false;
         // 非阻塞入队：如果队列满则丢弃最旧帧（避免阻塞渲染线程）
-        while (!_videoQueue.TryAdd(frame.Data, 0))
+        while (!added)
         {
+            try
+            {
+                added = _videoQueue.TryAdd(frame, 0);
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+
+            if (added)
+                break;
+
             // 队列满，丢弃一帧
             if (_videoQueue.TryTake(out _))
             {
-                Plugin.Log!.Warning("[FFmpeg] Video queue full, dropped a frame.");
+                int dropped = Interlocked.Increment(ref _droppedFrameCount);
+                if (dropped <= 5 || dropped % 60 == 0)
+                    Plugin.Log!.Warning($"[FFmpeg] Video queue full, dropped a captured frame. dropped={dropped}");
             }
             else
             {
                 break;
             }
         }
+
+        if (added)
+            Interlocked.Increment(ref _inputFrameCount);
     }
 
     public void WriteAudioPacket(AudioPacket packet)
@@ -238,17 +271,39 @@ internal sealed class FFmpegWriter : IOutputSink
     {
         Plugin.Log!.Info("[FFmpeg] Video writer thread started.");
 
-        foreach (var frameData in _videoQueue!.GetConsumingEnumerable())
-        {
-            if (_stopped) break;
+        long? firstTimestampHns = null;
+        long nextOutputFrameIndex = 0;
+        byte[]? lastFrameData = null;
 
+        foreach (var frame in _videoQueue!.GetConsumingEnumerable())
+        {
             try
             {
-                _stdin!.Write(frameData, 0, frameData.Length);
-                _frameCount++;
+                if (firstTimestampHns == null)
+                {
+                    firstTimestampHns = frame.TimestampHns;
+                    lastFrameData = frame.Data;
+                    WriteRawVideoFrame(frame.Data, duplicate: false);
+                    nextOutputFrameIndex = 1;
+                    continue;
+                }
 
-                if (_frameCount % 300 == 0)
-                    Plugin.Log!.Info($"[FFmpeg] Written {_frameCount} frames, {_audioPackets} audio packets");
+                long relativeHns = Math.Max(0, frame.TimestampHns - firstTimestampHns.Value);
+                long targetFrameIndex = relativeHns * _videoFps / 10_000_000L;
+
+                while (lastFrameData != null && nextOutputFrameIndex < targetFrameIndex)
+                {
+                    WriteRawVideoFrame(lastFrameData, duplicate: true);
+                    nextOutputFrameIndex++;
+                }
+
+                if (nextOutputFrameIndex <= targetFrameIndex)
+                {
+                    WriteRawVideoFrame(frame.Data, duplicate: false);
+                    nextOutputFrameIndex++;
+                }
+
+                lastFrameData = frame.Data;
             }
             catch (Exception ex)
             {
@@ -257,7 +312,36 @@ internal sealed class FFmpegWriter : IOutputSink
             }
         }
 
-        Plugin.Log!.Info("[FFmpeg] Video writer thread exiting.");
+        if (_finalVideoDuration is { } finalDuration && lastFrameData != null)
+        {
+            long desiredFrameCount = Math.Max(1, (finalDuration.Ticks * _videoFps + TimeSpan.TicksPerSecond - 1) / TimeSpan.TicksPerSecond);
+            while (nextOutputFrameIndex < desiredFrameCount)
+            {
+                try
+                {
+                    WriteRawVideoFrame(lastFrameData, duplicate: true);
+                    nextOutputFrameIndex++;
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log!.Warning($"[FFmpeg] Final video padding failed: {ex.Message}");
+                    break;
+                }
+            }
+        }
+
+        Plugin.Log!.Info($"[FFmpeg] Video writer thread exiting. input={_inputFrameCount}, output={_frameCount}, duplicated={_duplicatedFrameCount}, dropped={_droppedFrameCount}");
+    }
+
+    private void WriteRawVideoFrame(byte[] frameData, bool duplicate)
+    {
+        _stdin!.Write(frameData, 0, frameData.Length);
+        _frameCount++;
+        if (duplicate)
+            _duplicatedFrameCount++;
+
+        if (_frameCount % 300 == 0)
+            Plugin.Log!.Info($"[FFmpeg] Written {_frameCount} video frames (input={_inputFrameCount}, duplicated={_duplicatedFrameCount}, dropped={_droppedFrameCount}), {_audioPackets} audio packets");
     }
 
     /// <summary>音频写入线程：从队列取包写入命名管道。</summary>
@@ -280,7 +364,6 @@ internal sealed class FFmpegWriter : IOutputSink
 
         foreach (var audioData in _audioQueue!.GetConsumingEnumerable())
         {
-            if (_stopped) break;
             if (_audioPipe == null || !_audioPipe.IsConnected) break;
 
             try
@@ -299,21 +382,24 @@ internal sealed class FFmpegWriter : IOutputSink
         Plugin.Log!.Info("[FFmpeg] Audio writer thread exiting.");
     }
 
-    public void Stop()
+    public void Stop(TimeSpan? finalVideoDuration = null)
     {
         if (_stopped) return;
         _stopped = true;
+        _finalVideoDuration = finalVideoDuration;
 
-        Plugin.Log!.Info($"[FFmpeg] Stopping... frames={_frameCount}, audioPackets={_audioPackets}");
+        Plugin.Log!.Info($"[FFmpeg] Stopping... input={_inputFrameCount}, output={_frameCount}, duplicated={_duplicatedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
 
         // 完成视频队列
         try { _videoQueue?.CompleteAdding(); } catch { }
         // 完成音频队列
         try { _audioQueue?.CompleteAdding(); } catch { }
 
-        // 等待写入线程完成（最多 5 秒）
-        _videoWriterThread?.Join(5_000);
-        _audioWriterThread?.Join(5_000);
+        // 等待写入线程完成。高分辨率补帧后收尾可能需要多一点时间。
+        if (_videoWriterThread != null && !_videoWriterThread.Join(30_000))
+            Plugin.Log.Warning("[FFmpeg] Video writer did not finish in 30s; closing input with remaining frames unwritten.");
+        if (_audioWriterThread != null && !_audioWriterThread.Join(5_000))
+            Plugin.Log.Warning("[FFmpeg] Audio writer did not finish in 5s; closing input with remaining packets unwritten.");
 
         // 关闭 stdin（发送 EOF）
         try { _stdin?.Flush(); _stdin?.Close(); } catch { }
@@ -325,9 +411,9 @@ internal sealed class FFmpegWriter : IOutputSink
         if (_process != null && !_process.HasExited)
         {
             Plugin.Log.Info("[FFmpeg] Waiting for FFmpeg to finalize...");
-            if (!_process.WaitForExit(10_000))
+            if (!_process.WaitForExit(30_000))
             {
-                Plugin.Log.Warning("[FFmpeg] FFmpeg did not exit in 10s, killing.");
+                Plugin.Log.Warning("[FFmpeg] FFmpeg did not exit in 30s, killing.");
                 try { _process.Kill(); } catch { }
             }
         }

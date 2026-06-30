@@ -118,7 +118,7 @@ internal sealed class ConfigWindow : Window
         config.TargetFps = fps;
 
         bool hw = config.UseHardwareEncoder;
-        ImGui.Checkbox("使用硬件编码器 (实验)", ref hw);
+        ImGui.Checkbox("使用硬件编码器", ref hw);
         config.UseHardwareEncoder = hw;
 
         bool lowLat = config.LowLatencyMode;
@@ -169,7 +169,7 @@ internal sealed class ConfigWindow : Window
         }
         ImGui.TextDisabled($"实际: {config.ResolvePreset()}");
 
-        ImGui.TextDisabled("auto 当前使用 libx264。3440x1440 软件编码建议 30fps/ultrafast；硬件编码器依赖 GPU 驱动。");
+        ImGui.TextDisabled("auto 会按硬件编码开关选择 h264_nvenc 或 libx264。若驱动异常，可手动切回 libx264。");
     }
 
     private void DrawOutputSettings(Configuration config)

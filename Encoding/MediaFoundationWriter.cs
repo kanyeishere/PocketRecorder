@@ -314,7 +314,7 @@ internal sealed unsafe class MediaFoundationWriter : IOutputSink
         }
     }
 
-    public void Stop()
+    public void Stop(TimeSpan? finalVideoDuration = null)
     {
         if (_sinkWriter == null) return;
 

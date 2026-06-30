@@ -411,7 +411,7 @@ internal sealed unsafe class WindowGraphicsCapture : IDisposable
                         ? 0
                         : (long)(systemRelativeTime.TotalMilliseconds * 10_000);
 
-                    frame = new VideoFrame(buffer, (int)width, (int)height, dstStride, timestampHns);
+                    frame = new VideoFrame(buffer, (int)width, (int)height, dstStride, timestampHns, VideoPixelFormat.Bgra);
                 }
             }
             finally

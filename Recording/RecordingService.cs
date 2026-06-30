@@ -133,7 +133,7 @@ internal sealed class RecordingService : IDisposable
             try
             {
                 _writer.Start(
-                    new VideoFormat(_videoWidth, _videoHeight, _videoFps),
+                    new VideoFormat(_videoWidth, _videoHeight, _videoFps, frame.PixelFormat),
                     audioFormat);
                 _isRecording = true;
                 _recordStart = DateTime.Now;
@@ -185,14 +185,15 @@ internal sealed class RecordingService : IDisposable
             return;
         }
 
-        Plugin.Log.Info($"[Record] Stopping... frames={_frameCount}, duration={Elapsed}");
+        TimeSpan finalDuration = Elapsed;
+        Plugin.Log.Info($"[Record] Stopping... frames={_frameCount}, duration={finalDuration}");
 
         // 停止捕获
         _videoCapture?.Stop();
         _audioCapture?.Stop();
 
         // 完成 writer
-        _writer?.Stop();
+        _writer?.Stop(finalDuration);
         _writer?.Dispose();
         _writer = null;
 
