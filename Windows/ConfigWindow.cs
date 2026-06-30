@@ -281,7 +281,10 @@ internal sealed class ConfigWindow : Window
 
     private void DrawBundledFFmpegControls(Configuration config)
     {
-        if (_ffmpegInstallInProgress)
+        bool bootstrapBusy = _plugin.IsFFmpegBootstrapRunning && !_plugin.IsFFmpegBootstrapComplete;
+        bool busy = _ffmpegInstallInProgress || bootstrapBusy;
+
+        if (busy)
         {
             ImGui.BeginDisabled();
             ImGui.Button("下载中", new Vector2(-1, 0));
@@ -292,8 +295,12 @@ internal sealed class ConfigWindow : Window
             StartBundledFFmpegInstall(config);
         }
 
-        if (!string.IsNullOrWhiteSpace(_ffmpegInstallStatus))
-            ImGui.TextDisabled(_ffmpegInstallStatus);
+        string status = _ffmpegInstallStatus;
+        if (string.IsNullOrWhiteSpace(status))
+            status = _plugin.FFmpegBootstrapStatus;
+
+        if (!string.IsNullOrWhiteSpace(status))
+            ImGui.TextDisabled(status);
     }
 
     private void StartBundledFFmpegInstall(Configuration config)

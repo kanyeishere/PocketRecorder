@@ -1,27 +1,21 @@
 using Dalamud.Hooking;
-using Dalamud.Interface;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using TerraFX.Interop.DirectX;
-using TerraFX.Interop.Windows;
 using DXGI_FORMAT = TerraFX.Interop.DirectX.DXGI_FORMAT;
 
 namespace Recorder.Capture;
 
 /// <summary>
 /// 视频捕获服务。
-/// 主方案：Framework.Update + FFXIVClientStructs BackBuffer（后台可用，不阻塞渲染线程）
-/// 备选方案：Hook IDXGISwapChain::Present（在 Present 前捕获）
-/// 最后方案：Windows Graphics Capture API
+/// 通过 Hook IDXGISwapChain::Present 在 Present 前直接捕获游戏 D3D11 backbuffer。
 /// </summary>
 internal sealed unsafe class VideoCaptureService : IDisposable
 {
-    private readonly IUiBuilder _uiBuilder;
     private readonly IGameInteropProvider _gameInterop;
-    private readonly IFramework _framework;
     private readonly Action<VideoFrame> _onFrame;
     private readonly Func<bool>? _shouldCaptureFrame;
 
@@ -34,22 +28,27 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     private IntPtr _stagingDevice;
     private int _stagingWriteIndex;
     private int _stagingReadyCount;
-    private ID3D11Multithread* _d3d11Multithread;
-    private IntPtr _multithreadContext;
-    private bool _multithreadUnavailableLogged;
+    private ID3D11Texture2D* _nv12SourceTexture;
+    private ID3D11ShaderResourceView* _nv12SourceSrv;
+    private ID3D11Buffer* _nv12OutputBuffer;
+    private ID3D11UnorderedAccessView* _nv12OutputUav;
+    private ID3D11Buffer* _nv12ConstantBuffer;
+    private ID3D11ComputeShader* _nv12ComputeShader;
+    private IntPtr _nv12ShaderDevice;
+    private readonly IntPtr[] _nv12ReadbackBuffers = new IntPtr[StagingTextureCount];
+    private uint _nv12Width;
+    private uint _nv12Height;
+    private DXGI_FORMAT _nv12Format;
+    private IntPtr _nv12Device;
+    private int _nv12DataSize;
+    private int _nv12WriteIndex;
+    private int _nv12ReadyCount;
+    private bool _nv12Disabled;
+    private bool _nv12FallbackLogged;
+    private VideoPixelFormat? _lockedOutputPixelFormat;
 
-    // Present Hook（备选）
+    // Present Hook
     private Hook<PresentDelegate>? _presentHook;
-
-    // Windows Graphics Capture（最后方案）
-    private WindowGraphicsCapture? _wgcCapture;
-
-    private enum CaptureBackend
-    {
-        FrameworkUpdate,
-        PresentHook,
-        WindowsGraphicsCapture,
-    }
 
     // 状态
     private bool _capturing;
@@ -63,17 +62,93 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     private int _errorCount;
     private int _consecutiveBlackFrames;
     private bool _presentHookEnabled;
-    private int _diagnosedBackendMask;
-    private CaptureBackend _activeBackend = CaptureBackend.FrameworkUpdate;
+    private bool _diagnosedFirstFrame;
+    private bool _diagnosedReadbackFrame;
+    private bool _loggedBackBufferSuccess;
     private string _captureMethod = "unknown";
 
-    private const int MaxBlackFramesBeforeFallback = 3;
+    private const int MaxConsecutiveEmptyFramesBeforeWarning = 3;
     private const int StagingTextureCount = 3;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
+    private const string Nv12ComputeShaderSource = @"
+Texture2D<float4> SourceTexture : register(t0);
+RWByteAddressBuffer Nv12Output : register(u0);
+
+cbuffer Nv12Constants : register(b0)
+{
+    uint Width;
+    uint Height;
+    uint Padding0;
+    uint Padding;
+};
+
+float3 LoadRgb(uint2 p)
+{
+    p.x = min(p.x, Width - 1);
+    p.y = min(p.y, Height - 1);
+    float4 c = SourceTexture.Load(int3(p, 0));
+    return c.rgb;
+}
+
+uint PackByte(uint value, uint byteIndex)
+{
+    return (value & 0xffu) << (byteIndex * 8u);
+}
+
+uint Pack4(uint b0, uint b1, uint b2, uint b3)
+{
+    return PackByte(b0, 0u) | PackByte(b1, 1u) | PackByte(b2, 2u) | PackByte(b3, 3u);
+}
+
+uint ToY(float3 rgb)
+{
+    float y = 16.0 + 219.0 * dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    return (uint)clamp(round(y), 16.0, 235.0);
+}
+
+uint ToU(float3 rgb)
+{
+    float u = 128.0 + 224.0 * dot(rgb, float3(-0.114572, -0.385428, 0.500000));
+    return (uint)clamp(round(u), 16.0, 240.0);
+}
+
+uint ToV(float3 rgb)
+{
+    float v = 128.0 + 224.0 * dot(rgb, float3(0.500000, -0.454153, -0.045847));
+    return (uint)clamp(round(v), 16.0, 240.0);
+}
+
+[numthreads(16, 16, 1)]
+void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint blockX = dispatchThreadId.x * 4u;
+    uint blockY = dispatchThreadId.y * 2u;
+    if (blockX >= Width || blockY >= Height)
+        return;
+
+    float3 c00 = LoadRgb(uint2(blockX + 0u, blockY + 0u));
+    float3 c10 = LoadRgb(uint2(blockX + 1u, blockY + 0u));
+    float3 c20 = LoadRgb(uint2(blockX + 2u, blockY + 0u));
+    float3 c30 = LoadRgb(uint2(blockX + 3u, blockY + 0u));
+    float3 c01 = LoadRgb(uint2(blockX + 0u, blockY + 1u));
+    float3 c11 = LoadRgb(uint2(blockX + 1u, blockY + 1u));
+    float3 c21 = LoadRgb(uint2(blockX + 2u, blockY + 1u));
+    float3 c31 = LoadRgb(uint2(blockX + 3u, blockY + 1u));
+
+    uint yBase0 = blockY * Width + blockX;
+    uint yBase1 = (blockY + 1u) * Width + blockX;
+    Nv12Output.Store(yBase0, Pack4(ToY(c00), ToY(c10), ToY(c20), ToY(c30)));
+    Nv12Output.Store(yBase1, Pack4(ToY(c01), ToY(c11), ToY(c21), ToY(c31)));
+
+    uint uvBase = Width * Height + (blockY / 2u) * Width + blockX;
+    float3 avg0 = (c00 + c10 + c01 + c11) * 0.25;
+    float3 avg1 = (c20 + c30 + c21 + c31) * 0.25;
+    Nv12Output.Store(uvBase, Pack4(ToU(avg0), ToV(avg0), ToU(avg1), ToV(avg1)));
+}
+";
 
     private static readonly Guid IID_ID3D11Texture2D = new(0x6F15AAF2, 0xD208, 0x4E89, 0x9A, 0xB4, 0x48, 0x95, 0x35, 0xD3, 0x4F, 0x9C);
     private static readonly Guid IID_ID3D11Device = new(0xdb6f6ddb, 0xac77, 0x4e88, 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40);
-    private static readonly Guid IID_ID3D11Multithread = new(0x9B7E4E00, 0x342C, 0x4106, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0);
 
     public int CurrentWidth { get; private set; }
     public int CurrentHeight { get; private set; }
@@ -81,59 +156,49 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int PresentDelegate(IntPtr swapChain, uint syncInterval, uint flags);
 
-    public VideoCaptureService(IUiBuilder uiBuilder, IGameInteropProvider gameInterop, IFramework framework, Action<VideoFrame> onFrame, Func<bool>? shouldCaptureFrame = null)
+    public VideoCaptureService(IGameInteropProvider gameInterop, Action<VideoFrame> onFrame, Func<bool>? shouldCaptureFrame = null)
     {
-        _uiBuilder = uiBuilder;
         _gameInterop = gameInterop;
-        _framework = framework;
         _onFrame = onFrame;
         _shouldCaptureFrame = shouldCaptureFrame;
     }
 
-    public void Start(int targetFps)
+    public bool Start(int targetFps)
     {
         _targetFps = targetFps;
-        _capturing = true;
+        _capturing = false;
         _frameCount = 0;
         _skipCount = 0;
         _backpressureSkipCount = 0;
         _errorCount = 0;
         _consecutiveBlackFrames = 0;
         _presentHookEnabled = false;
-        _diagnosedBackendMask = 0;
-        _activeBackend = CaptureBackend.PresentHook;
+        _diagnosedFirstFrame = false;
+        _diagnosedReadbackFrame = false;
+        _loggedBackBufferSuccess = false;
+        _nv12Disabled = false;
+        _nv12FallbackLogged = false;
+        _lockedOutputPixelFormat = null;
         _lastFrameTicks = 0;
         _sw.Restart();
 
-        // 默认用 Present Hook 在 Present 前捕获，避免 Framework.Update 读到渲染中间态。
         if (TryInstallPresentHook(enable: true))
         {
+            _capturing = true;
             _captureMethod = "PresentHook";
             Plugin.Log!.Info($"[Video] Capture started, targetFps={targetFps}, method=PresentHook");
-            return;
+            return true;
         }
 
-        _activeBackend = CaptureBackend.FrameworkUpdate;
-        _framework.Update += OnFrameworkUpdate;
-        _captureMethod = "FrameworkUpdate";
-        Plugin.Log!.Warning("[Video] Present hook unavailable; capture started with FrameworkUpdate fallback.");
+        _sw.Stop();
+        _captureMethod = "Unavailable";
+        Plugin.Log!.Error("[Video] Present hook unavailable; capture was not started.");
+        return false;
     }
 
     public void Stop()
     {
         _capturing = false;
-        _activeBackend = CaptureBackend.FrameworkUpdate;
-
-        // 取消 Framework.Update 订阅
-        _framework.Update -= OnFrameworkUpdate;
-
-        // 停止 WGC 后备
-        if (_wgcCapture != null)
-        {
-            _wgcCapture.Stop();
-            _wgcCapture.Dispose();
-            _wgcCapture = null;
-        }
 
         // 卸载 hook
         if (_presentHook != null)
@@ -152,80 +217,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     }
 
     // ──────────────────────────────────────────────────────────
-    //  主方案：Framework.Update + FFXIVClientStructs BackBuffer
-    // ──────────────────────────────────────────────────────────
-
-    private void OnFrameworkUpdate(IFramework framework)
-    {
-        if (!_capturing || _activeBackend != CaptureBackend.FrameworkUpdate) return;
-
-        try
-        {
-            CaptureViaFrameworkUpdate();
-        }
-        catch (Exception ex)
-        {
-            _errorCount++;
-            if (_errorCount <= 5 || _errorCount % 100 == 0)
-                Plugin.Log!.Warning($"[Video] Framework.Update capture failed (#{_errorCount}): {ex.Message}");
-        }
-    }
-
-    private unsafe void CaptureViaFrameworkUpdate()
-    {
-        long now = _sw.ElapsedTicks;
-        long minInterval = Stopwatch.Frequency / _targetFps;
-        if (now - _lastFrameTicks < minInterval) return;
-        _lastFrameTicks = now;
-        if (ShouldSkipCaptureForBackpressure()) return;
-
-        Device* gameDevice = Device.Instance();
-        if (gameDevice == null) { _skipCount++; return; }
-
-        SwapChain* gameSwapChain = gameDevice->SwapChain;
-        if (gameSwapChain == null) { _skipCount++; return; }
-
-        // 获取 BackBuffer 的 D3D11Texture2D
-        Texture* backBufferTex = gameSwapChain->BackBuffer;
-        if (backBufferTex == null) { _skipCount++; return; }
-
-        ID3D11Texture2D* backBuffer = (ID3D11Texture2D*)backBufferTex->D3D11Texture2D;
-        if (backBuffer == null) { _skipCount++; return; }
-
-        // 通过 SwapChain 的 DXGI 接口获取游戏设备
-        IDXGISwapChain* dxgiSwapChain = (IDXGISwapChain*)gameSwapChain->DXGISwapChain;
-        if (dxgiSwapChain == null) { _skipCount++; return; }
-
-        ID3D11Device* device = null;
-        Guid iidDev = IID_ID3D11Device;
-        int hr = dxgiSwapChain->GetDevice(&iidDev, (void**)&device);
-        if (hr < 0 || device == null)
-        {
-            _skipCount++;
-            if (_skipCount <= 3)
-                Plugin.Log!.Warning($"[Video] SwapChain->GetDevice failed: 0x{hr:X8}");
-            return;
-        }
-        _device = device;
-
-        ID3D11DeviceContext* ctx;
-        _device->GetImmediateContext(&ctx);
-        if (ctx == null) { _skipCount++; _device->Release(); return; }
-
-        try
-        {
-            // 注意：BackBuffer 不需要 Release（它是 gameSwapChain 拥有的）
-            // 但 GetDevice 返回的 device 需要 Release
-            ProcessTexture(ctx, backBuffer, now, releaseDevice: true);
-        }
-        finally
-        {
-            ctx->Release();
-        }
-    }
-
-    // ──────────────────────────────────────────────────────────
-    //  备选方案：Present Hook
+    //  Present Hook 捕获
     // ──────────────────────────────────────────────────────────
 
     private bool TryInstallPresentHook(bool enable)
@@ -295,7 +287,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
 
     private int OnPresentDetour(IntPtr swapChainPtr, uint syncInterval, uint flags)
     {
-        if (_capturing && _activeBackend == CaptureBackend.PresentHook)
+        if (_capturing)
         {
             try
             {
@@ -322,8 +314,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
 
         var swapChain = (IDXGISwapChain*)swapChainPtr;
 
-        // ★ 关键修复：从 SwapChain 获取游戏自己的 D3D11 Device
-        // 之前用 _uiBuilder.DeviceHandle 获取的是 ImGui 的设备，跨设备 CopyResource 会产生黑帧
+        // 从 SwapChain 获取游戏自己的 D3D11 Device，避免跨设备 CopyResource 造成黑帧。
         Guid iidDev = IID_ID3D11Device;
         ID3D11Device* gameDevice = null;
         int hrDev = swapChain->GetDevice(&iidDev, (void**)&gameDevice);
@@ -342,31 +333,22 @@ internal sealed unsafe class VideoCaptureService : IDisposable
 
         try
         {
-            // 尝试 GetBuffer 获取 backbuffer
             ID3D11Texture2D* backBuffer = null;
             Guid iidTex2D = IID_ID3D11Texture2D;
             int hr = swapChain->GetBuffer(0, &iidTex2D, (void**)&backBuffer);
-            bool needRelease = hr >= 0;
-
             if (hr < 0 || backBuffer == null)
             {
-                // fallback: FFXIVClientStructs BackBuffer
-                Device* kernelDevice = Device.Instance();
-                if (kernelDevice != null && kernelDevice->SwapChain != null && kernelDevice->SwapChain->BackBuffer != null)
-                {
-                    backBuffer = (ID3D11Texture2D*)kernelDevice->SwapChain->BackBuffer->D3D11Texture2D;
-                    needRelease = false;
-                    if (_frameCount == 0 && backBuffer != null)
-                        Plugin.Log!.Info("[Video] Present: GetBuffer(0) failed, using FFXIVClientStructs BackBuffer");
-                }
-            }
-            else
-            {
-                if (_frameCount == 0)
-                    Plugin.Log!.Info("[Video] Present: ✓ GetBuffer(0) succeeded");
+                _skipCount++;
+                if (_skipCount <= 3)
+                    Plugin.Log!.Warning($"[Video] Present: GetBuffer(0) failed: 0x{hr:X8}");
+                return;
             }
 
-            if (backBuffer == null) { _skipCount++; return; }
+            if (!_loggedBackBufferSuccess)
+            {
+                _loggedBackBufferSuccess = true;
+                Plugin.Log!.Info("[Video] Present: GetBuffer(0) succeeded.");
+            }
 
             try
             {
@@ -374,7 +356,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
             }
             finally
             {
-                if (needRelease) backBuffer->Release();
+                backBuffer->Release();
             }
         }
         finally
@@ -386,6 +368,169 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     // ──────────────────────────────────────────────────────────
     //  共享：纹理处理
     // ──────────────────────────────────────────────────────────
+
+    private bool TryProcessTextureAsNv12(
+        ID3D11DeviceContext* ctx,
+        ID3D11Texture2D* srcTexture,
+        uint width,
+        uint height,
+        DXGI_FORMAT format,
+        long timestampTicks,
+        bool diagnoseThisFrame)
+    {
+        if (_nv12Disabled)
+            return _lockedOutputPixelFormat == VideoPixelFormat.Nv12 &&
+                   SkipLockedNv12Frame("NV12 path is disabled");
+
+        if (_lockedOutputPixelFormat is { } lockedFormat && lockedFormat != VideoPixelFormat.Nv12)
+            return false;
+
+        if (!IsNv12SupportedInput(format) || (width & 3) != 0 || (height & 1) != 0)
+        {
+            DisableNv12Path($"unsupported source for NV12 path: {width}x{height}, format={format}");
+            return _lockedOutputPixelFormat == VideoPixelFormat.Nv12 &&
+                   SkipLockedNv12Frame("source format or dimensions no longer support NV12 conversion");
+        }
+
+        try
+        {
+            if (!EnsureNv12Resources(width, height, format))
+            {
+                return _lockedOutputPixelFormat == VideoPixelFormat.Nv12 &&
+                       SkipLockedNv12Frame("NV12 resources could not be created");
+            }
+
+            ID3D11Buffer* writeBuffer = _nv12OutputBuffer;
+            ID3D11Buffer* readBuffer = _nv12ReadyCount >= StagingTextureCount - 1
+                ? (ID3D11Buffer*)_nv12ReadbackBuffers[(_nv12WriteIndex + 1) % StagingTextureCount]
+                : null;
+
+            bool mappedOk = false;
+            string? disableNv12AfterReadback = null;
+            VideoFrame? frame = null;
+
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            try
+            {
+                ctx->CopyResource((ID3D11Resource*)_nv12SourceTexture, (ID3D11Resource*)srcTexture);
+                DispatchNv12Conversion(ctx, width, height, format);
+
+                ID3D11Buffer* stagingWrite = (ID3D11Buffer*)_nv12ReadbackBuffers[_nv12WriteIndex];
+                ctx->CopyResource((ID3D11Resource*)stagingWrite, (ID3D11Resource*)writeBuffer);
+
+                _nv12WriteIndex = (_nv12WriteIndex + 1) % StagingTextureCount;
+                if (_nv12ReadyCount < StagingTextureCount)
+                    _nv12ReadyCount++;
+
+                if (readBuffer == null)
+                    return true;
+
+                int hr = ctx->Map(
+                    (ID3D11Resource*)readBuffer,
+                    0,
+                    D3D11_MAP.D3D11_MAP_READ,
+                    (uint)D3D11_MAP_FLAG.D3D11_MAP_FLAG_DO_NOT_WAIT,
+                    &mapped);
+                if (hr < 0)
+                {
+                    _skipCount++;
+                    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+                    {
+                        if (_skipCount <= 3 || _skipCount % 300 == 0)
+                            Plugin.Log!.Info($"[Video] NV12 readback not ready; skipped without blocking. skipped={_skipCount}");
+                    }
+                    else if (_skipCount <= 3)
+                    {
+                        Plugin.Log!.Warning($"[Video] NV12 Map failed: 0x{hr:X8}");
+                    }
+
+                    return true;
+                }
+
+                mappedOk = true;
+
+                byte[]? rentedBuffer = VideoFrame.RentBuffer(_nv12DataSize);
+                byte[] buffer = rentedBuffer;
+                try
+                {
+                    Marshal.Copy((IntPtr)mapped.pData, buffer, 0, _nv12DataSize);
+
+                    bool isEmptyFrame = IsNv12FrameEmpty(buffer, (int)width, (int)height);
+                    if (diagnoseThisFrame)
+                    {
+                        Plugin.Log!.Info($"[Video] NV12 path enabled: {width}x{height}, bytes={_nv12DataSize}, sourceFormat={format}");
+                        DiagnoseNv12Pixels(buffer, (int)width, (int)height);
+                        MarkReadbackDiagnosed();
+                    }
+
+                    if (isEmptyFrame)
+                    {
+                        _consecutiveBlackFrames++;
+                        LogConsecutiveEmptyFrames("NV12");
+                        if (_lockedOutputPixelFormat == null &&
+                            _consecutiveBlackFrames >= MaxConsecutiveEmptyFramesBeforeWarning)
+                        {
+                            disableNv12AfterReadback = "NV12 path produced consecutive empty frames before the encoder locked its input format.";
+                        }
+                    }
+                    else
+                    {
+                        _consecutiveBlackFrames = 0;
+                        long timestampHns = timestampTicks * 10_000_000L / Stopwatch.Frequency;
+                        _lockedOutputPixelFormat ??= VideoPixelFormat.Nv12;
+                        frame = new VideoFrame(buffer, _nv12DataSize, (int)width, (int)height, (int)width, timestampHns, VideoPixelFormat.Nv12, ownsBuffer: true);
+                        rentedBuffer = null;
+                    }
+                }
+                finally
+                {
+                    if (rentedBuffer != null)
+                        VideoFrame.ReturnBuffer(rentedBuffer);
+                }
+            }
+            finally
+            {
+                if (mappedOk)
+                    ctx->Unmap((ID3D11Resource*)readBuffer, 0);
+            }
+
+            if (disableNv12AfterReadback != null)
+            {
+                DisableNv12Path(disableNv12AfterReadback);
+                return false;
+            }
+
+            if (frame != null)
+            {
+                bool delivered = false;
+                try
+                {
+                    _onFrame(frame);
+                    delivered = true;
+                }
+                finally
+                {
+                    if (!delivered)
+                        frame.ReturnBuffer();
+                }
+
+                _frameCount++;
+
+                if (_frameCount % 300 == 0)
+                    Plugin.Log!.Info($"[Video] {CurrentWidth}x{CurrentHeight} NV12 frame #{_frameCount}, method={_captureMethod}");
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DisableNv12Path($"NV12 GPU conversion failed: {ex.Message}");
+            if (_lockedOutputPixelFormat == VideoPixelFormat.Nv12)
+                return SkipLockedNv12Frame("NV12 GPU conversion failed after the encoder locked its input format");
+
+            return false;
+        }
+    }
 
     /// <summary>
     /// 处理纹理：CopyResource → Map → 读取像素 → 回调
@@ -401,7 +546,8 @@ internal sealed unsafe class VideoCaptureService : IDisposable
             uint width = desc.Width;
             uint height = desc.Height;
             DXGI_FORMAT format = desc.Format;
-            bool diagnoseThisBackend = ShouldDiagnoseBackend(_activeBackend);
+            bool diagnoseTexture = ShouldDiagnoseFirstFrame();
+            bool diagnoseReadback = ShouldDiagnoseReadbackFrame();
 
             CurrentWidth = (int)width;
             CurrentHeight = (int)height;
@@ -420,12 +566,15 @@ internal sealed unsafe class VideoCaptureService : IDisposable
                 return;
             }
 
-            if (diagnoseThisBackend)
+            if (diagnoseTexture)
             {
-                Plugin.Log!.Info($"[Video] {_activeBackend} first frame: {width}x{height}, format={format}, " +
+                Plugin.Log!.Info($"[Video] PresentHook first frame: {width}x{height}, format={format}, " +
                     $"usage={desc.Usage}, bindFlags=0x{desc.BindFlags:X}, cpuAccess=0x{desc.CPUAccessFlags:X}, " +
                     $"miscFlags=0x{desc.MiscFlags:X}, mips={desc.MipLevels}, sample={desc.SampleDesc.Count}/{desc.SampleDesc.Quality}");
             }
+
+            if (TryProcessTextureAsNv12(ctx, srcTexture, width, height, format, timestampTicks, diagnoseReadback))
+                return;
 
             if (!EnsureStagingTextures(width, height, format))
                 return;
@@ -435,12 +584,7 @@ internal sealed unsafe class VideoCaptureService : IDisposable
                 ? (ID3D11Texture2D*)_stagingTextures[(_stagingWriteIndex + 1) % StagingTextureCount]
                 : null;
 
-            bool useD3D11MultithreadProtection = _activeBackend != CaptureBackend.PresentHook;
-            if (useD3D11MultithreadProtection)
-                EnsureD3D11MultithreadProtection(ctx);
-            bool d3dLocked = useD3D11MultithreadProtection && EnterD3D11Multithread();
             bool mappedOk = false;
-            bool switchBackendAfterReadback = false;
             VideoFrame? frame = null;
 
             D3D11_MAPPED_SUBRESOURCE mapped;
@@ -513,9 +657,10 @@ internal sealed unsafe class VideoCaptureService : IDisposable
 
                         bool isEmptyFrame = IsFrameEmpty(buffer, (int)width, (int)height, dstStride);
 
-                        if (diagnoseThisBackend)
+                        if (diagnoseReadback)
                         {
                             DiagnosePixels(buffer, (int)width, (int)height, dstStride);
+                            MarkReadbackDiagnosed();
                         }
 
                         VideoPixelFormat pixelFormat =
@@ -529,19 +674,25 @@ internal sealed unsafe class VideoCaptureService : IDisposable
                         if (isEmptyFrame)
                         {
                             _consecutiveBlackFrames++;
-                            if (_consecutiveBlackFrames >= MaxBlackFramesBeforeFallback)
-                            {
-                                Plugin.Log!.Warning($"[Video] {_consecutiveBlackFrames} consecutive empty frames on {_captureMethod}! Switching capture backend.");
-                                switchBackendAfterReadback = true;
-                            }
+                            LogConsecutiveEmptyFrames(pixelFormat.ToString());
                         }
                         else
                         {
                             _consecutiveBlackFrames = 0;
 
                             long timestampHns = timestampTicks * 10_000_000L / Stopwatch.Frequency;
-                            frame = new VideoFrame(buffer, dataSize, (int)width, (int)height, dstStride, timestampHns, pixelFormat, ownsBuffer: true);
-                            rentedBuffer = null;
+                            if (_lockedOutputPixelFormat is { } lockedFormat && lockedFormat != pixelFormat)
+                            {
+                                _skipCount++;
+                                if (_skipCount <= 3 || _skipCount % 300 == 0)
+                                    Plugin.Log!.Warning($"[Video] Skipping {pixelFormat} frame because recording input is locked to {lockedFormat}.");
+                            }
+                            else
+                            {
+                                _lockedOutputPixelFormat ??= pixelFormat;
+                                frame = new VideoFrame(buffer, dataSize, (int)width, (int)height, dstStride, timestampHns, pixelFormat, ownsBuffer: true);
+                                rentedBuffer = null;
+                            }
                         }
                     }
                     finally
@@ -555,15 +706,6 @@ internal sealed unsafe class VideoCaptureService : IDisposable
             {
                 if (mappedOk)
                     ctx->Unmap((ID3D11Resource*)readTexture, 0);
-
-                if (d3dLocked)
-                    LeaveD3D11Multithread();
-            }
-
-            if (switchBackendAfterReadback)
-            {
-                HandleBlackFrameFallback();
-                return;
             }
 
             if (frame != null)
@@ -597,178 +739,43 @@ internal sealed unsafe class VideoCaptureService : IDisposable
     }
 
     // ──────────────────────────────────────────────────────────
-    //  最后方案：Windows Graphics Capture
-    // ──────────────────────────────────────────────────────────
-
-    private void HandleBlackFrameFallback()
-    {
-        try
-        {
-            if (_activeBackend == CaptureBackend.FrameworkUpdate)
-            {
-                if (TrySwitchToPresentHook())
-                    return;
-
-                if (TrySwitchToWgcFallback())
-                    return;
-            }
-            else if (_activeBackend == CaptureBackend.PresentHook)
-            {
-                if (TrySwitchToWgcFallback())
-                    return;
-            }
-
-            Plugin.Log!.Warning("[Video] No fallback backend could be activated; keeping current capture path.");
-        }
-        finally
-        {
-            _consecutiveBlackFrames = 0;
-        }
-    }
-
-    private bool TrySwitchToPresentHook()
-    {
-        if (_activeBackend != CaptureBackend.FrameworkUpdate)
-            return true;
-
-        if (!TryInstallPresentHook(enable: true))
-            return false;
-
-        _framework.Update -= OnFrameworkUpdate;
-        _activeBackend = CaptureBackend.PresentHook;
-        _captureMethod = "PresentHook";
-        Plugin.Log!.Info("[Video] Switched to Present Hook fallback.");
-        return true;
-    }
-
-    private bool TrySwitchToWgcFallback()
-    {
-        if (_activeBackend == CaptureBackend.WindowsGraphicsCapture)
-            return true;
-
-        if (!TryGetDeviceForWgc(out IntPtr deviceHandle, out bool releaseDevice, out string deviceSource))
-            return false;
-
-        IntPtr hwnd = _uiBuilder.WindowHandlePtr;
-
-        Plugin.Log!.Info($"[Video] Starting WGC: hwnd=0x{hwnd:X}, device=0x{deviceHandle:X}, source={deviceSource}");
-
-        WindowGraphicsCapture wgcCapture;
-        try
-        {
-            wgcCapture = new WindowGraphicsCapture(deviceHandle, _targetFps, OnWgcFrame, _shouldCaptureFrame);
-        }
-        finally
-        {
-            if (releaseDevice)
-                ((ID3D11Device*)deviceHandle)->Release();
-        }
-
-        if (!wgcCapture.Start(hwnd))
-        {
-            Plugin.Log!.Error("[Video] WGC start failed. Staying on the current capture backend.");
-            wgcCapture.Dispose();
-            return false;
-        }
-
-        if (_activeBackend == CaptureBackend.FrameworkUpdate)
-            _framework.Update -= OnFrameworkUpdate;
-
-        if (_presentHook != null && _presentHookEnabled)
-        {
-            try { _presentHook.Disable(); } catch { }
-            _presentHookEnabled = false;
-        }
-
-        _wgcCapture = wgcCapture;
-        _activeBackend = CaptureBackend.WindowsGraphicsCapture;
-        _captureMethod = "WindowsGraphicsCapture";
-        Plugin.Log!.Info("[Video] Switched to Windows Graphics Capture fallback.");
-        return true;
-    }
-
-    private bool TryGetDeviceForWgc(out IntPtr deviceHandle, out bool releaseDevice, out string source)
-    {
-        deviceHandle = IntPtr.Zero;
-        releaseDevice = false;
-        source = "none";
-
-        try
-        {
-            Device* gameDevice = Device.Instance();
-            SwapChain* gameSwapChain = gameDevice != null ? gameDevice->SwapChain : null;
-            IDXGISwapChain* dxgiSwapChain = gameSwapChain != null ? (IDXGISwapChain*)gameSwapChain->DXGISwapChain : null;
-            if (dxgiSwapChain != null)
-            {
-                Guid iidDev = IID_ID3D11Device;
-                ID3D11Device* d3d11Device = null;
-                int hr = dxgiSwapChain->GetDevice(&iidDev, (void**)&d3d11Device);
-                if (hr >= 0 && d3d11Device != null)
-                {
-                    deviceHandle = (IntPtr)d3d11Device;
-                    releaseDevice = true;
-                    source = "GameSwapChain";
-                    return true;
-                }
-
-                Plugin.Log!.Warning($"[Video] WGC: SwapChain->GetDevice failed: 0x{hr:X8}, trying UiBuilder device.");
-            }
-        }
-        catch (Exception ex)
-        {
-            Plugin.Log!.Warning($"[Video] WGC: failed to get game D3D11 device ({ex.Message}), trying UiBuilder device.");
-        }
-
-        deviceHandle = _uiBuilder.DeviceHandle;
-        if (deviceHandle == IntPtr.Zero)
-        {
-            Plugin.Log!.Error("[Video] WGC: UiBuilder.DeviceHandle is zero.");
-            return false;
-        }
-
-        source = "UiBuilder";
-        return true;
-    }
-
-    private void OnWgcFrame(VideoFrame frame)
-    {
-        if (!_capturing)
-        {
-            frame.ReturnBuffer();
-            return;
-        }
-
-        CurrentWidth = frame.Width;
-        CurrentHeight = frame.Height;
-        bool delivered = false;
-        try
-        {
-            _onFrame(frame);
-            delivered = true;
-        }
-        finally
-        {
-            if (!delivered)
-                frame.ReturnBuffer();
-        }
-
-        _frameCount++;
-
-        if (_frameCount % 300 == 0)
-            Plugin.Log!.Info($"[Video] {frame.Width}x{frame.Height} frame #{_frameCount} (WGC)");
-    }
-
-    // ──────────────────────────────────────────────────────────
     //  工具方法
     // ──────────────────────────────────────────────────────────
 
-    private bool ShouldDiagnoseBackend(CaptureBackend backend)
+    private bool ShouldDiagnoseFirstFrame()
     {
-        int bit = 1 << (int)backend;
-        if ((_diagnosedBackendMask & bit) != 0)
+        if (_diagnosedFirstFrame)
             return false;
 
-        _diagnosedBackendMask |= bit;
+        _diagnosedFirstFrame = true;
+        return true;
+    }
+
+    private bool ShouldDiagnoseReadbackFrame()
+    {
+        return !_diagnosedReadbackFrame;
+    }
+
+    private void MarkReadbackDiagnosed()
+    {
+        _diagnosedReadbackFrame = true;
+    }
+
+    private void LogConsecutiveEmptyFrames(string format)
+    {
+        if (_consecutiveBlackFrames == MaxConsecutiveEmptyFramesBeforeWarning ||
+            _consecutiveBlackFrames % 300 == 0)
+        {
+            Plugin.Log!.Warning($"[Video] {_consecutiveBlackFrames} consecutive empty {format} frames on {_captureMethod}; skipping them.");
+        }
+    }
+
+    private bool SkipLockedNv12Frame(string reason)
+    {
+        _skipCount++;
+        if (_skipCount <= 3 || _skipCount % 300 == 0)
+            Plugin.Log!.Warning($"[Video] Skipping frame because recording input is locked to NV12. {reason}.");
+
         return true;
     }
 
@@ -901,6 +908,333 @@ internal sealed unsafe class VideoCaptureService : IDisposable
         return true;
     }
 
+    private bool EnsureNv12Resources(uint width, uint height, DXGI_FORMAT format)
+    {
+        int dataSize = checked((int)(width * height * 3 / 2));
+        if (_nv12OutputBuffer != null &&
+            width == _nv12Width &&
+            height == _nv12Height &&
+            format == _nv12Format &&
+            _nv12Device == (IntPtr)_device &&
+            _nv12DataSize == dataSize)
+            return true;
+
+        ReleaseNv12Resources();
+
+        if (!EnsureNv12Shader())
+            return false;
+
+        D3D11_TEXTURE2D_DESC textureDesc = default;
+        textureDesc.Width = width;
+        textureDesc.Height = height;
+        textureDesc.MipLevels = 1;
+        textureDesc.ArraySize = 1;
+        DXGI_FORMAT shaderFormat = GetNv12ShaderReadableFormat(format);
+        textureDesc.Format = shaderFormat;
+        textureDesc.SampleDesc.Count = 1;
+        textureDesc.SampleDesc.Quality = 0;
+        textureDesc.Usage = D3D11_USAGE.D3D11_USAGE_DEFAULT;
+        textureDesc.BindFlags = (uint)D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE;
+        textureDesc.CPUAccessFlags = 0;
+        textureDesc.MiscFlags = 0;
+
+        ID3D11Texture2D* sourceTexture;
+        int hr = _device->CreateTexture2D(&textureDesc, null, &sourceTexture);
+        if (hr < 0 || sourceTexture == null)
+        {
+            DisableNv12Path($"CreateTexture2D(NV12 source) failed: 0x{hr:X8}");
+            return false;
+        }
+        _nv12SourceTexture = sourceTexture;
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = default;
+        srvDesc.Format = shaderFormat;
+        srvDesc.ViewDimension = D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+
+        ID3D11ShaderResourceView* sourceSrv;
+        hr = _device->CreateShaderResourceView((ID3D11Resource*)_nv12SourceTexture, &srvDesc, &sourceSrv);
+        if (hr < 0 || sourceSrv == null)
+        {
+            DisableNv12Path($"CreateShaderResourceView(NV12 source) failed: 0x{hr:X8}");
+            return false;
+        }
+        _nv12SourceSrv = sourceSrv;
+
+        D3D11_BUFFER_DESC outputDesc = default;
+        outputDesc.ByteWidth = (uint)dataSize;
+        outputDesc.Usage = D3D11_USAGE.D3D11_USAGE_DEFAULT;
+        outputDesc.BindFlags = (uint)D3D11_BIND_FLAG.D3D11_BIND_UNORDERED_ACCESS;
+        outputDesc.CPUAccessFlags = 0;
+        outputDesc.MiscFlags = (uint)D3D11_RESOURCE_MISC_FLAG.D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        outputDesc.StructureByteStride = 0;
+
+        ID3D11Buffer* outputBuffer;
+        hr = _device->CreateBuffer(&outputDesc, null, &outputBuffer);
+        if (hr < 0 || outputBuffer == null)
+        {
+            DisableNv12Path($"CreateBuffer(NV12 output) failed: 0x{hr:X8}");
+            return false;
+        }
+        _nv12OutputBuffer = outputBuffer;
+
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = default;
+        uavDesc.Format = DXGI_FORMAT.DXGI_FORMAT_R32_TYPELESS;
+        uavDesc.ViewDimension = D3D11_UAV_DIMENSION.D3D11_UAV_DIMENSION_BUFFER;
+        uavDesc.Buffer.FirstElement = 0;
+        uavDesc.Buffer.NumElements = (uint)((dataSize + 3) / 4);
+        uavDesc.Buffer.Flags = (uint)D3D11_BUFFER_UAV_FLAG.D3D11_BUFFER_UAV_FLAG_RAW;
+
+        ID3D11UnorderedAccessView* outputUav;
+        hr = _device->CreateUnorderedAccessView((ID3D11Resource*)_nv12OutputBuffer, &uavDesc, &outputUav);
+        if (hr < 0 || outputUav == null)
+        {
+            DisableNv12Path($"CreateUnorderedAccessView(NV12 output) failed: 0x{hr:X8}");
+            return false;
+        }
+        _nv12OutputUav = outputUav;
+
+        D3D11_BUFFER_DESC cbDesc = default;
+        cbDesc.ByteWidth = 16;
+        cbDesc.Usage = D3D11_USAGE.D3D11_USAGE_DEFAULT;
+        cbDesc.BindFlags = (uint)D3D11_BIND_FLAG.D3D11_BIND_CONSTANT_BUFFER;
+
+        ID3D11Buffer* constantBuffer;
+        hr = _device->CreateBuffer(&cbDesc, null, &constantBuffer);
+        if (hr < 0 || constantBuffer == null)
+        {
+            DisableNv12Path($"CreateBuffer(NV12 constants) failed: 0x{hr:X8}");
+            return false;
+        }
+        _nv12ConstantBuffer = constantBuffer;
+
+        D3D11_BUFFER_DESC stagingDesc = default;
+        stagingDesc.ByteWidth = (uint)dataSize;
+        stagingDesc.Usage = D3D11_USAGE.D3D11_USAGE_STAGING;
+        stagingDesc.BindFlags = 0;
+        stagingDesc.CPUAccessFlags = (uint)D3D11_CPU_ACCESS_FLAG.D3D11_CPU_ACCESS_READ;
+        stagingDesc.MiscFlags = 0;
+        stagingDesc.StructureByteStride = 0;
+
+        for (int i = 0; i < StagingTextureCount; i++)
+        {
+            ID3D11Buffer* readbackBuffer;
+            hr = _device->CreateBuffer(&stagingDesc, null, &readbackBuffer);
+            if (hr < 0 || readbackBuffer == null)
+            {
+                DisableNv12Path($"CreateBuffer(NV12 readback #{i}) failed: 0x{hr:X8}");
+                return false;
+            }
+
+            _nv12ReadbackBuffers[i] = (IntPtr)readbackBuffer;
+        }
+
+        _nv12Width = width;
+        _nv12Height = height;
+        _nv12Format = format;
+        _nv12Device = (IntPtr)_device;
+        _nv12DataSize = dataSize;
+        _nv12WriteIndex = 0;
+        _nv12ReadyCount = 0;
+        return true;
+    }
+
+    private bool EnsureNv12Shader()
+    {
+        if (_nv12ComputeShader != null && _nv12ShaderDevice == (IntPtr)_device)
+            return true;
+
+        if (_nv12ComputeShader != null)
+            ReleaseNv12Shader();
+
+        byte[] shaderBytes = System.Text.Encoding.ASCII.GetBytes(Nv12ComputeShaderSource);
+        IntPtr entryPoint = Marshal.StringToHGlobalAnsi("CSMain");
+        IntPtr target = Marshal.StringToHGlobalAnsi("cs_5_0");
+        fixed (byte* shaderSource = shaderBytes)
+        {
+            ID3DBlob* shaderBlob = null;
+            ID3DBlob* errorBlob = null;
+            int hr = DirectX.D3DCompile(
+                shaderSource,
+                (nuint)shaderBytes.Length,
+                null,
+                null,
+                null,
+                (sbyte*)entryPoint,
+                (sbyte*)target,
+                0,
+                0,
+                &shaderBlob,
+                &errorBlob);
+            try
+            {
+                if (hr < 0 || shaderBlob == null)
+                {
+                    string error = errorBlob != null
+                        ? Marshal.PtrToStringAnsi((IntPtr)errorBlob->GetBufferPointer(), (int)errorBlob->GetBufferSize()) ?? string.Empty
+                        : string.Empty;
+                    DisableNv12Path($"D3DCompile(NV12) failed: 0x{hr:X8} {error}");
+                    return false;
+                }
+
+                ID3D11ComputeShader* computeShader;
+                hr = _device->CreateComputeShader(shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(), null, &computeShader);
+                if (hr < 0 || computeShader == null)
+                {
+                    DisableNv12Path($"CreateComputeShader(NV12) failed: 0x{hr:X8}");
+                    return false;
+                }
+                _nv12ComputeShader = computeShader;
+                _nv12ShaderDevice = (IntPtr)_device;
+
+                return true;
+            }
+            finally
+            {
+                if (shaderBlob != null) shaderBlob->Release();
+                if (errorBlob != null) errorBlob->Release();
+                Marshal.FreeHGlobal(entryPoint);
+                Marshal.FreeHGlobal(target);
+            }
+        }
+    }
+
+    private void DispatchNv12Conversion(ID3D11DeviceContext* ctx, uint width, uint height, DXGI_FORMAT format)
+    {
+        uint[] constants =
+        {
+            width,
+            height,
+            0u,
+            0u,
+        };
+
+        fixed (uint* constantData = constants)
+            ctx->UpdateSubresource((ID3D11Resource*)_nv12ConstantBuffer, 0, null, constantData, 0, 0);
+
+        ID3D11ShaderResourceView* srv = _nv12SourceSrv;
+        ID3D11UnorderedAccessView* uav = _nv12OutputUav;
+        ID3D11Buffer* cb = _nv12ConstantBuffer;
+
+        ID3D11ComputeShader* oldShader = null;
+        ID3D11ClassInstance** oldClassInstances = stackalloc ID3D11ClassInstance*[256];
+        uint oldClassInstanceCount = 256;
+        ID3D11Buffer* oldCb = null;
+        ID3D11ShaderResourceView* oldSrv = null;
+        ID3D11UnorderedAccessView* oldUav = null;
+        ctx->CSGetShader(&oldShader, oldClassInstances, &oldClassInstanceCount);
+        ctx->CSGetConstantBuffers(0, 1, &oldCb);
+        ctx->CSGetShaderResources(0, 1, &oldSrv);
+        ctx->CSGetUnorderedAccessViews(0, 1, &oldUav);
+
+        try
+        {
+            ctx->CSSetShader(_nv12ComputeShader, null, 0);
+            ctx->CSSetConstantBuffers(0, 1, &cb);
+            ctx->CSSetShaderResources(0, 1, &srv);
+            ctx->CSSetUnorderedAccessViews(0, 1, &uav, null);
+            ctx->Dispatch((width / 4 + 15) / 16, (height / 2 + 15) / 16, 1);
+        }
+        finally
+        {
+            ID3D11ShaderResourceView* nullSrv = null;
+            ID3D11UnorderedAccessView* nullUav = null;
+            ID3D11Buffer* nullCb = null;
+            ctx->CSSetShaderResources(0, 1, &nullSrv);
+            ctx->CSSetUnorderedAccessViews(0, 1, &nullUav, null);
+            ctx->CSSetConstantBuffers(0, 1, &nullCb);
+
+            ctx->CSSetShader(oldShader, oldClassInstances, oldClassInstanceCount);
+            ctx->CSSetConstantBuffers(0, 1, &oldCb);
+            ctx->CSSetShaderResources(0, 1, &oldSrv);
+            ctx->CSSetUnorderedAccessViews(0, 1, &oldUav, null);
+
+            if (oldShader != null) oldShader->Release();
+            if (oldCb != null) oldCb->Release();
+            if (oldSrv != null) oldSrv->Release();
+            if (oldUav != null) oldUav->Release();
+            for (uint i = 0; i < oldClassInstanceCount; i++)
+            {
+                if (oldClassInstances[i] != null)
+                    oldClassInstances[i]->Release();
+            }
+        }
+    }
+
+    private static bool IsNv12SupportedInput(DXGI_FORMAT format)
+        => format == DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM ||
+           format == DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+           format == DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+           format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM ||
+           format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+           format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS;
+
+    private static DXGI_FORMAT GetNv12ShaderReadableFormat(DXGI_FORMAT format)
+        => format switch
+        {
+            DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM_SRGB or
+            DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB or
+            DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM,
+            _ => format,
+        };
+
+    private void DisableNv12Path(string reason)
+    {
+        _nv12Disabled = true;
+        ReleaseNv12Resources();
+        if (!_nv12FallbackLogged)
+        {
+            _nv12FallbackLogged = true;
+            Plugin.Log!.Warning($"[Video] NV12 GPU readback disabled; falling back to BGRA readback. {reason}");
+        }
+    }
+
+    private static bool IsNv12FrameEmpty(byte[] buffer, int width, int height)
+    {
+        int[] xs = { width / 4, width / 2, width * 3 / 4 };
+        int[] ys = { height / 4, height / 2, height * 3 / 4 };
+        foreach (int y in ys)
+        {
+            foreach (int x in xs)
+            {
+                int evenX = x & ~1;
+                int evenY = y & ~1;
+                int uvBase = width * height + (evenY / 2) * width + evenX;
+                if (buffer[y * width + x] != 0 || buffer[uvBase] != 0 || buffer[uvBase + 1] != 0)
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void DiagnoseNv12Pixels(byte[] buffer, int width, int height)
+    {
+        (int x, int y)[] pts =
+        {
+            (width / 4, height / 4),
+            (width / 2, height / 2),
+            (width * 3 / 4, height * 3 / 4),
+        };
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append("[Video] NV12 diagnostics:");
+        foreach (var (x, y) in pts)
+        {
+            int evenX = x & ~1;
+            int evenY = y & ~1;
+            int yValue = buffer[y * width + x];
+            int uvBase = width * height + (evenY / 2) * width + evenX;
+            int uValue = buffer[uvBase];
+            int vValue = buffer[uvBase + 1];
+            sb.Append($" ({x},{y})=[Y{yValue},U{uValue},V{vValue}]");
+        }
+
+        Plugin.Log!.Info(sb.ToString());
+    }
+
     private void ReleaseStagingTextures()
     {
         for (int i = 0; i < _stagingTextures.Length; i++)
@@ -917,61 +1251,65 @@ internal sealed unsafe class VideoCaptureService : IDisposable
         _stagingReadyCount = 0;
     }
 
-    private void EnsureD3D11MultithreadProtection(ID3D11DeviceContext* ctx)
+    private void ReleaseNv12Resources()
     {
-        if (ctx == null)
-            return;
-
-        IntPtr contextPtr = (IntPtr)ctx;
-        if (_multithreadContext == contextPtr)
-            return;
-
-        ReleaseD3D11Multithread();
-        _multithreadContext = contextPtr;
-
-        Guid iid = IID_ID3D11Multithread;
-        ID3D11Multithread* multithread = null;
-        int hr = ctx->QueryInterface(&iid, (void**)&multithread);
-        if (hr < 0 || multithread == null)
+        if (_nv12SourceSrv != null)
         {
-            if (!_multithreadUnavailableLogged)
-            {
-                _multithreadUnavailableLogged = true;
-                Plugin.Log!.Warning($"[Video] ID3D11Multithread unavailable: 0x{hr:X8}");
-            }
-
-            return;
+            _nv12SourceSrv->Release();
+            _nv12SourceSrv = null;
         }
 
-        multithread->SetMultithreadProtected(new BOOL(1));
-        _d3d11Multithread = multithread;
-        Plugin.Log!.Info("[Video] D3D11 multithread protection enabled for capture readback.");
-    }
-
-    private bool EnterD3D11Multithread()
-    {
-        if (_d3d11Multithread == null)
-            return false;
-
-        _d3d11Multithread->Enter();
-        return true;
-    }
-
-    private void LeaveD3D11Multithread()
-    {
-        if (_d3d11Multithread != null)
-            _d3d11Multithread->Leave();
-    }
-
-    private void ReleaseD3D11Multithread()
-    {
-        if (_d3d11Multithread != null)
+        if (_nv12SourceTexture != null)
         {
-            _d3d11Multithread->Release();
-            _d3d11Multithread = null;
+            _nv12SourceTexture->Release();
+            _nv12SourceTexture = null;
         }
 
-        _multithreadContext = IntPtr.Zero;
+        if (_nv12OutputUav != null)
+        {
+            _nv12OutputUav->Release();
+            _nv12OutputUav = null;
+        }
+
+        if (_nv12OutputBuffer != null)
+        {
+            _nv12OutputBuffer->Release();
+            _nv12OutputBuffer = null;
+        }
+
+        if (_nv12ConstantBuffer != null)
+        {
+            _nv12ConstantBuffer->Release();
+            _nv12ConstantBuffer = null;
+        }
+
+        for (int i = 0; i < _nv12ReadbackBuffers.Length; i++)
+        {
+            if (_nv12ReadbackBuffers[i] == IntPtr.Zero)
+                continue;
+
+            ((ID3D11Buffer*)_nv12ReadbackBuffers[i])->Release();
+            _nv12ReadbackBuffers[i] = IntPtr.Zero;
+        }
+
+        _nv12Width = 0;
+        _nv12Height = 0;
+        _nv12Format = 0;
+        _nv12Device = IntPtr.Zero;
+        _nv12DataSize = 0;
+        _nv12WriteIndex = 0;
+        _nv12ReadyCount = 0;
+    }
+
+    private void ReleaseNv12Shader()
+    {
+        if (_nv12ComputeShader != null)
+        {
+            _nv12ComputeShader->Release();
+            _nv12ComputeShader = null;
+        }
+
+        _nv12ShaderDevice = IntPtr.Zero;
     }
 
     public void Dispose()
@@ -982,8 +1320,8 @@ internal sealed unsafe class VideoCaptureService : IDisposable
         Stop();
 
         ReleaseStagingTextures();
-
-        ReleaseD3D11Multithread();
+        ReleaseNv12Resources();
+        ReleaseNv12Shader();
     }
 }
 
@@ -992,6 +1330,7 @@ internal enum VideoPixelFormat
 {
     Bgra,
     Rgba,
+    Nv12,
 }
 
 internal sealed class VideoFrame

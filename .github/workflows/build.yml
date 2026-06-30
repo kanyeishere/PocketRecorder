@@ -1,0 +1,36 @@
+name: PR Build Check
+
+on:
+  push:
+    branches: ['*']
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      DALAMUD_HOME: ${{ github.workspace }}\lib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build Plugin
+        run: dotnet build --configuration Release /p:DALAMUD_HOME="${{ github.workspace }}\lib"
+
+      - name: Store Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Plugin-PocketRecorder
+          path: bin\x64\Release\*
+          retention-days: 1

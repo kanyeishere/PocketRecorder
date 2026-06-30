@@ -15,7 +15,6 @@ internal sealed class RecordingService : IDisposable
 {
     private readonly Plugin _plugin;
     private readonly IGameInteropProvider _gameInterop;
-    private readonly IFramework _framework;
     private readonly object _sync = new();
 
     private VideoCaptureService? _videoCapture;
@@ -37,6 +36,7 @@ internal sealed class RecordingService : IDisposable
     private int _videoWidth;
     private int _videoHeight;
     private int _videoFps;
+    private VideoPixelFormat _videoPixelFormat;
 
     public bool IsRecording
     {
@@ -81,11 +81,10 @@ internal sealed class RecordingService : IDisposable
 
     public event Action<bool>? RecordingStateChanged;
 
-    public RecordingService(Plugin plugin, IGameInteropProvider gameInterop, IFramework framework)
+    public RecordingService(Plugin plugin, IGameInteropProvider gameInterop)
     {
         _plugin = plugin;
         _gameInterop = gameInterop;
-        _framework = framework;
     }
 
     public void ToggleRecording()
@@ -153,6 +152,7 @@ internal sealed class RecordingService : IDisposable
             _frameCount = 0;
             _videoWidth = 0;
             _videoHeight = 0;
+            _videoPixelFormat = VideoPixelFormat.Bgra;
         }
 
         if (options.CaptureAudio)
@@ -169,9 +169,7 @@ internal sealed class RecordingService : IDisposable
         }
 
         videoCapture = new VideoCaptureService(
-            Plugin.PluginInterface.UiBuilder,
             _gameInterop,
-            _framework,
             OnVideoFrame,
             ShouldCaptureVideoFrame);
 
@@ -188,7 +186,33 @@ internal sealed class RecordingService : IDisposable
             _videoCapture = videoCapture;
         }
 
-        videoCapture.Start(options.TargetFps);
+        if (!videoCapture.Start(options.TargetFps))
+        {
+            lock (_sync)
+            {
+                if (IsCurrentSessionNoLock(options.SessionId))
+                {
+                    _sessionId++;
+                    _startOptions = null;
+                    _videoCapture = null;
+                    _audioCapture = null;
+                    _writer = null;
+                    _isRecording = false;
+                    _isStartingWriter = false;
+                    _isFinalizing = false;
+                    _stopRequested = true;
+                    _finishedCallback = null;
+                }
+            }
+
+            try { videoCapture.Dispose(); } catch { }
+            try { audioCapture?.Stop(); } catch { }
+            try { audioCapture?.Dispose(); } catch { }
+
+            Plugin.Log.Warning("[Record] Video capture could not start; recording aborted.");
+            RecordingStateChanged?.Invoke(false);
+            return false;
+        }
 
         Plugin.Log.Info($"[Record] Preparation started -> {options.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
         Plugin.Log.Info($"[Record] Config: fps={options.TargetFps}, bitrate={options.VideoBitrate}, codec={options.VideoCodec}, preset={options.EncoderPreset}, audio={options.CaptureAudio}, hw={options.UseHardwareEncoder}");
@@ -203,6 +227,7 @@ internal sealed class RecordingService : IDisposable
         bool startWriter;
         int expectedWidth;
         int expectedHeight;
+        VideoPixelFormat expectedPixelFormat;
 
         lock (_sync)
         {
@@ -224,10 +249,12 @@ internal sealed class RecordingService : IDisposable
                 _isStartingWriter = true;
                 _videoWidth = frame.Width;
                 _videoHeight = frame.Height;
+                _videoPixelFormat = frame.PixelFormat;
                 options = _startOptions;
                 startWriter = true;
                 expectedWidth = frame.Width;
                 expectedHeight = frame.Height;
+                expectedPixelFormat = frame.PixelFormat;
             }
             else
             {
@@ -235,6 +262,7 @@ internal sealed class RecordingService : IDisposable
                 startWriter = false;
                 expectedWidth = _videoWidth;
                 expectedHeight = _videoHeight;
+                expectedPixelFormat = _videoPixelFormat;
             }
         }
 
@@ -247,6 +275,13 @@ internal sealed class RecordingService : IDisposable
         if (frame.Width != expectedWidth || frame.Height != expectedHeight)
         {
             Plugin.Log!.Warning($"Frame size changed {frame.Width}x{frame.Height} != {expectedWidth}x{expectedHeight}, skipping.");
+            frame.ReturnBuffer();
+            return;
+        }
+
+        if (frame.PixelFormat != expectedPixelFormat)
+        {
+            Plugin.Log!.Warning($"Frame pixel format changed {frame.PixelFormat} != {expectedPixelFormat}, skipping.");
             frame.ReturnBuffer();
             return;
         }
@@ -325,6 +360,7 @@ internal sealed class RecordingService : IDisposable
                 _recordStart = DateTime.Now;
                 _videoWidth = firstFrame.Width;
                 _videoHeight = firstFrame.Height;
+                _videoPixelFormat = firstFrame.PixelFormat;
             }
 
             startedWriter!.WriteVideoFrame(firstFrame);

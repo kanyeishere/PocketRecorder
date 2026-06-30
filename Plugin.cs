@@ -41,7 +41,7 @@ public sealed class Plugin : IDalamudPlugin
         DService.Init(pluginInterface);
         Config = Configuration.Load(pluginInterface);
 
-        RecordingService = new RecordingService(this, GameInterop, Framework);
+        RecordingService = new RecordingService(this, GameInterop);
         AutoDutyRecordingService = new AutoDutyRecordingService(this, ClientState, DutyState, Framework);
         ConfigWindow = new ConfigWindow(this);
         FloatingRecordWindow = new FloatingRecordWindow(this);

@@ -216,7 +216,12 @@ internal sealed class FFmpegWriter : IOutputSink
 
     private static string GetFFmpegPixelFormat(VideoPixelFormat pixelFormat)
     {
-        return pixelFormat == VideoPixelFormat.Rgba ? "rgba" : "bgra";
+        return pixelFormat switch
+        {
+            VideoPixelFormat.Rgba => "rgba",
+            VideoPixelFormat.Nv12 => "nv12",
+            _ => "bgra",
+        };
     }
 
     public void WriteVideoFrame(VideoFrame frame)
