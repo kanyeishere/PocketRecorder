@@ -39,9 +39,10 @@ internal sealed class FloatingRecordWindow : Window
     {
         IsOpen = _plugin.Config.ShowFloatingRecordButton;
 
+        bool ffmpegBusy = _plugin.IsFFmpegBootstrapRunning && !_plugin.IsFFmpegBootstrapComplete;
         var phase = _plugin.RecordingService.Phase;
         bool active = phase is RecordingPhase.Preparing or RecordingPhase.Recording;
-        bool busy = phase == RecordingPhase.Finalizing;
+        bool busy = phase == RecordingPhase.Finalizing || ffmpegBusy;
         _suppressContextMenuThisFrame = false;
         bool pressed = DrawCyberRecordButton(active, busy);
 
@@ -51,7 +52,14 @@ internal sealed class FloatingRecordWindow : Window
         if (ImGui.IsItemHovered())
         {
             ImGui.BeginTooltip();
-            ImGui.TextUnformatted(active ? "左键停止录制，右键拖动" : busy ? "保存中" : "左键开始录制，右键拖动");
+            ImGui.TextUnformatted(
+                ffmpegBusy
+                    ? "正在下载必要组件"
+                    : active
+                        ? "左键停止录制，右键拖动"
+                        : busy
+                            ? "保存中"
+                            : "左键开始录制，右键拖动");
             ImGui.EndTooltip();
         }
 

@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 using System.Text;
 
 namespace Recorder.Encoding;
@@ -12,7 +13,7 @@ internal sealed record EncoderSelection(string Codec, string Preset, bool IsHard
 internal static class FFmpegEncoderSelector
 {
     private const int ProbeTimeoutMs = 4_000;
-    private static readonly ConcurrentDictionary<string, EncoderSelection> SelectionCache = new();
+    private static readonly ConcurrentDictionary<string, Lazy<EncoderSelection>> SelectionCache = new();
 
     public static EncoderSelection Select(string ffmpegPath, Configuration config)
     {
@@ -35,8 +36,22 @@ internal static class FFmpegEncoderSelector
                 "software fallback requested");
         }
 
-        string cacheKey = $"{ffmpegPath}|{config.VideoBitrate}|{config.EncoderPreset}|auto-hardware";
-        return SelectionCache.GetOrAdd(cacheKey, _ => SelectHardwareEncoder(ffmpegPath, config.EncoderPreset));
+        string cacheKey = $"{ffmpegPath}|{config.EncoderPreset}|auto-hardware";
+        Lazy<EncoderSelection> lazySelection = SelectionCache.GetOrAdd(
+            cacheKey,
+            _ => new Lazy<EncoderSelection>(
+                () => SelectHardwareEncoder(ffmpegPath, config.EncoderPreset),
+                LazyThreadSafetyMode.ExecutionAndPublication));
+
+        return lazySelection.Value;
+    }
+
+    public static void Warmup(string ffmpegPath, Configuration config)
+    {
+        if (!IsAuto(config.VideoCodec) || !config.UseHardwareEncoder)
+            return;
+
+        _ = Select(ffmpegPath, config);
     }
 
     public static string ResolvePresetForCodec(string codec, string configuredPreset)
@@ -78,31 +93,40 @@ internal static class FFmpegEncoderSelector
 
     private static EncoderSelection SelectHardwareEncoder(string ffmpegPath, string configuredPreset)
     {
-        HashSet<string> encoders = GetAvailableEncoders(ffmpegPath);
-        string[] candidates = { "h264_nvenc", "h264_amf", "h264_qsv" };
-        var failures = new List<string>();
-
-        foreach (string codec in candidates)
+        try
         {
-            if (encoders.Count > 0 && !encoders.Contains(codec))
+            HashSet<string> encoders = GetAvailableEncoders(ffmpegPath);
+            string[] candidates = { "h264_nvenc", "h264_amf", "h264_qsv" };
+            var failures = new List<string>();
+
+            foreach (string codec in candidates)
             {
-                failures.Add($"{codec}: not listed by FFmpeg");
-                continue;
+                if (encoders.Count > 0 && !encoders.Contains(codec))
+                {
+                    failures.Add($"{codec}: not listed by FFmpeg");
+                    continue;
+                }
+
+                string preset = ResolvePresetForCodec(codec, configuredPreset);
+                if (CanEncodeOneFrame(ffmpegPath, codec, preset, out string error))
+                {
+                    Plugin.Log!.Info($"[FFmpeg] Auto encoder selected: {codec}, preset={preset}");
+                    return new EncoderSelection(codec, preset, true, "auto hardware probe");
+                }
+
+                failures.Add($"{codec}: {TrimForLog(error)}");
             }
 
-            string preset = ResolvePresetForCodec(codec, configuredPreset);
-            if (CanEncodeOneFrame(ffmpegPath, codec, preset, out string error))
-            {
-                Plugin.Log!.Info($"[FFmpeg] Auto encoder selected: {codec}, preset={preset}");
-                return new EncoderSelection(codec, preset, true, "auto hardware probe");
-            }
-
-            failures.Add($"{codec}: {TrimForLog(error)}");
+            string fallbackPreset = ResolvePresetForCodec("libx264", configuredPreset);
+            Plugin.Log!.Warning($"[FFmpeg] No hardware encoder passed probe; falling back to libx264. {string.Join(" | ", failures)}");
+            return new EncoderSelection("libx264", fallbackPreset, false, "hardware probe failed");
         }
-
-        string fallbackPreset = ResolvePresetForCodec("libx264", configuredPreset);
-        Plugin.Log!.Warning($"[FFmpeg] No hardware encoder passed probe; falling back to libx264. {string.Join(" | ", failures)}");
-        return new EncoderSelection("libx264", fallbackPreset, false, "hardware probe failed");
+        catch (Exception ex)
+        {
+            string fallbackPreset = ResolvePresetForCodec("libx264", configuredPreset);
+            Plugin.Log!.Warning($"[FFmpeg] Hardware encoder probe failed unexpectedly; falling back to libx264. {TrimForLog(ex.Message)}");
+            return new EncoderSelection("libx264", fallbackPreset, false, "hardware probe exception");
+        }
     }
 
     private static HashSet<string> GetAvailableEncoders(string ffmpegPath)

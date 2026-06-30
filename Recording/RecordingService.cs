@@ -109,6 +109,12 @@ internal sealed class RecordingService : IDisposable
         AudioCaptureService? audioCapture = null;
         VideoCaptureService videoCapture;
 
+        if (!_plugin.IsFFmpegBootstrapComplete)
+        {
+            Plugin.Log.Warning($"[Record] FFmpeg is not ready yet: {_plugin.FFmpegBootstrapStatus}");
+            return false;
+        }
+
         lock (_sync)
         {
             if (HasActiveSessionNoLock())

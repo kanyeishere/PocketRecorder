@@ -15,26 +15,36 @@ internal static class FFmpegBootstrapper
 
     public static string ResolveOrInstall(string configuredPath, string pluginConfigDirectory)
     {
-        string? configured = ResolveConfiguredPath(configuredPath);
+        string? configured = TryResolveExistingPath(configuredPath, pluginConfigDirectory);
         if (configured != null)
             return configured;
+
+        lock (InstallLock)
+        {
+            string? resolved = TryResolveExistingPath(configuredPath, pluginConfigDirectory);
+            if (resolved != null)
+                return resolved;
+
+            string installed = GetInstalledFFmpegPath(pluginConfigDirectory);
+            InstallFFmpeg(pluginConfigDirectory, installed, "FFmpeg not found");
+            return installed;
+        }
+    }
+
+    public static string? TryResolveExistingPath(string configuredPath, string pluginConfigDirectory)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            string? configured = ResolveConfiguredPath(configuredPath);
+            if (configured != null)
+                return configured;
+        }
 
         string installed = GetInstalledFFmpegPath(pluginConfigDirectory);
         if (File.Exists(installed))
             return installed;
 
-        string? fromPath = FindOnPath("ffmpeg.exe");
-        if (fromPath != null)
-            return fromPath;
-
-        lock (InstallLock)
-        {
-            if (File.Exists(installed))
-                return installed;
-
-            InstallFFmpeg(pluginConfigDirectory, installed, "FFmpeg not found");
-            return installed;
-        }
+        return null;
     }
 
     public static string GetInstalledFFmpegPath(string pluginConfigDirectory)

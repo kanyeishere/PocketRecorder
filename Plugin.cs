@@ -3,8 +3,11 @@ using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using OmenTools;
+using Recorder.Encoding;
 using Recorder.Recording;
 using Recorder.Windows;
+using System;
+using System.Threading;
 
 namespace Recorder;
 
@@ -29,6 +32,9 @@ public sealed class Plugin : IDalamudPlugin
     internal FloatingRecordWindow FloatingRecordWindow { get; }
 
     internal Dalamud.Interface.Windowing.WindowSystem WindowSystem { get; }
+    internal volatile bool IsFFmpegBootstrapRunning;
+    internal volatile bool IsFFmpegBootstrapComplete;
+    internal string FFmpegBootstrapStatus { get; private set; } = string.Empty;
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
@@ -49,6 +55,59 @@ public sealed class Plugin : IDalamudPlugin
 
         AddCommandHandler(CommandName);
         AddCommandHandler(ShortCommandName);
+
+        StartBackgroundWarmup();
+    }
+
+    private void StartBackgroundWarmup()
+    {
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                IsFFmpegBootstrapRunning = true;
+                FFmpegBootstrapStatus = "正在检查 FFmpeg...";
+
+                string pluginConfigDirectory = PluginInterface.GetPluginConfigDirectory();
+                string? ffmpegPath = FFmpegBootstrapper.TryResolveExistingPath(
+                    Config.FFmpegPath,
+                    pluginConfigDirectory);
+
+                if (ffmpegPath == null)
+                {
+                    FFmpegBootstrapStatus = "正在下载必要组件...";
+                    ffmpegPath = FFmpegBootstrapper.InstallOrUpdateBundled(pluginConfigDirectory);
+                    Config.FFmpegPath = ffmpegPath;
+                    Config.Save(PluginInterface);
+                }
+
+                if (ffmpegPath == null)
+                {
+                    FFmpegBootstrapStatus = "必要组件下载失败";
+                    return;
+                }
+
+                FFmpegEncoderSelector.Warmup(ffmpegPath, Config);
+                FFmpegBootstrapStatus = "必要组件已就绪";
+                IsFFmpegBootstrapComplete = true;
+                Log.Info($"[FFmpeg] Background warmup finished: {ffmpegPath}");
+            }
+            catch (Exception ex)
+            {
+                FFmpegBootstrapStatus = "必要组件下载失败";
+                Log.Warning($"[FFmpeg] Background warmup failed: {ex.Message}");
+            }
+            finally
+            {
+                IsFFmpegBootstrapRunning = false;
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "Recorder-FFmpegWarmup",
+        };
+
+        thread.Start();
     }
 
     private void AddCommandHandler(string commandName)

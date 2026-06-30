@@ -93,8 +93,15 @@ internal sealed class ConfigWindow : Window
 
     private void DrawRecordingControls()
     {
+        bool ffmpegBusy = _plugin.IsFFmpegBootstrapRunning && !_plugin.IsFFmpegBootstrapComplete;
         var phase = _plugin.RecordingService.Phase;
-        if (phase == RecordingPhase.Recording || phase == RecordingPhase.Preparing)
+        if (ffmpegBusy)
+        {
+            ImGui.BeginDisabled();
+            ImGui.Button("正在下载必要组件", new Vector2(-1, 32));
+            ImGui.EndDisabled();
+        }
+        else if (phase == RecordingPhase.Recording || phase == RecordingPhase.Preparing)
         {
             if (ImGui.Button("■ 停止录制", new Vector2(-1, 32)))
             {
