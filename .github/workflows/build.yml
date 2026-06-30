@@ -17,8 +17,10 @@ jobs:
       DALAMUD_HOME: ${{ github.workspace }}\lib
 
     steps:
-      - name: Checkout
+      - name: Checkout with submodules
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
