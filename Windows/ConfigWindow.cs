@@ -3,7 +3,6 @@ using Dalamud.Interface.Windowing;
 using Recorder.Encoding;
 using Recorder.Recording;
 using System;
-using System.IO;
 using System.Numerics;
 using System.Threading;
 
@@ -14,7 +13,6 @@ internal sealed class ConfigWindow : Window
     private const string DiscordInviteUrl = "https://discord.gg/CQd4w7Bzv2";
 
     private readonly Plugin _plugin;
-    private bool _isRecording;
     private bool _ffmpegInstallInProgress;
     private string _ffmpegInstallStatus = string.Empty;
 
@@ -24,11 +22,6 @@ internal sealed class ConfigWindow : Window
         Size = new Vector2(420, 520);
         SizeCondition = ImGuiCond.FirstUseEver;
         Flags = ImGuiWindowFlags.NoCollapse;
-
-        _plugin.RecordingService.RecordingStateChanged += recording =>
-        {
-            _isRecording = recording;
-        };
     }
 
     public override void Draw()
@@ -81,7 +74,7 @@ internal sealed class ConfigWindow : Window
             int frameCount = _plugin.RecordingService.FrameCount;
 
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.3f, 0.3f, 1f));
-            ImGui.Text($"{GetPhaseIndicator(phase)} {GetPhaseText(phase)}  {elapsed:hh\\:mm\\:ss}");
+            ImGui.Text($"{GetPhaseIndicator(phase)} {phase.ToDisplayText()}  {elapsed:hh\\:mm\\:ss}");
             ImGui.PopStyleColor();
             ImGui.Text($"帧数: {frameCount}");
             if (!string.IsNullOrEmpty(_plugin.RecordingService.CurrentFilePath))
@@ -160,17 +153,6 @@ internal sealed class ConfigWindow : Window
         }
 
         ImGui.TextDisabled($"自动录制状态: {_plugin.AutoDutyRecordingService.StatusText}");
-    }
-
-    private static string GetPhaseText(RecordingPhase phase)
-    {
-        return phase switch
-        {
-            RecordingPhase.Preparing => "准备中",
-            RecordingPhase.Recording => "录制中",
-            RecordingPhase.Finalizing => "保存中",
-            _ => "待机中",
-        };
     }
 
     private static string GetPhaseIndicator(RecordingPhase phase)
@@ -379,14 +361,7 @@ internal sealed class ConfigWindow : Window
         {
             try
             {
-                if (!Directory.Exists(effectiveDir))
-                    Directory.CreateDirectory(effectiveDir);
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = effectiveDir,
-                    UseShellExecute = true,
-                    Verb = "open"
-                });
+                Recorder.ShellHelpers.OpenDirectory(effectiveDir);
             }
             catch (Exception ex)
             {

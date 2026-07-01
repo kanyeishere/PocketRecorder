@@ -11,6 +11,11 @@ namespace Recorder.Recording;
 
 internal sealed class AutoDutyRecordingService : IDisposable
 {
+    private static readonly Regex InvalidFileNameCharsRegex = new(
+        $"[{Regex.Escape(new string(Path.GetInvalidFileNameChars()))}]+",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant,
+        TimeSpan.FromMilliseconds(250));
+
     private readonly Plugin _plugin;
     private readonly IClientState _clientState;
     private readonly IDutyState _dutyState;
@@ -249,8 +254,7 @@ internal sealed class AutoDutyRecordingService : IDisposable
 
     private static string SanitizeFileName(string value)
     {
-        string invalid = Regex.Escape(new string(Path.GetInvalidFileNameChars()));
-        string sanitized = Regex.Replace(value.Trim(), $"[{invalid}]+", "_");
+        string sanitized = InvalidFileNameCharsRegex.Replace(value.Trim(), "_");
         return string.IsNullOrWhiteSpace(sanitized) ? "Duty" : sanitized;
     }
 

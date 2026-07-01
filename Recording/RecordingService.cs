@@ -19,14 +19,11 @@ internal sealed class RecordingService : IDisposable
 
     private VideoCaptureService? _videoCapture;
     private AudioCaptureService? _audioCapture;
-    private FFmpegWriter? _writer;
+    private IOutputSink? _writer;
     private RecordingStartOptions? _startOptions;
 
     private int _sessionId;
-    private bool _isRecording;
-    private bool _isStartingWriter;
-    private bool _isFinalizing;
-    private bool _stopRequested;
+    private RecordingLifecycle _lifecycle = RecordingLifecycle.Idle;
     private DateTime _recordStart;
     private int _frameCount;
     private string? _currentFilePath;
@@ -52,18 +49,7 @@ internal sealed class RecordingService : IDisposable
         get
         {
             lock (_sync)
-            {
-                if (_isFinalizing)
-                    return RecordingPhase.Finalizing;
-
-                if (_isRecording)
-                    return RecordingPhase.Recording;
-
-                if (_startOptions != null || _videoCapture != null || _audioCapture != null || _isStartingWriter)
-                    return RecordingPhase.Preparing;
-
-                return RecordingPhase.Idle;
-            }
+                return ToPublicPhase(_lifecycle);
         }
     }
 
@@ -72,7 +58,7 @@ internal sealed class RecordingService : IDisposable
         get
         {
             lock (_sync)
-                return _isRecording ? DateTime.Now - _recordStart : TimeSpan.Zero;
+                return _lifecycle == RecordingLifecycle.Recording ? DateTime.Now - _recordStart : TimeSpan.Zero;
         }
     }
 
@@ -144,10 +130,7 @@ internal sealed class RecordingService : IDisposable
             _writer = null;
             _audioCapture = null;
             _videoCapture = null;
-            _isRecording = false;
-            _isStartingWriter = false;
-            _isFinalizing = false;
-            _stopRequested = false;
+            _lifecycle = RecordingLifecycle.Preparing;
             _finishedCallback = finishedCallback;
             _frameCount = 0;
             _videoWidth = 0;
@@ -193,21 +176,12 @@ internal sealed class RecordingService : IDisposable
                 if (IsCurrentSessionNoLock(options.SessionId))
                 {
                     _sessionId++;
-                    _startOptions = null;
-                    _videoCapture = null;
-                    _audioCapture = null;
-                    _writer = null;
-                    _isRecording = false;
-                    _isStartingWriter = false;
-                    _isFinalizing = false;
-                    _stopRequested = true;
-                    _finishedCallback = null;
+                    ClearSessionNoLock(RecordingLifecycle.Idle);
                 }
             }
 
-            try { videoCapture.Dispose(); } catch { }
-            try { audioCapture?.Stop(); } catch { }
-            try { audioCapture?.Dispose(); } catch { }
+            DisposeVideoCapture(videoCapture);
+            StopAndDisposeAudioCapture(audioCapture);
 
             Plugin.Log.Warning("[Record] Video capture could not start; recording aborted.");
             RecordingStateChanged?.Invoke(false);
@@ -222,7 +196,7 @@ internal sealed class RecordingService : IDisposable
 
     private void OnVideoFrame(VideoFrame frame)
     {
-        FFmpegWriter? writer;
+        IOutputSink? writer;
         RecordingStartOptions? options;
         bool startWriter;
         int expectedWidth;
@@ -231,7 +205,7 @@ internal sealed class RecordingService : IDisposable
 
         lock (_sync)
         {
-            if (_stopRequested || _startOptions == null)
+            if (_startOptions == null || _lifecycle == RecordingLifecycle.Finalizing)
             {
                 frame.ReturnBuffer();
                 return;
@@ -240,13 +214,13 @@ internal sealed class RecordingService : IDisposable
             writer = _writer;
             if (writer == null)
             {
-                if (_isStartingWriter)
+                if (_lifecycle == RecordingLifecycle.StartingWriter)
                 {
                     frame.ReturnBuffer();
                     return;
                 }
 
-                _isStartingWriter = true;
+                _lifecycle = RecordingLifecycle.StartingWriter;
                 _videoWidth = frame.Width;
                 _videoHeight = frame.Height;
                 _videoPixelFormat = frame.PixelFormat;
@@ -303,8 +277,8 @@ internal sealed class RecordingService : IDisposable
     private void StartWriterWorker(RecordingStartOptions options, VideoFrame firstFrame)
     {
         Stopwatch startSw = Stopwatch.StartNew();
-        FFmpegWriter? writer = null;
-        FFmpegWriter? startedWriter = null;
+        IOutputSink? writer = null;
+        IOutputSink? startedWriter = null;
         bool frameHandedToWriter = false;
 
         try
@@ -336,8 +310,7 @@ internal sealed class RecordingService : IDisposable
                 ffmpegPath,
                 options.VideoBitrate,
                 encoder.Codec,
-                encoder.Preset,
-                encoder.IsHardware);
+                encoder.Preset);
             writer.SetOutputPath(options.OutputPath);
 
             writer.Start(
@@ -355,8 +328,7 @@ internal sealed class RecordingService : IDisposable
                 _writer = writer;
                 startedWriter = writer;
                 writer = null;
-                _isRecording = true;
-                _isStartingWriter = false;
+                _lifecycle = RecordingLifecycle.Recording;
                 _recordStart = DateTime.Now;
                 _videoWidth = firstFrame.Width;
                 _videoHeight = firstFrame.Height;
@@ -441,8 +413,7 @@ internal sealed class RecordingService : IDisposable
         if (audioToStop != null)
         {
             Plugin.Log.Warning($"[Record] Audio init failed or timed out (LastError={audioToStop.LastError}), continuing video-only.");
-            try { audioToStop.Stop(); } catch { }
-            try { audioToStop.Dispose(); } catch { }
+            StopAndDisposeAudioCapture(audioToStop);
         }
 
         return null;
@@ -450,10 +421,10 @@ internal sealed class RecordingService : IDisposable
 
     private void OnAudioPacket(AudioPacket packet)
     {
-        FFmpegWriter? writer;
+        IOutputSink? writer;
         lock (_sync)
         {
-            if (_stopRequested)
+            if (_lifecycle is RecordingLifecycle.Idle or RecordingLifecycle.Finalizing)
                 return;
 
             writer = _writer;
@@ -466,7 +437,7 @@ internal sealed class RecordingService : IDisposable
     {
         lock (_sync)
         {
-            if (_stopRequested || _startOptions == null || _isStartingWriter)
+            if (_startOptions == null || _lifecycle == RecordingLifecycle.StartingWriter)
                 return false;
 
             return _writer == null || !_writer.IsVideoBackedUp;
@@ -482,7 +453,7 @@ internal sealed class RecordingService : IDisposable
     {
         VideoCaptureService? videoCapture;
         AudioCaptureService? audioCapture;
-        FFmpegWriter? writer;
+        IOutputSink? writer;
         string? outputPath;
         Action<RecordingFinishedEventArgs>? finishedCallback;
         TimeSpan finalDuration;
@@ -493,22 +464,21 @@ internal sealed class RecordingService : IDisposable
             if (!HasActiveSessionNoLock())
                 return;
 
-            finalDuration = _isRecording ? DateTime.Now - _recordStart : TimeSpan.Zero;
+            finalDuration = _lifecycle == RecordingLifecycle.Recording ? DateTime.Now - _recordStart : TimeSpan.Zero;
             outputPath = _currentFilePath;
             finishedCallback = _finishedCallback;
             videoCapture = _videoCapture;
             audioCapture = _audioCapture;
             writer = _writer;
 
-            _stopRequested = true;
             _sessionId++;
             _startOptions = null;
             _videoCapture = null;
             _audioCapture = null;
             _writer = null;
-            _isRecording = false;
-            _isStartingWriter = false;
-            _isFinalizing = writer != null || audioCapture != null || videoCapture != null;
+            _lifecycle = writer != null || audioCapture != null || videoCapture != null
+                ? RecordingLifecycle.Finalizing
+                : RecordingLifecycle.Idle;
             _finishedCallback = null;
         }
 
@@ -520,16 +490,16 @@ internal sealed class RecordingService : IDisposable
         void FinalizeRecording()
         {
             Stopwatch finalizeSw = Stopwatch.StartNew();
-            try { videoCapture?.Dispose(); } catch { }
-            try { audioCapture?.Stop(); } catch { }
-            try { audioCapture?.Dispose(); } catch { }
+            DisposeVideoCapture(videoCapture);
+            StopAndDisposeAudioCapture(audioCapture);
 
             try { writer?.Stop(finalDuration); } catch (Exception ex) { Plugin.Log.Warning($"[Record] Writer stop failed: {ex.Message}"); }
             try { writer?.Dispose(); } catch { }
 
             lock (_sync)
             {
-                _isFinalizing = false;
+                if (_lifecycle == RecordingLifecycle.Finalizing)
+                    _lifecycle = RecordingLifecycle.Idle;
             }
 
             Plugin.Log.Info($"[Record] Saved: {outputPath}, finalize={finalizeSw.ElapsedMilliseconds}ms");
@@ -581,21 +551,12 @@ internal sealed class RecordingService : IDisposable
             outputPath = _currentFilePath;
 
             _sessionId++;
-            _startOptions = null;
-            _videoCapture = null;
-            _audioCapture = null;
-            _writer = null;
-            _isRecording = false;
-            _isStartingWriter = false;
-            _isFinalizing = false;
-            _stopRequested = true;
-            _finishedCallback = null;
+            ClearSessionNoLock(RecordingLifecycle.Idle);
         }
 
         try { videoCapture?.Stop(); } catch { }
-        try { videoCapture?.Dispose(); } catch { }
-        try { audioCapture?.Stop(); } catch { }
-        try { audioCapture?.Dispose(); } catch { }
+        DisposeVideoCapture(videoCapture);
+        StopAndDisposeAudioCapture(audioCapture);
 
         RecordingStateChanged?.Invoke(false);
 
@@ -618,9 +579,7 @@ internal sealed class RecordingService : IDisposable
                _videoCapture != null ||
                _audioCapture != null ||
                _writer != null ||
-               _isRecording ||
-               _isStartingWriter ||
-               _isFinalizing;
+               _lifecycle != RecordingLifecycle.Idle;
     }
 
     private bool IsCurrentSession(int sessionId)
@@ -631,7 +590,40 @@ internal sealed class RecordingService : IDisposable
 
     private bool IsCurrentSessionNoLock(int sessionId)
     {
-        return !_stopRequested && _startOptions?.SessionId == sessionId;
+        return _startOptions?.SessionId == sessionId &&
+               _lifecycle is RecordingLifecycle.Preparing or RecordingLifecycle.StartingWriter or RecordingLifecycle.Recording;
+    }
+
+    private static RecordingPhase ToPublicPhase(RecordingLifecycle lifecycle)
+    {
+        return lifecycle switch
+        {
+            RecordingLifecycle.Preparing or RecordingLifecycle.StartingWriter => RecordingPhase.Preparing,
+            RecordingLifecycle.Recording => RecordingPhase.Recording,
+            RecordingLifecycle.Finalizing => RecordingPhase.Finalizing,
+            _ => RecordingPhase.Idle,
+        };
+    }
+
+    private void ClearSessionNoLock(RecordingLifecycle nextLifecycle)
+    {
+        _startOptions = null;
+        _videoCapture = null;
+        _audioCapture = null;
+        _writer = null;
+        _lifecycle = nextLifecycle;
+        _finishedCallback = null;
+    }
+
+    private static void DisposeVideoCapture(VideoCaptureService? videoCapture)
+    {
+        try { videoCapture?.Dispose(); } catch { }
+    }
+
+    private static void StopAndDisposeAudioCapture(AudioCaptureService? audioCapture)
+    {
+        try { audioCapture?.Stop(); } catch { }
+        try { audioCapture?.Dispose(); } catch { }
     }
 
     public void Dispose()
@@ -650,6 +642,15 @@ internal sealed class RecordingService : IDisposable
         string VideoCodec,
         string EncoderPreset,
         bool UseHardwareEncoder);
+}
+
+internal enum RecordingLifecycle
+{
+    Idle,
+    Preparing,
+    StartingWriter,
+    Recording,
+    Finalizing,
 }
 
 internal enum RecordingPhase

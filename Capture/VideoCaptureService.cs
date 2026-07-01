@@ -304,7 +304,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         return _presentHook!.Original(swapChainPtr, syncInterval, flags);
     }
 
-    private unsafe void CaptureBeforePresent(IntPtr swapChainPtr)
+    private void CaptureBeforePresent(IntPtr swapChainPtr)
     {
         long now = _sw.ElapsedTicks;
         long minInterval = Stopwatch.Frequency / _targetFps;
@@ -376,7 +376,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         uint height,
         DXGI_FORMAT format,
         long timestampTicks,
-        bool diagnoseThisFrame)
+        bool readbackDiagnosticsPending)
     {
         if (_nv12Disabled)
             return _lockedOutputPixelFormat == VideoPixelFormat.Nv12 &&
@@ -425,27 +425,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                 if (readBuffer == null)
                     return true;
 
-                int hr = ctx->Map(
-                    (ID3D11Resource*)readBuffer,
-                    0,
-                    D3D11_MAP.D3D11_MAP_READ,
-                    (uint)D3D11_MAP_FLAG.D3D11_MAP_FLAG_DO_NOT_WAIT,
-                    &mapped);
-                if (hr < 0)
-                {
-                    _skipCount++;
-                    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
-                    {
-                        if (_skipCount <= 3 || _skipCount % 300 == 0)
-                            Plugin.Log!.Info($"[Video] NV12 readback not ready; skipped without blocking. skipped={_skipCount}");
-                    }
-                    else if (_skipCount <= 3)
-                    {
-                        Plugin.Log!.Warning($"[Video] NV12 Map failed: 0x{hr:X8}");
-                    }
-
+                if (!TryMapReadbackResource(ctx, (ID3D11Resource*)readBuffer, "NV12", out mapped))
                     return true;
-                }
 
                 mappedOk = true;
 
@@ -456,11 +437,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                     Marshal.Copy((IntPtr)mapped.pData, buffer, 0, _nv12DataSize);
 
                     bool isEmptyFrame = IsNv12FrameEmpty(buffer, (int)width, (int)height);
-                    if (diagnoseThisFrame)
+                    if (readbackDiagnosticsPending && ClaimReadbackDiagnostic())
                     {
                         Plugin.Log!.Info($"[Video] NV12 path enabled: {width}x{height}, bytes={_nv12DataSize}, sourceFormat={format}");
                         DiagnoseNv12Pixels(buffer, (int)width, (int)height);
-                        MarkReadbackDiagnosed();
                     }
 
                     if (isEmptyFrame)
@@ -546,19 +526,14 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             uint width = desc.Width;
             uint height = desc.Height;
             DXGI_FORMAT format = desc.Format;
-            bool diagnoseTexture = ShouldDiagnoseFirstFrame();
-            bool diagnoseReadback = ShouldDiagnoseReadbackFrame();
+            bool diagnoseTexture = ClaimFirstFrameDiagnostic();
+            bool readbackDiagnosticsPending = !_diagnosedReadbackFrame;
 
             CurrentWidth = (int)width;
             CurrentHeight = (int)height;
 
             int bpp = 4;
-            if (format != DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM &&
-                format != DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM_SRGB &&
-                format != DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_TYPELESS &&
-                format != DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM &&
-                format != DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
-                format != DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS)
+            if (!IsSupportedReadbackFormat(format))
             {
                 _skipCount++;
                 if (_skipCount <= 3)
@@ -573,7 +548,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                     $"miscFlags=0x{desc.MiscFlags:X}, mips={desc.MipLevels}, sample={desc.SampleDesc.Count}/{desc.SampleDesc.Quality}");
             }
 
-            if (TryProcessTextureAsNv12(ctx, srcTexture, width, height, format, timestampTicks, diagnoseReadback))
+            if (TryProcessTextureAsNv12(ctx, srcTexture, width, height, format, timestampTicks, readbackDiagnosticsPending))
                 return;
 
             if (!EnsureStagingTextures(width, height, format))
@@ -608,27 +583,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                 if (readTexture == null)
                     return;
 
-                int hr = ctx->Map(
-                    (ID3D11Resource*)readTexture,
-                    0,
-                    D3D11_MAP.D3D11_MAP_READ,
-                    (uint)D3D11_MAP_FLAG.D3D11_MAP_FLAG_DO_NOT_WAIT,
-                    &mapped);
-                if (hr < 0)
-                {
-                    _skipCount++;
-                    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
-                    {
-                        if (_skipCount <= 3 || _skipCount % 300 == 0)
-                            Plugin.Log!.Info($"[Video] Readback not ready; skipped without blocking. skipped={_skipCount}");
-                    }
-                    else if (_skipCount <= 3)
-                    {
-                        Plugin.Log!.Warning($"[Video] Map failed: 0x{hr:X8}");
-                    }
-
+                if (!TryMapReadbackResource(ctx, (ID3D11Resource*)readTexture, "BGRA", out mapped))
                     return;
-                }
 
                 mappedOk = true;
 
@@ -657,18 +613,12 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
                         bool isEmptyFrame = IsFrameEmpty(buffer, (int)width, (int)height, dstStride);
 
-                        if (diagnoseReadback)
+                        if (readbackDiagnosticsPending && ClaimReadbackDiagnostic())
                         {
                             DiagnosePixels(buffer, (int)width, (int)height, dstStride);
-                            MarkReadbackDiagnosed();
                         }
 
-                        VideoPixelFormat pixelFormat =
-                            format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM ||
-                            format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                            format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS
-                                ? VideoPixelFormat.Rgba
-                                : VideoPixelFormat.Bgra;
+                        VideoPixelFormat pixelFormat = GetReadbackPixelFormat(format);
 
                         // 空帧（RGBA 全 0）通常表示 GPU 读回失败；不要把它送进编码器。
                         if (isEmptyFrame)
@@ -742,7 +692,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     //  工具方法
     // ──────────────────────────────────────────────────────────
 
-    private bool ShouldDiagnoseFirstFrame()
+    private bool ClaimFirstFrameDiagnostic()
     {
         if (_diagnosedFirstFrame)
             return false;
@@ -751,14 +701,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         return true;
     }
 
-    private bool ShouldDiagnoseReadbackFrame()
+    private bool ClaimReadbackDiagnostic()
     {
-        return !_diagnosedReadbackFrame;
-    }
+        if (_diagnosedReadbackFrame)
+            return false;
 
-    private void MarkReadbackDiagnosed()
-    {
         _diagnosedReadbackFrame = true;
+        return true;
     }
 
     private void LogConsecutiveEmptyFrames(string format)
@@ -805,6 +754,38 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             Plugin.Log!.Info($"[Video] Encoder queue backed up; skipped capture readback. backpressureSkips={_backpressureSkipCount}");
 
         return true;
+    }
+
+    private bool TryMapReadbackResource(
+        ID3D11DeviceContext* ctx,
+        ID3D11Resource* resource,
+        string label,
+        out D3D11_MAPPED_SUBRESOURCE mapped)
+    {
+        D3D11_MAPPED_SUBRESOURCE mappedLocal = default;
+        int hr = ctx->Map(
+            resource,
+            0,
+            D3D11_MAP.D3D11_MAP_READ,
+            (uint)D3D11_MAP_FLAG.D3D11_MAP_FLAG_DO_NOT_WAIT,
+            &mappedLocal);
+        mapped = mappedLocal;
+
+        if (hr >= 0)
+            return true;
+
+        _skipCount++;
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+        {
+            if (_skipCount <= 3 || _skipCount % 300 == 0)
+                Plugin.Log!.Info($"[Video] {label} readback not ready; skipped without blocking. skipped={_skipCount}");
+        }
+        else if (_skipCount <= 3)
+        {
+            Plugin.Log!.Warning($"[Video] {label} Map failed: 0x{hr:X8}");
+        }
+
+        return false;
     }
 
     private static bool IsFrameEmpty(byte[] buffer, int width, int height, int stride)
@@ -1162,13 +1143,23 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         }
     }
 
-    private static bool IsNv12SupportedInput(DXGI_FORMAT format)
+    private static bool IsSupportedReadbackFormat(DXGI_FORMAT format)
         => format == DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM ||
            format == DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
            format == DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_TYPELESS ||
            format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM ||
            format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
            format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS;
+
+    private static bool IsNv12SupportedInput(DXGI_FORMAT format) => IsSupportedReadbackFormat(format);
+
+    private static bool IsRgbaFormat(DXGI_FORMAT format)
+        => format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM ||
+           format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+           format == DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_TYPELESS;
+
+    private static VideoPixelFormat GetReadbackPixelFormat(DXGI_FORMAT format)
+        => IsRgbaFormat(format) ? VideoPixelFormat.Rgba : VideoPixelFormat.Bgra;
 
     private static DXGI_FORMAT GetNv12ShaderReadableFormat(DXGI_FORMAT format)
         => format switch

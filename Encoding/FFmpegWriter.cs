@@ -42,18 +42,16 @@ internal sealed class FFmpegWriter : IOutputSink
     private readonly int _videoBitrate;
     private readonly string _videoCodec;
     private readonly string _preset;
-    private readonly bool _useHardware;
 
     public bool SupportsAudio => _hasAudio;
     public bool IsVideoBackedUp => _videoQueue != null && _videoQueue.Count >= MaxQueueSize / 2;
 
-    public FFmpegWriter(string ffmpegPath, int videoBitrate, string videoCodec, string preset, bool useHardware)
+    public FFmpegWriter(string ffmpegPath, int videoBitrate, string videoCodec, string preset)
     {
         _ffmpegPath = ffmpegPath;
         _videoBitrate = videoBitrate;
         _videoCodec = videoCodec;
         _preset = preset;
-        _useHardware = useHardware;
     }
 
     public void SetOutputPath(string path) => _outputPath = path;
@@ -86,10 +84,9 @@ internal sealed class FFmpegWriter : IOutputSink
         args.Add("-framerate"); args.Add($"{_videoFps}");
         args.Add("-i"); args.Add("-");
 
-        // ── 音频输入：命名管道 ──
-        string pipeName = $"RecAud_{Guid.NewGuid():N}"[..31];
         if (audio != null)
         {
+            string pipeName = $"RecAud_{Guid.NewGuid():N}"[..31];
             _audioPipe = new NamedPipeServerStream(
                 pipeName, PipeDirection.Out, 1,
                 PipeTransmissionMode.Byte, PipeOptions.Asynchronous,
@@ -297,12 +294,6 @@ internal sealed class FFmpegWriter : IOutputSink
         {
             try
             {
-                if (_stopped)
-                {
-                    frame.ReturnBuffer();
-                    break;
-                }
-
                 if (firstTimestampHns == null)
                 {
                     firstTimestampHns = frame.TimestampHns;
@@ -315,16 +306,10 @@ internal sealed class FFmpegWriter : IOutputSink
                 long relativeHns = Math.Max(0, frame.TimestampHns - firstTimestampHns.Value);
                 long targetFrameIndex = relativeHns * _videoFps / 10_000_000L;
 
-                while (!_stopped && lastFrame != null && nextOutputFrameIndex < targetFrameIndex)
+                while (lastFrame != null && nextOutputFrameIndex < targetFrameIndex)
                 {
                     WriteRawVideoFrame(lastFrame, duplicate: true);
                     nextOutputFrameIndex++;
-                }
-
-                if (_stopped)
-                {
-                    frame.ReturnBuffer();
-                    break;
                 }
 
                 if (nextOutputFrameIndex <= targetFrameIndex)
@@ -349,7 +334,7 @@ internal sealed class FFmpegWriter : IOutputSink
             }
         }
 
-        if (!_stopped && _finalVideoDuration is { } finalDuration && lastFrame != null)
+        if (_finalVideoDuration is { } finalDuration && lastFrame != null)
         {
             long desiredFrameCount = Math.Max(1, (finalDuration.Ticks * _videoFps + TimeSpan.TicksPerSecond - 1) / TimeSpan.TicksPerSecond);
             while (nextOutputFrameIndex < desiredFrameCount)
@@ -421,11 +406,11 @@ internal sealed class FFmpegWriter : IOutputSink
         {
             if (_audioPipe == null || !_audioPipe.IsConnected) break;
 
-                try
-                {
-                    _audioPipe.Write(audioData, 0, audioData.Length);
-                    Interlocked.Increment(ref _audioPackets);
-                }
+            try
+            {
+                _audioPipe.Write(audioData, 0, audioData.Length);
+                Interlocked.Increment(ref _audioPackets);
+            }
             catch (Exception)
             {
                 // 管道断开等静默
@@ -439,8 +424,8 @@ internal sealed class FFmpegWriter : IOutputSink
     public void Stop(TimeSpan? finalVideoDuration = null)
     {
         if (_stopped) return;
+        _finalVideoDuration = finalVideoDuration;
         _stopped = true;
-        _finalVideoDuration = null;
 
         Plugin.Log!.Info($"[FFmpeg] Stopping... input={_inputFrameCount}, output={_frameCount}, duplicated={_duplicatedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
 
@@ -448,10 +433,6 @@ internal sealed class FFmpegWriter : IOutputSink
         try { _videoQueue?.CompleteAdding(); } catch { }
         // 完成音频队列
         try { _audioQueue?.CompleteAdding(); } catch { }
-
-        int stopDroppedFrames = DrainQueuedVideoFrames();
-        if (stopDroppedFrames > 0)
-            Plugin.Log!.Info($"[FFmpeg] Dropped {stopDroppedFrames} queued video frame(s) during quick stop.");
 
         // 停止时优先快速收尾；如果 writer 卡在 stdin.Write，则关闭 stdin 解除阻塞。
         bool videoWriterFinished = _videoWriterThread == null || _videoWriterThread.Join(5_000);

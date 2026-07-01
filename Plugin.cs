@@ -144,7 +144,7 @@ public sealed class Plugin : IDalamudPlugin
 
             case "toggle":
                 RecordingService.ToggleRecording();
-                Print($"录制状态: {GetPhaseText(RecordingService.Phase)}");
+                Print($"录制状态: {RecordingService.Phase.ToDisplayText()}");
                 break;
 
             case "status":
@@ -206,7 +206,7 @@ public sealed class Plugin : IDalamudPlugin
         var phase = RecordingService.Phase;
         if (phase != RecordingPhase.Idle)
         {
-            Print($"无法开始录制，当前状态: {GetPhaseText(phase)}。");
+            Print($"无法开始录制，当前状态: {phase.ToDisplayText()}。");
             return;
         }
 
@@ -236,43 +236,28 @@ public sealed class Plugin : IDalamudPlugin
 
     private void HandleAutoRecordCommand(string[] parts)
     {
-        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
-        {
-            Print($"8 人副本自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}");
-            return;
-        }
-
-        bool? enabled = ParseSwitch(parts[1], Config.AutoRecordEightPlayerDuty);
-        if (enabled == null)
-        {
-            Print("用法: autorecord on | off | toggle | status");
-            return;
-        }
-
-        Config.AutoRecordEightPlayerDuty = enabled.Value;
-        Config.Save(PluginInterface);
-        Print($"8 人副本自动录制已{(enabled.Value ? "开启" : "关闭")}。");
+        HandleSwitchCommand(
+            parts,
+            Config.AutoRecordEightPlayerDuty,
+            $"8 人副本自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}",
+            "用法: autorecord on | off | toggle | status",
+            enabled => Config.AutoRecordEightPlayerDuty = enabled,
+            enabled => $"8 人副本自动录制已{(enabled ? "开启" : "关闭")}。");
     }
 
     private void HandleFloatingCommand(string[] parts)
     {
-        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
-        {
-            Print($"悬浮录制按钮: {OnOff(Config.ShowFloatingRecordButton)}。");
-            return;
-        }
-
-        bool? enabled = ParseSwitch(parts[1], Config.ShowFloatingRecordButton);
-        if (enabled == null)
-        {
-            Print("用法: floating on | off | toggle | status");
-            return;
-        }
-
-        Config.ShowFloatingRecordButton = enabled.Value;
-        FloatingRecordWindow.IsOpen = enabled.Value;
-        Config.Save(PluginInterface);
-        Print($"悬浮录制按钮已{(enabled.Value ? "显示" : "隐藏")}。");
+        HandleSwitchCommand(
+            parts,
+            Config.ShowFloatingRecordButton,
+            $"悬浮录制按钮: {OnOff(Config.ShowFloatingRecordButton)}。",
+            "用法: floating on | off | toggle | status",
+            enabled =>
+            {
+                Config.ShowFloatingRecordButton = enabled;
+                FloatingRecordWindow.IsOpen = enabled;
+            },
+            enabled => $"悬浮录制按钮已{(enabled ? "显示" : "隐藏")}。");
     }
 
     private void HandleFpsCommand(string[] parts)
@@ -315,22 +300,13 @@ public sealed class Plugin : IDalamudPlugin
 
     private void HandleAudioCommand(string[] parts)
     {
-        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
-        {
-            Print($"系统音频录制: {OnOff(Config.CaptureAudio)}。");
-            return;
-        }
-
-        bool? enabled = ParseSwitch(parts[1], Config.CaptureAudio);
-        if (enabled == null)
-        {
-            Print("用法: audio on | off | toggle | status");
-            return;
-        }
-
-        Config.CaptureAudio = enabled.Value;
-        Config.Save(PluginInterface);
-        Print($"系统音频录制已{(enabled.Value ? "开启" : "关闭")}，下次录制生效。");
+        HandleSwitchCommand(
+            parts,
+            Config.CaptureAudio,
+            $"系统音频录制: {OnOff(Config.CaptureAudio)}。",
+            "用法: audio on | off | toggle | status",
+            enabled => Config.CaptureAudio = enabled,
+            enabled => $"系统音频录制已{(enabled ? "开启" : "关闭")}，下次录制生效。");
     }
 
     private void OpenOutputDirectory()
@@ -338,16 +314,7 @@ public sealed class Plugin : IDalamudPlugin
         string dir = Config.GetEffectiveOutputDirectory(PluginInterface);
         try
         {
-            if (!System.IO.Directory.Exists(dir))
-                System.IO.Directory.CreateDirectory(dir);
-
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = dir,
-                UseShellExecute = true,
-                Verb = "open",
-            });
-
+            ShellHelpers.OpenDirectory(dir);
             Print($"已打开输出目录: {dir}");
         }
         catch (Exception ex)
@@ -363,9 +330,35 @@ public sealed class Plugin : IDalamudPlugin
             ? $"，时长 {RecordingService.Elapsed:hh\\:mm\\:ss}，帧数 {RecordingService.FrameCount}"
             : string.Empty;
 
-        Print($"录制状态: {GetPhaseText(RecordingService.Phase)}{elapsed}。");
+        Print($"录制状态: {RecordingService.Phase.ToDisplayText()}{elapsed}。");
         Print($"8 人副本自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}");
         Print($"参数: {Config.TargetFps} FPS / {Config.VideoBitrate / 1_000_000} Mbps / 音频 {OnOff(Config.CaptureAudio)}。");
+    }
+
+    private void HandleSwitchCommand(
+        string[] parts,
+        bool currentValue,
+        string statusText,
+        string usageText,
+        Action<bool> apply,
+        Func<bool, string> changedText)
+    {
+        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            Print(statusText);
+            return;
+        }
+
+        bool? enabled = ParseSwitch(parts[1], currentValue);
+        if (enabled == null)
+        {
+            Print(usageText);
+            return;
+        }
+
+        apply(enabled.Value);
+        Config.Save(PluginInterface);
+        Print(changedText(enabled.Value));
     }
 
     private static bool? ParseSwitch(string value, bool currentValue)
@@ -376,18 +369,6 @@ public sealed class Plugin : IDalamudPlugin
             "off" or "disable" or "disabled" or "0" or "false" or "no" => false,
             "toggle" => !currentValue,
             _ => null,
-        };
-    }
-
-    private static string GetPhaseText(RecordingPhase phase)
-    {
-        return phase switch
-        {
-            RecordingPhase.Idle => "待机",
-            RecordingPhase.Preparing => "准备中",
-            RecordingPhase.Recording => "录制中",
-            RecordingPhase.Finalizing => "保存中",
-            _ => phase.ToString(),
         };
     }
 

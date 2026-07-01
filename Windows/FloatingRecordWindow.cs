@@ -14,6 +14,7 @@ internal sealed class FloatingRecordWindow : Window
     private bool _rightDragStartedOnButton;
     private Vector2 _rightDragStartMousePos;
     private Vector2 _rightDragStartWindowPos;
+    private bool _rightClickRequestedMenu;
     private bool _suppressContextMenuThisFrame;
 
     public FloatingRecordWindow(Plugin plugin) : base("Pocket Recorder###PocketRecorderFloating")
@@ -68,8 +69,14 @@ internal sealed class FloatingRecordWindow : Window
 
         HandleRightMouseDrag();
 
+        if (_rightClickRequestedMenu)
+        {
+            ImGui.OpenPopup("PocketRecorderFloatingMenu");
+            _rightClickRequestedMenu = false;
+        }
+
         if (!_suppressContextMenuThisFrame &&
-            ImGui.BeginPopupContextItem("PocketRecorderFloatingMenu", ImGuiPopupFlags.MouseButtonRight))
+            ImGui.BeginPopup("PocketRecorderFloatingMenu"))
         {
             if (ImGui.MenuItem("打开设置"))
                 _plugin.ConfigWindow.IsOpen = true;
@@ -184,6 +191,8 @@ internal sealed class FloatingRecordWindow : Window
 
             _rightDragStartedOnButton = false;
             _wasDragging = false;
+            if (!_suppressContextMenuThisFrame)
+                _rightClickRequestedMenu = true;
             return;
         }
 

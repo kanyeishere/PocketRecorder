@@ -1,7 +1,6 @@
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using System;
-using System.Diagnostics;
 using System.Threading;
 
 namespace Recorder.Capture;
@@ -27,7 +26,6 @@ internal sealed class AudioCaptureService : IDisposable
 
     // 累计已采集的样本数，用于计算时间戳
     private long _totalSamples;
-    private static readonly Stopwatch _sw = Stopwatch.StartNew();
 
     public AudioCaptureService(Action<AudioPacket> onAudio)
     {
