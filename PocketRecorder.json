@@ -5,7 +5,7 @@
   "Description": "通过 D3D11捕获游戏原生画面。支持悬浮录制按钮、命令控制、可调 FPS/码率。支持 8 人副本倒计时自动录制，灭团、退出副本或登出会自动停录并保存。",
   "Tags": ["recording", "capture", "video", "audio", "ffmpeg", "ffxiv"],
   "InternalName": "PocketRecorder",
-  "AssemblyVersion": "1.0.0.0",
+  "AssemblyVersion": "1.0.1.0",
   "RepoUrl": "https://github.com/kanyeishere/PocketRecorder",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
