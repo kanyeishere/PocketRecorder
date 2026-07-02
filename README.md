@@ -93,7 +93,7 @@ GitHub Actions 会先构建 `NativeRecorder.abi9.dll`，再打包插件，并校
 
 ## 许可
 
-MIT
+GPL
 
 ---
 
