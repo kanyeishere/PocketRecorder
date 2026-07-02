@@ -148,7 +148,7 @@ internal sealed class ConfigWindow : Window
         }
 
         bool autoDuty = config.AutoRecordEightPlayerDuty;
-        if (ImGui.Checkbox("8 人副本倒计时自动录制", ref autoDuty))
+        if (ImGui.Checkbox("倒计时自动录制", ref autoDuty))
         {
             config.AutoRecordEightPlayerDuty = autoDuty;
             SaveConfig(config);

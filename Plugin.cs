@@ -240,10 +240,10 @@ public sealed class Plugin : IDalamudPlugin
         HandleSwitchCommand(
             parts,
             Config.AutoRecordEightPlayerDuty,
-            $"8 人副本自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}",
+            $"倒计时自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}",
             "用法: autorecord on | off | toggle | status",
             enabled => Config.AutoRecordEightPlayerDuty = enabled,
-            enabled => $"8 人副本自动录制已{(enabled ? "开启" : "关闭")}。");
+            enabled => $"倒计时自动录制已{(enabled ? "开启" : "关闭")}。");
     }
 
     private void HandleFloatingCommand(string[] parts)
@@ -332,7 +332,7 @@ public sealed class Plugin : IDalamudPlugin
             : string.Empty;
 
         Print($"录制状态: {RecordingService.Phase.ToDisplayText()}{elapsed}。");
-        Print($"8 人副本自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}");
+        Print($"倒计时自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}");
         Print($"参数: {Config.TargetFps} FPS / {Config.VideoBitrate / 1_000_000} Mbps / 音频 {OnOff(Config.CaptureAudio)}。");
     }
 

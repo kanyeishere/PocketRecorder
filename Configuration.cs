@@ -49,7 +49,7 @@ public class Configuration : IPluginConfiguration
     /// <summary>是否显示一键录制悬浮图标。</summary>
     public bool ShowFloatingRecordButton { get; set; } = true;
 
-    /// <summary>是否在 8 人副本倒计时开始时自动录制。</summary>
+    /// <summary>是否在倒计时开始时自动录制。</summary>
     public bool AutoRecordEightPlayerDuty { get; set; } = true;
 
     /// <summary>悬浮录制按钮位置。</summary>

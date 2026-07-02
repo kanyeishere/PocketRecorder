@@ -51,10 +51,7 @@ internal sealed class AutoDutyRecordingService : IDisposable
                 if (_autoRecordingActive)
                     return $"自动录制中: {_recordDutyName}";
 
-                if (IsEightPlayerDuty())
-                    return "等待倒计时";
-
-                return "等待 8 人副本";
+                return "等待倒计时";
             }
         }
     }
@@ -77,7 +74,7 @@ internal sealed class AutoDutyRecordingService : IDisposable
         bool countdownStarted = countdownVisible && !_wasCountdownVisible;
         _wasCountdownVisible = countdownVisible;
 
-        if (!countdownStarted || !IsEightPlayerDuty())
+        if (!countdownStarted)
             return;
 
         TryStartAutoRecording();
@@ -116,9 +113,7 @@ internal sealed class AutoDutyRecordingService : IDisposable
     private void OnTerritoryChanged(uint territoryType)
     {
         _wasCountdownVisible = false;
-
-        if (!IsEightPlayerDuty())
-            StopAutoRecording("territory changed");
+        StopAutoRecording("territory changed");
     }
 
     private void OnLogout(int type, int code)
@@ -189,28 +184,6 @@ internal sealed class AutoDutyRecordingService : IDisposable
     {
         var addon = Addons.ScreenInfoCountDown;
         return addon != null && addon->IsVisible && addon->IsFullyLoaded();
-    }
-
-    private static bool IsEightPlayerDuty()
-    {
-        if (!GameState.IsInInstanceArea || GameState.ContentFinderCondition == 0)
-            return false;
-
-        var content = GameState.ContentFinderConditionData;
-        if (content.RowId == 0)
-            return false;
-
-        var memberType = content.ContentMemberType.ValueNullable;
-        if (memberType == null)
-            return false;
-
-        int members = memberType.Value.TanksPerParty +
-                      memberType.Value.HealersPerParty +
-                      memberType.Value.MeleesPerParty +
-                      memberType.Value.RangedPerParty;
-        int parties = Math.Max(1, (int)memberType.Value.PartyCount);
-
-        return members * parties == 8;
     }
 
     private static string GetDutyName()
