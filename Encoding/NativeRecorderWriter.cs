@@ -15,6 +15,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private const int NativeCodecH264 = 1;
     private const int NativeCodecHevc = 2;
     private const int PressureWindowMs = 1_000;
+    private const int FirstFrameRetryMs = 1_500;
 
     private readonly int _videoBitrate;
     private readonly string _videoCodec;
@@ -36,6 +37,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private int _droppedFrameCount;
     private int _audioPackets;
     private long _submitPressureUntilTicks;
+    private long _videoFrameDurationHns;
+    private long _firstVideoTimestampHns;
+    private long _lastSubmittedVideoTimestampHns;
 
     public NativeRecorderWriter(int videoBitrate, string videoCodec)
     {
@@ -65,6 +69,9 @@ internal sealed class NativeRecorderWriter : IOutputSink
         _droppedFrameCount = 0;
         _audioPackets = 0;
         _submitPressureUntilTicks = 0;
+        _videoFrameDurationHns = Math.Max(1, 10_000_000L / _videoFps);
+        _firstVideoTimestampHns = -1;
+        _lastSubmittedVideoTimestampHns = -1;
         _firstVideoFrameException = null;
         _firstVideoFrameSubmitted.Reset();
 
@@ -100,6 +107,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
         }
 
         Plugin.Log!.Info($"[NativeRecorder] Started native D3D11 texture writer: {videoFormat.Width}x{videoFormat.Height}@{_videoFps}fps, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}");
+        Plugin.Log!.Info($"[NativeRecorder] Video timing: quantized capture timestamps, frameDurationHns={_videoFrameDurationHns}");
     }
 
     public void WriteVideoFrame(VideoFrame frame)
@@ -179,20 +187,39 @@ internal sealed class NativeRecorderWriter : IOutputSink
             try
             {
                 long submitStartTicks = Stopwatch.GetTimestamp();
-                bool accepted = _session!.SubmitD3D11Texture(frame);
+                bool isFirstSubmittedFrame = Volatile.Read(ref _submittedFrameCount) == 0;
+                long videoTimestampHns = GetQuantizedVideoTimestampHns(frame);
+                bool accepted = SubmitD3D11TextureWithStartupRetry(frame, videoTimestampHns, isFirstSubmittedFrame);
                 if (!accepted)
                 {
                     int dropped = Interlocked.Increment(ref _droppedFrameCount);
                     if (dropped <= 5 || dropped % 60 == 0)
-                        Plugin.Log!.Info($"[NativeRecorder] Native texture was not ready, dropped one frame. dropped={dropped}");
+                    {
+                        string status = _session?.GetLastStatus() ?? string.Empty;
+                        string suffix = string.IsNullOrWhiteSpace(status) ? string.Empty : $" lastStatus={status}";
+                        Plugin.Log!.Info($"[NativeRecorder] Native texture was not ready, dropped one frame. dropped={dropped}.{suffix}");
+                    }
+
+                    if (isFirstSubmittedFrame)
+                    {
+                        string status = _session?.GetLastStatus() ?? string.Empty;
+                        _firstVideoFrameException = new TimeoutException(
+                            string.IsNullOrWhiteSpace(status)
+                                ? "NativeRecorder did not accept the startup texture."
+                                : $"NativeRecorder did not accept the startup texture. {status}");
+                        _firstVideoFrameSubmitted.Set();
+                    }
+
                     continue;
                 }
 
                 frame.MarkD3D11TextureSubmitted();
                 long submitTicks = Stopwatch.GetTimestamp() - submitStartTicks;
-                MarkSubmitPressureIfSlow(submitTicks);
 
                 int submitted = Interlocked.Increment(ref _submittedFrameCount);
+                Volatile.Write(ref _lastSubmittedVideoTimestampHns, videoTimestampHns);
+                if (submitted > 1)
+                    MarkSubmitPressureIfSlow(submitTicks);
                 if (submitted == 1)
                 {
                     LogNativeStatus("Native backend status");
@@ -241,6 +268,57 @@ internal sealed class NativeRecorderWriter : IOutputSink
         AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
             $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
+    }
+
+    private long GetQuantizedVideoTimestampHns(VideoFrame frame)
+    {
+        long first = Volatile.Read(ref _firstVideoTimestampHns);
+        if (first < 0)
+        {
+            Interlocked.CompareExchange(ref _firstVideoTimestampHns, frame.TimestampHns, -1);
+            first = Volatile.Read(ref _firstVideoTimestampHns);
+        }
+
+        long relativeHns = Math.Max(0, frame.TimestampHns - first);
+        long frameIndex = (relativeHns + _videoFrameDurationHns / 2) / _videoFrameDurationHns;
+        long timestampHns = frameIndex * _videoFrameDurationHns;
+
+        long last = Volatile.Read(ref _lastSubmittedVideoTimestampHns);
+        if (last >= 0 && timestampHns <= last)
+            timestampHns = last + _videoFrameDurationHns;
+
+        return timestampHns;
+    }
+
+    private bool SubmitD3D11TextureWithStartupRetry(VideoFrame frame, long timestampHns, bool isFirstSubmittedFrame)
+    {
+        if (!isFirstSubmittedFrame)
+            return _session!.SubmitD3D11Texture(frame, timestampHns);
+
+        Stopwatch retrySw = Stopwatch.StartNew();
+        int attempts = 0;
+        while (!_stopped)
+        {
+            attempts++;
+            if (_session!.SubmitD3D11Texture(frame, timestampHns))
+            {
+                if (attempts > 1)
+                    Plugin.Log!.Info($"[NativeRecorder] First texture accepted after retry. attempts={attempts}, retryMs={retrySw.ElapsedMilliseconds}");
+                return true;
+            }
+
+            if (retrySw.ElapsedMilliseconds >= FirstFrameRetryMs)
+            {
+                string status = _session.GetLastStatus();
+                string suffix = string.IsNullOrWhiteSpace(status) ? string.Empty : $" lastStatus={status}";
+                Plugin.Log!.Warning($"[NativeRecorder] First texture was not ready after retry. attempts={attempts}, retryMs={retrySw.ElapsedMilliseconds}.{suffix}");
+                return false;
+            }
+
+            Thread.Sleep(2);
+        }
+
+        return false;
     }
 
     private void AudioWriterLoop()

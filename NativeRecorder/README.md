@@ -43,7 +43,7 @@ msbuild NativeRecorder\NativeRecorder.vcxproj /p:Configuration=Release /p:Platfo
 
 Current status:
 
-- Stable C ABI v9 is defined in `include/pocket_recorder_native.h`.
+- Stable C ABI v12 is defined in `include/pocket_recorder_native.h`.
 - `pr_probe` reports D3D11 texture support on NVIDIA machines with `nvEncodeAPI64.dll` available and AMD machines with `amfrt64.dll` available.
 - `pr_submit_d3d11_shared_texture` accepts the source D3D11 device plus a D3D11 shared texture handle, creates the native device on the same adapter, performs GPU NV12 conversion, and prefers HEVC or H.264 MP4 through NvEncoderD3D11 + libavformat.
 - AMD uses AMF + libavformat through the same native backend interface and muxer. If AMF cannot initialize or the first frame fails, PocketRecorder falls back to FFmpeg.

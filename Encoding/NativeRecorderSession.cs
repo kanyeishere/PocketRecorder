@@ -16,6 +16,9 @@ internal sealed class NativeRecorderSession : IDisposable
     }
 
     public bool SubmitD3D11Texture(VideoFrame frame)
+        => SubmitD3D11Texture(frame, frame.TimestampHns);
+
+    public bool SubmitD3D11Texture(VideoFrame frame, long timestampHns)
     {
         if (_handle == IntPtr.Zero)
             throw new ObjectDisposedException(nameof(NativeRecorderSession));
@@ -30,7 +33,7 @@ internal sealed class NativeRecorderSession : IDisposable
             frame.D3D11DevicePtr,
             frame.D3D11SharedHandle,
             frame.DxgiFormat,
-            frame.TimestampHns);
+            timestampHns);
     }
 
     public void SubmitAudio(AudioPacket packet)

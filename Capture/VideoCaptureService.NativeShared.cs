@@ -84,7 +84,7 @@ internal sealed unsafe partial class VideoCaptureService
             }
             else
             {
-                ctx->Flush();
+                WaitForNativeSharedCopy(ctx);
             }
         }
         finally
@@ -241,14 +241,14 @@ internal sealed unsafe partial class VideoCaptureService
         uint renderTargetBind = (uint)D3D11_BIND_FLAG.D3D11_BIND_RENDER_TARGET;
         (uint MiscFlags, uint BindFlags, bool RequireKeyedMutex, string Name)[] candidates =
         [
-            (D3D11ResourceMiscShared, shaderResourceBind, false, "obs-shared-srv"),
-            (D3D11ResourceMiscShared, 0, false, "shared-copy-only"),
-            (D3D11ResourceMiscShared, renderTargetBind, false, "shared-rtv"),
-            (D3D11ResourceMiscShared, renderTargetBind | shaderResourceBind, false, "shared-rtv-srv"),
             (D3D11ResourceMiscSharedKeyedMutex, 0, true, "keyed-copy-only"),
             (D3D11ResourceMiscSharedKeyedMutex, renderTargetBind, true, "keyed-rtv"),
             (D3D11ResourceMiscSharedKeyedMutex, shaderResourceBind, true, "keyed-srv"),
             (D3D11ResourceMiscSharedKeyedMutex, renderTargetBind | shaderResourceBind, true, "keyed-rtv-srv"),
+            (D3D11ResourceMiscShared, shaderResourceBind, false, "obs-shared-srv"),
+            (D3D11ResourceMiscShared, 0, false, "shared-copy-only"),
+            (D3D11ResourceMiscShared, renderTargetBind, false, "shared-rtv"),
+            (D3D11ResourceMiscShared, renderTargetBind | shaderResourceBind, false, "shared-rtv-srv"),
         ];
 
         var failures = new System.Text.StringBuilder();
@@ -388,6 +388,54 @@ internal sealed unsafe partial class VideoCaptureService
         }
 
         return false;
+    }
+
+    private static void WaitForNativeSharedCopy(ID3D11DeviceContext* ctx)
+    {
+        if (ctx == null)
+            return;
+
+        ID3D11Device* device = null;
+        ctx->GetDevice(&device);
+        if (device == null)
+        {
+            ctx->Flush();
+            return;
+        }
+
+        ID3D11Query* query = null;
+        try
+        {
+            D3D11_QUERY_DESC desc = default;
+            desc.Query = D3D11_QUERY.D3D11_QUERY_EVENT;
+            int hr = device->CreateQuery(&desc, &query);
+            if (hr < 0 || query == null)
+            {
+                ctx->Flush();
+                return;
+            }
+
+            ctx->End((ID3D11Asynchronous*)query);
+            ctx->Flush();
+
+            Stopwatch waitSw = Stopwatch.StartNew();
+            while (waitSw.ElapsedMilliseconds < 2)
+            {
+                hr = ctx->GetData((ID3D11Asynchronous*)query, null, 0, (uint)D3D11_ASYNC_GETDATA_FLAG.D3D11_ASYNC_GETDATA_DONOTFLUSH);
+                if (hr == 0)
+                    return;
+
+                Thread.SpinWait(64);
+            }
+        }
+        finally
+        {
+            if (query != null)
+                query->Release();
+            device->Release();
+        }
+
+        ctx->Flush();
     }
 
     private void SkipNativeSharedFrameForBusySlot()

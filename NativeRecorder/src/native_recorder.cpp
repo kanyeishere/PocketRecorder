@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -228,6 +229,55 @@ int32_t fail_hr(const char* operation, HRESULT hr)
     }
     set_last_error(message);
     return static_cast<int32_t>(hr);
+}
+
+HRESULT wait_for_d3d11_gpu(ID3D11DeviceContext* context, const char* operation, DWORD timeout_ms = 50)
+{
+    if (context == nullptr)
+        return E_POINTER;
+
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device)
+        return E_POINTER;
+
+    D3D11_QUERY_DESC desc{};
+    desc.Query = D3D11_QUERY_EVENT;
+
+    ComPtr<ID3D11Query> query;
+    HRESULT hr = device->CreateQuery(&desc, &query);
+    if (FAILED(hr))
+        return fail_step("CreateQuery(D3D11_QUERY_EVENT)", hr, operation != nullptr ? operation : "");
+
+    context->End(query.Get());
+    context->Flush();
+
+    auto start = std::chrono::steady_clock::now();
+    for (;;)
+    {
+        hr = context->GetData(query.Get(), nullptr, 0, 0);
+        if (hr == S_OK)
+            return S_OK;
+
+        if (FAILED(hr))
+            return fail_step("ID3D11DeviceContext::GetData", hr, operation != nullptr ? operation : "");
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        if (elapsed.count() >= timeout_ms)
+        {
+            std::string message = "NativeRecorder GPU synchronization timed out";
+            if (operation != nullptr && *operation != '\0')
+            {
+                message += " after ";
+                message += operation;
+            }
+            set_last_error(message);
+            return DXGI_ERROR_WAS_STILL_DRAWING;
+        }
+
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 }
 
 HRESULT fail_exception(const char* operation, const std::exception& ex, const std::string& details = {})
@@ -717,6 +767,10 @@ struct SharedTextureNv12Converter
         }
 
         device_context->CopyResource(source_copy_texture.Get(), source_texture.Get());
+        hr = wait_for_d3d11_gpu(device_context.Get(), "CopyResource(shared source)");
+        if (FAILED(hr))
+            return hr;
+
         if (keyed_mutex)
         {
             HRESULT release_hr = keyed_mutex->ReleaseSync(kGameWriteKey);
@@ -1265,6 +1319,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
     uint64_t written_packets = 0;
     uint64_t audio_packets = 0;
     int64_t video_sample_duration_hns = 0;
+    std::deque<int64_t> pending_video_timestamps_hns;
 
     NvencLibavRecorderBackend(const pr_video_config& video_config, const pr_audio_config& audio_config, std::wstring output)
         : video(video_config), audio(audio_config), output_path(std::move(output))
@@ -1315,7 +1370,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                 static_cast<uint32_t>(encoded_width),
                 static_cast<uint32_t>(encoded_height),
                 NV_ENC_BUFFER_FORMAT_NV12,
-                1);
+                3);
 
             NV_ENC_INITIALIZE_PARAMS initialize_params = { NV_ENC_INITIALIZE_PARAMS_VER };
             NV_ENC_CONFIG encode_config = { NV_ENC_CONFIG_VER };
@@ -1383,6 +1438,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
             ", sourceFormat=" + dxgi_format_to_string(source_format) +
             ", encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height) +
             ", pad=" + std::to_string(encoded_width - video.width) + "x" + std::to_string(encoded_height - video.height) +
+            ", nvencBuffers=" + std::to_string(encoder ? encoder->GetEncoderBufferCount() : 0) +
             ", vpSourceSupport=" + hex_uint32(converter.source_format_support) +
             ", vpNv12Support=" + hex_uint32(converter.nv12_format_support) +
             ", output=" + std::string(codec_name(video.codec)) + "/MP4 via NvEncoderD3D11 + libavformat.";
@@ -1414,6 +1470,9 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                 return E_POINTER;
 
             converter.device_context->CopyResource(input_texture, nv12_texture.Get());
+            hr = wait_for_d3d11_gpu(converter.device_context.Get(), "CopyResource(NVENC input)");
+            if (FAILED(hr))
+                return hr;
 
             NV_ENC_PIC_PARAMS picture_params = { NV_ENC_PIC_PARAMS_VER };
             picture_params.inputTimeStamp = static_cast<uint64_t>(std::max<int64_t>(0, timestamp_hns));
@@ -1421,15 +1480,14 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                 picture_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
 
             std::vector<NvEncOutputFrame> packets;
+            pending_video_timestamps_hns.push_back(std::max<int64_t>(0, timestamp_hns));
             encoder->EncodeFrame(packets, &picture_params);
             for (const NvEncOutputFrame& packet : packets)
             {
                 if (packet.frame.empty())
                     continue;
 
-                int64_t packet_timestamp = static_cast<int64_t>(packet.timeStamp);
-                if (packet_timestamp <= 0)
-                    packet_timestamp = timestamp_hns;
+                int64_t packet_timestamp = take_output_timestamp(static_cast<int64_t>(packet.timeStamp));
                 hr = muxer.write_video_packet(
                     packet.frame,
                     nvenc_output_is_key_frame(packet.pictureType),
@@ -1450,6 +1508,21 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
         }
 
         return S_OK;
+    }
+
+    int64_t take_output_timestamp(int64_t encoder_timestamp_hns)
+    {
+        if (!pending_video_timestamps_hns.empty())
+        {
+            int64_t timestamp = pending_video_timestamps_hns.front();
+            pending_video_timestamps_hns.pop_front();
+            return timestamp;
+        }
+
+        if (encoder_timestamp_hns >= 0)
+            return encoder_timestamp_hns;
+
+        return static_cast<int64_t>(written_packets) * video_sample_duration_hns;
     }
 
     HRESULT submit_audio(const void* data, int32_t byte_count, int64_t timestamp_hns) override
@@ -1485,10 +1558,11 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                     if (packet.frame.empty())
                         continue;
 
+                    int64_t packet_timestamp = take_output_timestamp(static_cast<int64_t>(packet.timeStamp));
                     HRESULT hr = muxer.write_video_packet(
                         packet.frame,
                         nvenc_output_is_key_frame(packet.pictureType),
-                        static_cast<int64_t>(packet.timeStamp),
+                        packet_timestamp,
                         video_sample_duration_hns);
                     if (FAILED(hr) && SUCCEEDED(result))
                         result = hr;
@@ -1538,6 +1612,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
     uint64_t written_packets = 0;
     uint64_t audio_packets = 0;
     int64_t video_sample_duration_hns = 0;
+    std::deque<int64_t> pending_video_timestamps_hns;
 
     AmfLibavRecorderBackend(const pr_video_config& video_config, const pr_audio_config& audio_config, std::wstring output)
         : video(video_config), audio(audio_config), output_path(std::move(output))
@@ -1781,6 +1856,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         if (result != AMF_OK && result != AMF_NEED_MORE_INPUT)
             return fail_amf("AMF SubmitInput", result);
 
+        pending_video_timestamps_hns.push_back(std::max<int64_t>(0, timestamp_hns));
         ++submitted_frames;
         return drain_output(false);
     }
@@ -1836,15 +1912,28 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
                     output_type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_I;
             }
 
-            int64_t timestamp = static_cast<int64_t>(data->GetPts());
-            if (timestamp <= 0)
-                timestamp = static_cast<int64_t>(submitted_frames) * video_sample_duration_hns;
+            int64_t timestamp = take_output_timestamp(static_cast<int64_t>(data->GetPts()));
 
             HRESULT hr = muxer.write_video_packet(packet, key_frame, timestamp, video_sample_duration_hns);
             if (FAILED(hr))
                 return hr;
             ++written_packets;
         }
+    }
+
+    int64_t take_output_timestamp(int64_t encoder_timestamp_hns)
+    {
+        if (!pending_video_timestamps_hns.empty())
+        {
+            int64_t timestamp = pending_video_timestamps_hns.front();
+            pending_video_timestamps_hns.pop_front();
+            return timestamp;
+        }
+
+        if (encoder_timestamp_hns >= 0)
+            return encoder_timestamp_hns;
+
+        return static_cast<int64_t>(written_packets) * video_sample_duration_hns;
     }
 
     HRESULT submit_audio(const void* data, int32_t byte_count, int64_t timestamp_hns) override

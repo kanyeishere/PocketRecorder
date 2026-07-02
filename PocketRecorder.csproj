@@ -33,7 +33,7 @@
     <EmbeddedResource Include="PocketRecorder.json" />
     <Content Include="PocketRecorder.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
-    <Content Include="NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll" Condition="Exists('NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll')" Link="NativeRecorder.abi9.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll" Condition="Exists('NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll')" Link="NativeRecorder.abi12.dll" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avformat-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avcodec-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avutil-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />

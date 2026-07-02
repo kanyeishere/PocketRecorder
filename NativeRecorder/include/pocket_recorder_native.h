@@ -14,7 +14,7 @@
 #  define PR_CALL
 #endif
 
-#define PR_ABI_VERSION 9
+#define PR_ABI_VERSION 12
 
 typedef struct pr_recorder_t pr_recorder_t;
 
