@@ -333,6 +333,31 @@ bool is_supported_texture_format(DXGI_FORMAT format)
     }
 }
 
+bool is_supported_recording_codec(int32_t codec)
+{
+    return codec == PR_CODEC_H264 || codec == PR_CODEC_HEVC;
+}
+
+const char* codec_name(int32_t codec)
+{
+    switch (codec)
+    {
+    case PR_CODEC_H264:
+        return "H264";
+    case PR_CODEC_HEVC:
+        return "HEVC";
+    case PR_CODEC_AV1:
+        return "AV1";
+    default:
+        return "unknown";
+    }
+}
+
+const GUID& media_foundation_video_subtype(int32_t codec)
+{
+    return codec == PR_CODEC_HEVC ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+}
+
 uint64_t make_sample_duration_hns(int fps)
 {
     int safe_fps = std::max(1, fps);
@@ -461,7 +486,7 @@ struct pr_recorder_t
             return E_INVALIDARG;
         if (video.width <= 0 || video.height <= 0 || video.fps <= 0)
             return E_INVALIDARG;
-        if (video.codec != PR_CODEC_H264)
+        if (!is_supported_recording_codec(video.codec))
             return MF_E_TOPO_CODEC_NOT_FOUND;
 
         const int source_width = video.width;
@@ -554,15 +579,16 @@ struct pr_recorder_t
         hr = set_video_type_common(video_out.Get(), encoded_width, encoded_height, video.fps);
         if (FAILED(hr))
             return fail_step("Set video output media type common attributes", hr);
-        hr = video_out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        const char* output_codec_name = codec_name(video.codec);
+        hr = video_out->SetGUID(MF_MT_SUBTYPE, media_foundation_video_subtype(video.codec));
         if (FAILED(hr))
-            return fail_step("Set video output subtype H264", hr);
+            return fail_step("Set video output subtype", hr, std::string("codec=") + output_codec_name);
         hr = video_out->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(video.bitrate_bps > 0 ? video.bitrate_bps : 12'000'000));
         if (FAILED(hr))
             return fail_step("Set video output bitrate", hr);
         hr = sink_writer->AddStream(video_out.Get(), &video_stream_index);
         if (FAILED(hr))
-            return fail_step("IMFSinkWriter::AddStream(video H264)", hr, "encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height));
+            return fail_step("IMFSinkWriter::AddStream(video)", hr, std::string("codec=") + output_codec_name + ", encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height));
 
         ComPtr<IMFMediaType> video_in;
         hr = MFCreateMediaType(&video_in);
@@ -679,7 +705,7 @@ struct pr_recorder_t
             ", pad=" + std::to_string(encoded_width - source_width) + "x" + std::to_string(encoded_height - source_height) +
             ", vpSourceSupport=" + hex_uint32(source_format_support) +
             ", vpNv12Support=" + hex_uint32(nv12_format_support) +
-            ", output=H264/MP4 via Media Foundation D3D11 texture input.";
+            ", output=" + std::string(output_codec_name) + "/MP4 via Media Foundation D3D11 texture input.";
         set_last_error(message);
         return S_OK;
     }
@@ -1031,9 +1057,9 @@ PR_API int32_t PR_CALL pr_create(const pr_video_config* video, const pr_audio_co
         return PR_E_INVALID_ARGUMENT;
     }
 
-    if (video->codec != PR_CODEC_H264)
+    if (!is_supported_recording_codec(video->codec))
     {
-        set_last_error("NativeRecorder prototype currently supports H.264 only.");
+        set_last_error("NativeRecorder Media Foundation backend currently supports H.264 and HEVC only.");
         return PR_E_NOT_AVAILABLE;
     }
 

@@ -267,7 +267,7 @@ internal sealed class ConfigWindow : Window
 
         if (config.VideoCodec != "auto")
         {
-            string[] codecs = { "libx264", "libx265", "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf" };
+            string[] codecs = { "hevc_nvenc", "hevc_qsv", "hevc_amf", "h264_nvenc", "h264_qsv", "h264_amf", "av1_nvenc", "libx264", "libx265" };
             int codecIdx = Array.IndexOf(codecs, config.VideoCodec);
             if (codecIdx < 0) codecIdx = 0;
             if (ImGui.Combo("视频编码器", ref codecIdx, codecs, codecs.Length))

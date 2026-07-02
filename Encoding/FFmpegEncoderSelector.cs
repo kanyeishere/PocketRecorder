@@ -96,7 +96,15 @@ internal static class FFmpegEncoderSelector
         try
         {
             HashSet<string> encoders = GetAvailableEncoders(ffmpegPath);
-            string[] candidates = { "h264_nvenc", "h264_amf", "h264_qsv" };
+            string[] candidates =
+            {
+                "hevc_nvenc",
+                "hevc_amf",
+                "hevc_qsv",
+                "h264_nvenc",
+                "h264_amf",
+                "h264_qsv",
+            };
             var failures = new List<string>();
 
             foreach (string codec in candidates)

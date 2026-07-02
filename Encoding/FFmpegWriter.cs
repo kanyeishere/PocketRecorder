@@ -140,12 +140,15 @@ internal sealed class FFmpegWriter : IOutputSink
             args.Add("-preset"); args.Add(_preset);
         }
         args.Add("-b:v"); args.Add($"{_videoBitrate}");
-        if (IsSoftwareH264(_videoCodec))
+        if (IsSoftwareX26x(_videoCodec))
         {
             args.Add("-pix_fmt"); args.Add("yuv420p");
-            args.Add("-tune"); args.Add("zerolatency");
             args.Add("-threads"); args.Add(GetSoftwareEncoderThreadCount().ToString());
-            args.Add("-x264-params"); args.Add("bframes=0:sync-lookahead=0");
+            if (_videoCodec.Equals("libx264", StringComparison.OrdinalIgnoreCase))
+            {
+                args.Add("-tune"); args.Add("zerolatency");
+                args.Add("-x264-params"); args.Add("bframes=0:sync-lookahead=0");
+            }
         }
         args.Add("-rtbufsize"); args.Add("200M");
         args.Add("-fps_mode"); args.Add("vfr");
@@ -213,9 +216,10 @@ internal sealed class FFmpegWriter : IOutputSink
         }
     }
 
-    private static bool IsSoftwareH264(string codec)
+    private static bool IsSoftwareX26x(string codec)
     {
-        return string.Equals(codec, "libx264", StringComparison.OrdinalIgnoreCase);
+        return string.Equals(codec, "libx264", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(codec, "libx265", StringComparison.OrdinalIgnoreCase);
     }
 
     private static int GetSoftwareEncoderThreadCount()

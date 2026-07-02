@@ -12,9 +12,13 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private const int MaxVideoQueueSize = 6;
     private const int MaxAudioQueueSize = 100;
     private const int NativeCodecH264 = 1;
+    private const int NativeCodecHevc = 2;
     private const int PressureWindowMs = 1_000;
 
     private readonly int _videoBitrate;
+    private readonly string _videoCodec;
+    private readonly int _nativeCodec;
+    private readonly string _nativeCodecName;
     private NativeRecorderSession? _session;
     private BlockingCollection<VideoFrame>? _videoQueue;
     private BlockingCollection<AudioPacket>? _audioQueue;
@@ -32,9 +36,12 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private int _audioPackets;
     private long _submitPressureUntilTicks;
 
-    public NativeRecorderWriter(int videoBitrate)
+    public NativeRecorderWriter(int videoBitrate, string videoCodec)
     {
         _videoBitrate = videoBitrate;
+        _videoCodec = videoCodec;
+        _nativeCodec = ResolveNativeCodec(videoCodec);
+        _nativeCodecName = _nativeCodec == NativeCodecH264 ? "H.264" : "HEVC";
     }
 
     public bool SupportsAudio => _hasAudio;
@@ -64,7 +71,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             videoFormat,
             audioFormat,
             _videoBitrate,
-            NativeCodecH264);
+            _nativeCodec);
 
         _videoQueue = new BlockingCollection<VideoFrame>(MaxVideoQueueSize);
         _videoWriterThread = new Thread(VideoWriterLoop)
@@ -85,7 +92,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             _audioWriterThread.Start();
         }
 
-        Plugin.Log!.Info($"[NativeRecorder] Started native D3D11 texture writer: {videoFormat.Width}x{videoFormat.Height}@{_videoFps}fps, audio={audioFormat != null}, bitrate={_videoBitrate}");
+        Plugin.Log!.Info($"[NativeRecorder] Started native D3D11 texture writer: {videoFormat.Width}x{videoFormat.Height}@{_videoFps}fps, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}");
     }
 
     public void WriteVideoFrame(VideoFrame frame)
@@ -299,5 +306,25 @@ internal sealed class NativeRecorderWriter : IOutputSink
         long pressureTicks = Stopwatch.GetTimestamp() +
             (Stopwatch.Frequency * PressureWindowMs / 1_000);
         Volatile.Write(ref _submitPressureUntilTicks, pressureTicks);
+    }
+
+    private static int ResolveNativeCodec(string codec)
+    {
+        if (string.IsNullOrWhiteSpace(codec) ||
+            codec.Equals("auto", StringComparison.OrdinalIgnoreCase) ||
+            codec.Equals("hevc", StringComparison.OrdinalIgnoreCase) ||
+            codec.Equals("h265", StringComparison.OrdinalIgnoreCase) ||
+            codec.Equals("hevc_nvenc", StringComparison.OrdinalIgnoreCase))
+        {
+            return NativeCodecHevc;
+        }
+
+        if (codec.Equals("h264", StringComparison.OrdinalIgnoreCase) ||
+            codec.Equals("h264_nvenc", StringComparison.OrdinalIgnoreCase))
+        {
+            return NativeCodecH264;
+        }
+
+        throw new InvalidOperationException($"NativeRecorder does not support codec '{codec}'.");
     }
 }

@@ -9,9 +9,9 @@ namespace Recorder.Encoding;
 
 internal static unsafe class NativeRecorderBackend
 {
-    private const int ExpectedAbiVersion = 5;
+    private const int ExpectedAbiVersion = 6;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
-    private static readonly string[] NativeDllFileNames = ["NativeRecorder.abi5.dll", "NativeRecorder.abi4.dll", "NativeRecorder.abi3.dll", "NativeRecorder.abi2.dll", "NativeRecorder.dll"];
+    private static readonly string[] NativeDllFileNames = ["NativeRecorder.abi6.dll", "NativeRecorder.abi5.dll", "NativeRecorder.abi4.dll", "NativeRecorder.abi3.dll", "NativeRecorder.abi2.dll", "NativeRecorder.dll"];
     private static readonly object Sync = new();
     private static readonly NativeRecorderDllResolver DllResolver = new(NativeDllFileNames);
     private static bool _loaded;

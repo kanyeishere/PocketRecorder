@@ -310,7 +310,7 @@ internal sealed class RecordingService : IDisposable
             {
                 try
                 {
-                    var nativeWriter = new NativeRecorderWriter(options.VideoBitrate);
+                    var nativeWriter = new NativeRecorderWriter(options.VideoBitrate, options.VideoCodec);
                     writer = nativeWriter;
                     writer.SetOutputPath(options.OutputPath);
                     writer.Start(
@@ -333,13 +333,13 @@ internal sealed class RecordingService : IDisposable
                         _videoWidth = firstFrame.Width;
                         _videoHeight = firstFrame.Height;
                         _videoPixelFormat = VideoPixelFormat.D3D11Texture;
-                        _currentBackend = "NativeRecorder D3D11";
+                        _currentBackend = $"NativeRecorder D3D11 {GetNativeRecorderCodecLabel(options.VideoCodec)}";
                         writerPublished = true;
                         _lifecycle = RecordingLifecycle.Recording;
                         _recordStart = DateTime.Now;
                     }
 
-                    Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, native=D3D11Texture/MediaFoundation-H264, asyncStart={startSw.ElapsedMilliseconds}ms");
+                    Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, native=D3D11Texture/MediaFoundation-{GetNativeRecorderCodecLabel(options.VideoCodec)}, asyncStart={startSw.ElapsedMilliseconds}ms");
                     return;
                 }
                 catch (Exception ex)
@@ -502,6 +502,17 @@ internal sealed class RecordingService : IDisposable
         }
 
         return null;
+    }
+
+    private static string GetNativeRecorderCodecLabel(string codec)
+    {
+        if (string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(codec, "h264_nvenc", StringComparison.OrdinalIgnoreCase))
+        {
+            return "H.264";
+        }
+
+        return "HEVC";
     }
 
     private void OnAudioPacket(AudioPacket packet)

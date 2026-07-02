@@ -21,7 +21,7 @@ internal static class RecordingBackendSelector
 
         if (!IsNativeRecorderCompatibleCodec(config.VideoCodec))
         {
-            reason = $"codec {config.VideoCodec} is not native-H264 compatible";
+            reason = $"codec {config.VideoCodec} is not native HEVC/H.264 compatible";
             return false;
         }
 
@@ -33,6 +33,9 @@ internal static class RecordingBackendSelector
     private static bool IsNativeRecorderCompatibleCodec(string codec)
     {
         return string.Equals(codec, "auto", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(codec, "hevc_nvenc", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(codec, "h265", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(codec, "h264_nvenc", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase);
     }
