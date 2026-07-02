@@ -8,22 +8,25 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 7;
+    public int Version { get; set; } = 10;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
 
     /// <summary>目标视频码率（bps），0 表示由编码器自动选择。</summary>
-    public int VideoBitrate { get; set; } = 32_000_000;
+    public int VideoBitrate { get; set; } = 12_000_000;
 
     /// <summary>目标帧率上限。</summary>
-    public int TargetFps { get; set; } = 60;
+    public int TargetFps { get; set; } = 30;
 
     /// <summary>是否录制音频。</summary>
     public bool CaptureAudio { get; set; } = true;
 
     /// <summary>是否优先使用硬件编码器。</summary>
     public bool UseHardwareEncoder { get; set; } = true;
+
+    /// <summary>是否启用实验 NativeRecorder D3D11 shared texture 路径。</summary>
+    public bool EnableNativeRecorderExperimental { get; set; } = true;
 
     /// <summary>FFmpeg 可执行文件路径，空则从 PATH 查找。</summary>
     public string FFmpegPath { get; set; } = string.Empty;
@@ -111,6 +114,32 @@ public class Configuration : IPluginConfiguration
                 config.TargetFps = 60;
 
             config.Version = 7;
+            config.Save(pi);
+        }
+
+        if (config.Version < 8)
+        {
+            if (config.VideoBitrate == 32_000_000)
+                config.VideoBitrate = 12_000_000;
+
+            if (config.TargetFps == 60)
+                config.TargetFps = 30;
+
+            config.Version = 8;
+            config.Save(pi);
+        }
+
+        if (config.Version < 9)
+        {
+            config.EnableNativeRecorderExperimental = false;
+            config.Version = 9;
+            config.Save(pi);
+        }
+
+        if (config.Version < 10)
+        {
+            config.EnableNativeRecorderExperimental = true;
+            config.Version = 10;
             config.Save(pi);
         }
 

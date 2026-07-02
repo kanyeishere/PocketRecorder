@@ -77,6 +77,8 @@ internal sealed class ConfigWindow : Window
             ImGui.Text($"{GetPhaseIndicator(phase)} {phase.ToDisplayText()}  {elapsed:hh\\:mm\\:ss}");
             ImGui.PopStyleColor();
             ImGui.Text($"帧数: {frameCount}");
+            if (!string.IsNullOrWhiteSpace(_plugin.RecordingService.CurrentBackend))
+                ImGui.Text($"后端: {_plugin.RecordingService.CurrentBackend}");
             if (!string.IsNullOrEmpty(_plugin.RecordingService.CurrentFilePath))
             {
                 ImGui.TextWrapped($"文件: {_plugin.RecordingService.CurrentFilePath}");
@@ -214,6 +216,13 @@ internal sealed class ConfigWindow : Window
                 config.UseHardwareEncoder = true;
                 SaveConfig(config);
             }
+        }
+
+        bool nativeRecorder = config.EnableNativeRecorderExperimental;
+        if (ImGui.Checkbox("NativeRecorder GPU 路径 (NVIDIA 实验)", ref nativeRecorder))
+        {
+            config.EnableNativeRecorderExperimental = nativeRecorder;
+            SaveConfig(config);
         }
 
         bool lowLat = config.LowLatencyMode;

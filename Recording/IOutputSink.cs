@@ -15,6 +15,9 @@ internal interface IOutputSink : IDisposable
     /// <summary>视频写入队列是否积压，需要捕获端暂缓读回。</summary>
     bool IsVideoBackedUp { get; }
 
+    /// <summary>视频写入链路是否处于压力期，需要捕获端临时降低输入帧率。</summary>
+    bool IsVideoUnderPressure { get; }
+
     /// <summary>设置输出路径。</summary>
     void SetOutputPath(string path);
 

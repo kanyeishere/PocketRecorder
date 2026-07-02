@@ -13,6 +13,7 @@ namespace Recorder.Encoding;
 /// 通过 FFmpeg 子进程编码视频和音频。
 /// 视频帧通过 stdin 以 rawvideo 格式传入，音频通过 Windows 命名管道传入。
 /// 所有写入操作异步执行（队列 + 专用线程），不阻塞渲染线程和音频采集线程。
+/// 视频使用 wall-clock VFR 时间戳；编码端追不上时丢弃过期帧，而不是复制旧帧补满 CFR。
 /// </summary>
 internal sealed class FFmpegWriter : IOutputSink
 {
@@ -26,10 +27,13 @@ internal sealed class FFmpegWriter : IOutputSink
     private volatile bool _stopped;
     private int _frameCount;
     private int _inputFrameCount;
-    private int _duplicatedFrameCount;
+    private int _tailDuplicateFrameCount;
     private int _droppedFrameCount;
+    private int _staleFrameDropCount;
+    private int _nativeManagedCopyFrameCount;
     private int _audioPackets;
     private TimeSpan? _finalVideoDuration;
+    private long _managedNativeCopyUntilTicks;
 
     // 异步写入队列
     private BlockingCollection<VideoFrame>? _videoQueue;
@@ -37,6 +41,7 @@ internal sealed class FFmpegWriter : IOutputSink
     private BlockingCollection<byte[]>? _audioQueue;
     private Thread? _audioWriterThread;
     private const int MaxQueueSize = 10; // 限制队列深度，避免内存暴涨
+    private const int NativeCopyPressureWindowMs = 1_000;
 
     private readonly string _ffmpegPath;
     private readonly int _videoBitrate;
@@ -48,6 +53,7 @@ internal sealed class FFmpegWriter : IOutputSink
 
     public bool SupportsAudio => _hasAudio;
     public bool IsVideoBackedUp => _videoQueue != null && _videoQueue.Count >= MaxQueueSize / 2;
+    public bool IsVideoUnderPressure => IsVideoBackedUp || IsWritePressureActive();
 
     public FFmpegWriter(string ffmpegPath, int videoBitrate, string videoCodec, string preset)
     {
@@ -66,10 +72,13 @@ internal sealed class FFmpegWriter : IOutputSink
         _stopped = false;
         _frameCount = 0;
         _inputFrameCount = 0;
-        _duplicatedFrameCount = 0;
+        _tailDuplicateFrameCount = 0;
         _droppedFrameCount = 0;
+        _staleFrameDropCount = 0;
+        _nativeManagedCopyFrameCount = 0;
         _audioPackets = 0;
         _finalVideoDuration = null;
+        _managedNativeCopyUntilTicks = 0;
         _stdinWritePerfStats.Reset();
         _nativeSnapshotPerfStats.Reset();
         _firstVideoFrameWritten.Reset();
@@ -84,6 +93,7 @@ internal sealed class FFmpegWriter : IOutputSink
         args.Add("-y"); // 覆盖
 
         // ── 视频输入：stdin rawvideo ──
+        args.Add("-use_wallclock_as_timestamps"); args.Add("1");
         args.Add("-f"); args.Add("rawvideo");
         args.Add("-pix_fmt"); args.Add(GetFFmpegPixelFormat(video.PixelFormat));
         args.Add("-video_size"); args.Add($"{video.Width}x{video.Height}");
@@ -138,7 +148,7 @@ internal sealed class FFmpegWriter : IOutputSink
             args.Add("-x264-params"); args.Add("bframes=0:sync-lookahead=0");
         }
         args.Add("-rtbufsize"); args.Add("200M");
-        args.Add("-fps_mode"); args.Add("cfr");
+        args.Add("-fps_mode"); args.Add("vfr");
 
         // ── 音频编码器 ──
         if (audio != null)
@@ -182,7 +192,7 @@ internal sealed class FFmpegWriter : IOutputSink
         Plugin.Log!.Info($"[FFmpeg] Process started (PID={_process.Id}), codec={_videoCodec}, pix_fmt={GetFFmpegPixelFormat(video.PixelFormat)}, {video.Width}x{video.Height}@{_videoFps}fps");
 
         // 启动异步写入线程
-        Plugin.Log!.Info($"[FFmpeg] Video timing: rawvideo CFR stream synthesized from capture timestamps at {_videoFps}fps.");
+        Plugin.Log!.Info("[FFmpeg] Video timing: rawvideo VFR uses wall-clock timestamps; stale queued frames are dropped instead of synthesized.");
         _videoQueue = new BlockingCollection<VideoFrame>(MaxQueueSize);
         _videoWriterThread = new Thread(VideoWriterLoop)
         {
@@ -233,6 +243,27 @@ internal sealed class FFmpegWriter : IOutputSink
         {
             frame.ReturnBuffer();
             return;
+        }
+
+        if (ShouldDetachNativeFrameBeforeEnqueue(frame))
+        {
+            VideoFrame originalFrame = frame;
+            try
+            {
+                frame = frame.DetachToManagedCopyIfNative();
+                if (!ReferenceEquals(originalFrame, frame))
+                {
+                    int copied = Interlocked.Increment(ref _nativeManagedCopyFrameCount);
+                    if (copied <= 5 || copied % 300 == 0)
+                        Plugin.Log!.Info($"[FFmpeg] Detached native frame to managed buffer under writer pressure. nativeCopies={copied}");
+                }
+            }
+            catch (Exception ex)
+            {
+                originalFrame.ReturnBuffer();
+                Plugin.Log!.Warning($"[FFmpeg] Failed to detach native frame under writer pressure: {ex.Message}");
+                return;
+            }
         }
 
         bool added = false;
@@ -292,46 +323,24 @@ internal sealed class FFmpegWriter : IOutputSink
     {
         Plugin.Log!.Info("[FFmpeg] Video writer thread started.");
 
-        long? firstTimestampHns = null;
-        long nextOutputFrameIndex = 0;
         using var lastFrame = new LastVideoFrameCache(this);
         foreach (var frame in _videoQueue!.GetConsumingEnumerable())
         {
+            VideoFrame frameToWrite = frame;
             bool frameStored = false;
             try
             {
-                if (firstTimestampHns == null)
-                {
-                    firstTimestampHns = frame.TimestampHns;
-                    WriteRawVideoFrame(frame, duplicate: false);
-                    lastFrame.Store(frame);
-                    frameStored = true;
-                    nextOutputFrameIndex = 1;
-                    continue;
-                }
+                if (ShouldCoalesceQueuedFrames())
+                    frameToWrite = DropStaleQueuedFrames(frameToWrite);
 
-                long relativeHns = Math.Max(0, frame.TimestampHns - firstTimestampHns.Value);
-                long targetFrameIndex = relativeHns * _videoFps / 10_000_000L;
-
-                while (lastFrame.HasFrame && nextOutputFrameIndex < targetFrameIndex)
-                {
-                    lastFrame.WriteDuplicate(this);
-                    nextOutputFrameIndex++;
-                }
-
-                if (nextOutputFrameIndex <= targetFrameIndex)
-                {
-                    WriteRawVideoFrame(frame, duplicate: false);
-                    nextOutputFrameIndex++;
-                }
-
-                lastFrame.Store(frame);
+                WriteRawVideoFrame(frameToWrite, duplicate: false);
+                lastFrame.Store(frameToWrite);
                 frameStored = true;
             }
             catch (Exception ex)
             {
                 if (!frameStored)
-                    frame.ReturnBuffer();
+                    frameToWrite.ReturnBuffer();
                 if (_stopped)
                     Plugin.Log!.Info($"[FFmpeg] Video writer stopped while writing: {ex.Message}");
                 else
@@ -340,21 +349,17 @@ internal sealed class FFmpegWriter : IOutputSink
             }
         }
 
-        if (_finalVideoDuration is { } finalDuration && lastFrame.HasFrame)
+        if (_finalVideoDuration is { } finalDuration &&
+            finalDuration > TimeSpan.Zero &&
+            lastFrame.HasFrame)
         {
-            long desiredFrameCount = Math.Max(1, (finalDuration.Ticks * _videoFps + TimeSpan.TicksPerSecond - 1) / TimeSpan.TicksPerSecond);
-            while (nextOutputFrameIndex < desiredFrameCount)
+            try
             {
-                try
-                {
-                    lastFrame.WriteDuplicate(this);
-                    nextOutputFrameIndex++;
-                }
-                catch (Exception ex)
-                {
-                    Plugin.Log!.Warning($"[FFmpeg] Final video padding failed: {ex.Message}");
-                    break;
-                }
+                lastFrame.WriteDuplicate(this);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log!.Warning($"[FFmpeg] Final tail frame failed: {ex.Message}");
             }
         }
 
@@ -362,7 +367,7 @@ internal sealed class FFmpegWriter : IOutputSink
         _stdinWritePerfStats.FlushIfAny();
         _nativeSnapshotPerfStats.FlushIfAny();
 
-        Plugin.Log!.Info($"[FFmpeg] Video writer thread exiting. input={_inputFrameCount}, output={_frameCount}, duplicated={_duplicatedFrameCount}, dropped={_droppedFrameCount}");
+        Plugin.Log!.Info($"[FFmpeg] Video writer thread exiting. input={_inputFrameCount}, output={_frameCount}, tailDuplicates={_tailDuplicateFrameCount}, dropped={_droppedFrameCount}, staleDrops={_staleFrameDropCount}, nativeCopies={_nativeManagedCopyFrameCount}");
     }
 
     public bool WaitForFirstVideoFrameWritten(int timeoutMs)
@@ -378,6 +383,7 @@ internal sealed class FFmpegWriter : IOutputSink
                 _stdin!.Write(new ReadOnlySpan<byte>(frame.DataPtr, frame.DataLength));
             }
             long writeTicks = Stopwatch.GetTimestamp() - writeStartTicks;
+            MarkWritePressureIfSlow(writeTicks);
             ReadOnlySpan<long> perfTicks = stackalloc long[] { writeTicks };
             _stdinWritePerfStats.Record(frame.Width, frame.Height, frame.DataLength, frame.PixelFormat, perfTicks);
             RecordWrittenVideoFrame(duplicate);
@@ -392,6 +398,7 @@ internal sealed class FFmpegWriter : IOutputSink
         long writeStartTicks = Stopwatch.GetTimestamp();
         _stdin!.Write(data);
         long writeTicks = Stopwatch.GetTimestamp() - writeStartTicks;
+        MarkWritePressureIfSlow(writeTicks);
         ReadOnlySpan<long> perfTicks = stackalloc long[] { writeTicks };
         _stdinWritePerfStats.Record(width, height, data.Length, pixelFormat, perfTicks);
 
@@ -405,10 +412,68 @@ internal sealed class FFmpegWriter : IOutputSink
             _firstVideoFrameWritten.Set();
 
         if (duplicate)
-            _duplicatedFrameCount++;
+            _tailDuplicateFrameCount++;
 
         if (_frameCount % 300 == 0)
-            Plugin.Log!.Info($"[FFmpeg] Written {_frameCount} video frames (input={_inputFrameCount}, duplicated={_duplicatedFrameCount}, dropped={_droppedFrameCount}), {_audioPackets} audio packets");
+            Plugin.Log!.Info($"[FFmpeg] Written {_frameCount} video frames (input={_inputFrameCount}, tailDuplicates={_tailDuplicateFrameCount}, dropped={_droppedFrameCount}, staleDrops={_staleFrameDropCount}, nativeCopies={_nativeManagedCopyFrameCount}), {_audioPackets} audio packets");
+    }
+
+    private bool ShouldDetachNativeFrameBeforeEnqueue(VideoFrame frame)
+    {
+        if (!frame.IsNative || _videoQueue == null)
+            return false;
+
+        return _videoQueue.Count > 0 || IsWritePressureActive();
+    }
+
+    private bool ShouldCoalesceQueuedFrames()
+    {
+        if (_videoQueue == null)
+            return false;
+
+        return _videoQueue.Count >= MaxQueueSize / 2 || IsWritePressureActive();
+    }
+
+    private VideoFrame DropStaleQueuedFrames(VideoFrame currentFrame)
+    {
+        if (_videoQueue == null)
+            return currentFrame;
+
+        int staleDropped = 0;
+        while (_videoQueue.TryTake(out var newerFrame))
+        {
+            currentFrame.ReturnBuffer();
+            currentFrame = newerFrame;
+            staleDropped++;
+        }
+
+        if (staleDropped > 0)
+        {
+            int dropped = Interlocked.Add(ref _droppedFrameCount, staleDropped);
+            int stale = Interlocked.Add(ref _staleFrameDropCount, staleDropped);
+            if (stale <= 5 || stale % 60 == 0)
+                Plugin.Log!.Warning($"[FFmpeg] Dropped stale queued video frames to catch up. staleDrops={stale}, dropped={dropped}");
+        }
+
+        return currentFrame;
+    }
+
+    private bool IsWritePressureActive()
+    {
+        long untilTicks = Volatile.Read(ref _managedNativeCopyUntilTicks);
+        return untilTicks > Stopwatch.GetTimestamp();
+    }
+
+    private void MarkWritePressureIfSlow(long writeTicks)
+    {
+        int fps = Math.Max(1, _videoFps);
+        long frameBudgetTicks = Math.Max(1, Stopwatch.Frequency / fps);
+        if (writeTicks <= frameBudgetTicks)
+            return;
+
+        long pressureTicks = Stopwatch.GetTimestamp() +
+            (Stopwatch.Frequency * NativeCopyPressureWindowMs / 1_000);
+        Volatile.Write(ref _managedNativeCopyUntilTicks, pressureTicks);
     }
 
     private int DrainQueuedVideoFrames()
@@ -576,7 +641,7 @@ internal sealed class FFmpegWriter : IOutputSink
         _finalVideoDuration = finalVideoDuration;
         _stopped = true;
 
-        Plugin.Log!.Info($"[FFmpeg] Stopping... input={_inputFrameCount}, output={_frameCount}, duplicated={_duplicatedFrameCount}, dropped={_droppedFrameCount}, audioPackets={_audioPackets}");
+        Plugin.Log!.Info($"[FFmpeg] Stopping... input={_inputFrameCount}, output={_frameCount}, tailDuplicates={_tailDuplicateFrameCount}, dropped={_droppedFrameCount}, staleDrops={_staleFrameDropCount}, nativeCopies={_nativeManagedCopyFrameCount}, audioPackets={_audioPackets}");
 
         // 完成视频队列
         try { _videoQueue?.CompleteAdding(); } catch { }

@@ -16,6 +16,7 @@ internal sealed class RecordingService : IDisposable
     private readonly Plugin _plugin;
     private readonly IGameInteropProvider _gameInterop;
     private readonly object _sync = new();
+    private readonly SoftFpsGovernor _softFps;
 
     private VideoCaptureService? _videoCapture;
     private AudioCaptureService? _audioCapture;
@@ -27,6 +28,7 @@ internal sealed class RecordingService : IDisposable
     private DateTime _recordStart;
     private int _frameCount;
     private string? _currentFilePath;
+    private string _currentBackend = string.Empty;
     private Action<RecordingFinishedEventArgs>? _finishedCallback;
 
     // 配置缓存（录制开始时快照）
@@ -64,6 +66,7 @@ internal sealed class RecordingService : IDisposable
 
     public int FrameCount => Volatile.Read(ref _frameCount);
     public string? CurrentFilePath => _currentFilePath;
+    public string CurrentBackend => _currentBackend;
 
     public event Action<bool>? RecordingStateChanged;
 
@@ -71,6 +74,7 @@ internal sealed class RecordingService : IDisposable
     {
         _plugin = plugin;
         _gameInterop = gameInterop;
+        _softFps = new SoftFpsGovernor(message => Plugin.Log!.Info(message));
     }
 
     public void ToggleRecording()
@@ -93,6 +97,7 @@ internal sealed class RecordingService : IDisposable
         RecordingStartOptions options;
         AudioCaptureService? audioCapture = null;
         VideoCaptureService videoCapture;
+        string nativeReason = "not evaluated";
 
         if (!_plugin.IsFFmpegBootstrapComplete)
         {
@@ -108,6 +113,7 @@ internal sealed class RecordingService : IDisposable
             var config = _plugin.Config;
             int sessionId = ++_sessionId;
             _videoFps = Math.Max(1, config.TargetFps);
+            bool preferNativeRecorder = RecordingBackendSelector.ShouldPreferNativeRecorder(config, out nativeReason);
 
             string dir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
             _currentFilePath = string.IsNullOrWhiteSpace(outputPath)
@@ -124,7 +130,8 @@ internal sealed class RecordingService : IDisposable
                 config.CaptureAudio,
                 config.VideoCodec,
                 config.EncoderPreset,
-                config.UseHardwareEncoder);
+                config.UseHardwareEncoder,
+                preferNativeRecorder);
 
             _startOptions = options;
             _writer = null;
@@ -133,9 +140,11 @@ internal sealed class RecordingService : IDisposable
             _lifecycle = RecordingLifecycle.Preparing;
             _finishedCallback = finishedCallback;
             _frameCount = 0;
+            _currentBackend = preferNativeRecorder ? "NativeRecorder 准备中" : "FFmpeg 准备中";
             _videoWidth = 0;
             _videoHeight = 0;
             _videoPixelFormat = VideoPixelFormat.Bgra;
+            _softFps.Reset(log: false);
         }
 
         if (options.CaptureAudio)
@@ -155,6 +164,7 @@ internal sealed class RecordingService : IDisposable
             _gameInterop,
             OnVideoFrame,
             ShouldCaptureVideoFrame);
+        videoCapture.PreferD3D11TextureFrames = options.PreferNativeRecorder;
 
         lock (_sync)
         {
@@ -189,7 +199,7 @@ internal sealed class RecordingService : IDisposable
         }
 
         Plugin.Log.Info($"[Record] Preparation started -> {options.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
-        Plugin.Log.Info($"[Record] Config: fps={options.TargetFps}, bitrate={options.VideoBitrate}, codec={options.VideoCodec}, preset={options.EncoderPreset}, audio={options.CaptureAudio}, hw={options.UseHardwareEncoder}");
+        Plugin.Log.Info($"[Record] Config: fps={options.TargetFps}, bitrate={options.VideoBitrate}, codec={options.VideoCodec}, preset={options.EncoderPreset}, audio={options.CaptureAudio}, hw={options.UseHardwareEncoder}, native={options.PreferNativeRecorder} ({nativeReason})");
         RecordingStateChanged?.Invoke(true);
         return true;
     }
@@ -289,14 +299,64 @@ internal sealed class RecordingService : IDisposable
                 return;
             }
 
-            firstFrame = firstFrame.DetachToManagedCopyIfNative();
-
             AudioFormat? audioFormat = WaitForAudioFormat(options);
             if (!IsCurrentSession(options.SessionId))
             {
                 firstFrame.ReturnBuffer();
                 return;
             }
+
+            if (options.PreferNativeRecorder && firstFrame.IsD3D11Texture)
+            {
+                try
+                {
+                    var nativeWriter = new NativeRecorderWriter(options.VideoBitrate);
+                    writer = nativeWriter;
+                    writer.SetOutputPath(options.OutputPath);
+                    writer.Start(
+                        new VideoFormat(firstFrame.Width, firstFrame.Height, options.TargetFps, VideoPixelFormat.D3D11Texture),
+                        audioFormat);
+
+                    writer.WriteVideoFrame(firstFrame);
+                    frameHandedToWriter = true;
+                    nativeWriter.WaitForFirstVideoFrameSubmitted(2_000);
+
+                    lock (_sync)
+                    {
+                        if (!IsCurrentSessionNoLock(options.SessionId) ||
+                            _lifecycle != RecordingLifecycle.StartingWriter)
+                        {
+                            return;
+                        }
+
+                        _writer = writer;
+                        _videoWidth = firstFrame.Width;
+                        _videoHeight = firstFrame.Height;
+                        _videoPixelFormat = VideoPixelFormat.D3D11Texture;
+                        _currentBackend = "NativeRecorder D3D11";
+                        writerPublished = true;
+                        _lifecycle = RecordingLifecycle.Recording;
+                        _recordStart = DateTime.Now;
+                    }
+
+                    Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, native=D3D11Texture/MediaFoundation-H264, asyncStart={startSw.ElapsedMilliseconds}ms");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log!.Warning($"[NativeRecorder] Native path failed before start; falling back to FFmpeg stdin rawvideo. {ex.Message}");
+                    if (!frameHandedToWriter)
+                        firstFrame.ReturnBuffer();
+                    try { writer?.Stop(TimeSpan.Zero); } catch { }
+                    try { writer?.Dispose(); } catch { }
+                    writer = null;
+                    writerPublished = false;
+                    SwitchToFFmpegFallback(options.SessionId);
+                    return;
+                }
+            }
+
+            firstFrame = firstFrame.DetachToManagedCopyIfNative();
 
             var encoderConfig = new Configuration
             {
@@ -338,6 +398,7 @@ internal sealed class RecordingService : IDisposable
                 _videoWidth = firstFrame.Width;
                 _videoHeight = firstFrame.Height;
                 _videoPixelFormat = firstFrame.PixelFormat;
+                _currentBackend = $"FFmpeg {encoder.Codec}";
                 writerPublished = true;
             }
 
@@ -464,7 +525,45 @@ internal sealed class RecordingService : IDisposable
             if (_startOptions == null || _lifecycle == RecordingLifecycle.StartingWriter)
                 return false;
 
-            return _writer == null || !_writer.IsVideoBackedUp;
+            if (_writer == null)
+            {
+                _softFps.Reset();
+                return true;
+            }
+
+            if (!_writer.IsVideoUnderPressure)
+            {
+                _softFps.Reset();
+                return true;
+            }
+
+            if (_writer.IsVideoBackedUp)
+                return false;
+
+            return _softFps.ShouldCapture(_videoFps);
+        }
+    }
+
+    private void SwitchToFFmpegFallback(int sessionId)
+    {
+        lock (_sync)
+        {
+            if (!IsCurrentSessionNoLock(sessionId))
+                return;
+
+            if (_startOptions != null)
+                _startOptions = _startOptions with { PreferNativeRecorder = false };
+
+            if (_videoCapture != null)
+                _videoCapture.PreferD3D11TextureFrames = false;
+
+            _writer = null;
+            _videoWidth = 0;
+            _videoHeight = 0;
+            _videoPixelFormat = VideoPixelFormat.Bgra;
+            _currentBackend = "FFmpeg fallback 准备中";
+            _lifecycle = RecordingLifecycle.Preparing;
+            _softFps.Reset(log: false);
         }
     }
 
@@ -659,6 +758,7 @@ internal sealed class RecordingService : IDisposable
         _audioCapture = null;
         _writer = null;
         _lifecycle = nextLifecycle;
+        _currentBackend = string.Empty;
         _finishedCallback = null;
     }
 
@@ -688,7 +788,8 @@ internal sealed class RecordingService : IDisposable
         bool CaptureAudio,
         string VideoCodec,
         string EncoderPreset,
-        bool UseHardwareEncoder);
+        bool UseHardwareEncoder,
+        bool PreferNativeRecorder);
 }
 
 internal enum RecordingLifecycle

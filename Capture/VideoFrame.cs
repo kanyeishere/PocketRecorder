@@ -10,6 +10,8 @@ internal sealed unsafe class VideoFrame
     private readonly Action? _onConsumed;
     private int _bufferReturned;
     private bool _isNative;
+    private bool _isD3D11Texture;
+    private int _d3d11TextureSubmitted;
     private byte* _dataPtr;
 
     public VideoFrame(
@@ -54,6 +56,31 @@ internal sealed unsafe class VideoFrame
         _onConsumed = onConsumed;
     }
 
+    public VideoFrame(
+        IntPtr d3d11DevicePtr,
+        IntPtr d3d11TexturePtr,
+        IntPtr d3d11SharedHandle,
+        int dxgiFormat,
+        int width,
+        int height,
+        long timestampHns,
+        Action<bool> onConsumed)
+    {
+        _isD3D11Texture = true;
+        Data = Array.Empty<byte>();
+        DataLength = 0;
+        Width = width;
+        Height = height;
+        Stride = 0;
+        TimestampHns = timestampHns;
+        PixelFormat = VideoPixelFormat.D3D11Texture;
+        D3D11DevicePtr = d3d11DevicePtr;
+        D3D11TexturePtr = d3d11TexturePtr;
+        D3D11SharedHandle = d3d11SharedHandle;
+        DxgiFormat = dxgiFormat;
+        _onD3D11TextureConsumed = onConsumed;
+    }
+
     public byte[] Data { get; }
     public int DataLength { get; }
     public int Width { get; }
@@ -63,9 +90,24 @@ internal sealed unsafe class VideoFrame
     public VideoPixelFormat PixelFormat { get; }
     public byte* DataPtr => _dataPtr;
     public bool IsNative => _isNative;
+    public bool IsD3D11Texture => _isD3D11Texture;
+    public IntPtr D3D11DevicePtr { get; }
+    public IntPtr D3D11TexturePtr { get; }
+    public IntPtr D3D11SharedHandle { get; }
+    public int DxgiFormat { get; }
+    private Action<bool>? _onD3D11TextureConsumed;
+
+    public void MarkD3D11TextureSubmitted()
+    {
+        if (_isD3D11Texture)
+            Volatile.Write(ref _d3d11TextureSubmitted, 1);
+    }
 
     public VideoFrame DetachToManagedCopyIfNative()
     {
+        if (_isD3D11Texture)
+            throw new InvalidOperationException("D3D11 texture frames cannot be detached to managed rawvideo buffers.");
+
         if (!_isNative)
             return this;
 
@@ -100,6 +142,13 @@ internal sealed unsafe class VideoFrame
 
     public void ReturnBuffer()
     {
+        if (_isD3D11Texture)
+        {
+            if (Interlocked.Exchange(ref _bufferReturned, 1) == 0)
+                _onD3D11TextureConsumed?.Invoke(Volatile.Read(ref _d3d11TextureSubmitted) != 0);
+            return;
+        }
+
         if (_isNative)
         {
             if (Interlocked.Exchange(ref _bufferReturned, 1) == 0)
