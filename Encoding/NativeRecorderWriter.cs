@@ -10,12 +10,12 @@ namespace Recorder.Encoding;
 
 internal sealed class NativeRecorderWriter : IOutputSink
 {
-    private const int MaxVideoQueueSize = 6;
+    private const int MaxVideoQueueSize = 18;
     private const int MaxAudioQueueSize = 100;
     private const int NativeCodecH264 = 1;
     private const int NativeCodecHevc = 2;
     private const int PressureWindowMs = 1_000;
-    private const int FirstFrameRetryMs = 1_500;
+    private const int FirstFrameRetryMs = 300;
 
     private readonly int _videoBitrate;
     private readonly string _videoCodec;
@@ -107,7 +107,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
         }
 
         Plugin.Log!.Info($"[NativeRecorder] Started native D3D11 texture writer: {videoFormat.Width}x{videoFormat.Height}@{_videoFps}fps, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}");
-        Plugin.Log!.Info($"[NativeRecorder] Video timing: quantized capture timestamps, frameDurationHns={_videoFrameDurationHns}");
+        Plugin.Log!.Info($"[NativeRecorder] Video timing: monotonic capture timestamps, frameDurationHns={_videoFrameDurationHns}");
     }
 
     public void WriteVideoFrame(VideoFrame frame)
@@ -188,7 +188,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             {
                 long submitStartTicks = Stopwatch.GetTimestamp();
                 bool isFirstSubmittedFrame = Volatile.Read(ref _submittedFrameCount) == 0;
-                long videoTimestampHns = GetQuantizedVideoTimestampHns(frame);
+                long videoTimestampHns = GetMonotonicVideoTimestampHns(frame);
                 bool accepted = SubmitD3D11TextureWithStartupRetry(frame, videoTimestampHns, isFirstSubmittedFrame);
                 if (!accepted)
                 {
@@ -270,7 +270,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, dropped={_droppedFrameCount}");
     }
 
-    private long GetQuantizedVideoTimestampHns(VideoFrame frame)
+    private long GetMonotonicVideoTimestampHns(VideoFrame frame)
     {
         long first = Volatile.Read(ref _firstVideoTimestampHns);
         if (first < 0)
@@ -279,13 +279,11 @@ internal sealed class NativeRecorderWriter : IOutputSink
             first = Volatile.Read(ref _firstVideoTimestampHns);
         }
 
-        long relativeHns = Math.Max(0, frame.TimestampHns - first);
-        long frameIndex = (relativeHns + _videoFrameDurationHns / 2) / _videoFrameDurationHns;
-        long timestampHns = frameIndex * _videoFrameDurationHns;
+        long timestampHns = Math.Max(0, frame.TimestampHns - first);
 
         long last = Volatile.Read(ref _lastSubmittedVideoTimestampHns);
         if (last >= 0 && timestampHns <= last)
-            timestampHns = last + _videoFrameDurationHns;
+            timestampHns = last + 1;
 
         return timestampHns;
     }

@@ -100,7 +100,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private const int Nv12SlotReady = 1;
     private const int Nv12SlotMapped = 2;
     private const int Nv12SlotPendingRelease = 3;
-    private const int NativeSharedTextureCount = 4;
+    private const int NativeSharedTextureCount = 6;
     private const int NativeSlotAvailable = 0;
     private const int NativeSlotInFlight = 1;
     private const int NativeSlotPendingDropRelease = 2;

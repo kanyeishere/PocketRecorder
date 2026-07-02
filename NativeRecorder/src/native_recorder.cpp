@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -53,6 +54,8 @@ constexpr DWORD kInvalidStream = 0xFFFFFFFFu;
 constexpr UINT64 kGameWriteKey = 0;
 constexpr UINT64 kEncoderReadKey = 1;
 constexpr DWORD kSharedTextureAcquireTimeoutMs = 5;
+constexpr size_t kAmfNv12PoolSize = 8;
+constexpr size_t kMaxMuxQueueItems = 512;
 
 std::mutex g_error_mutex;
 std::string g_last_error;
@@ -229,55 +232,6 @@ int32_t fail_hr(const char* operation, HRESULT hr)
     }
     set_last_error(message);
     return static_cast<int32_t>(hr);
-}
-
-HRESULT wait_for_d3d11_gpu(ID3D11DeviceContext* context, const char* operation, DWORD timeout_ms = 50)
-{
-    if (context == nullptr)
-        return E_POINTER;
-
-    ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
-    if (!device)
-        return E_POINTER;
-
-    D3D11_QUERY_DESC desc{};
-    desc.Query = D3D11_QUERY_EVENT;
-
-    ComPtr<ID3D11Query> query;
-    HRESULT hr = device->CreateQuery(&desc, &query);
-    if (FAILED(hr))
-        return fail_step("CreateQuery(D3D11_QUERY_EVENT)", hr, operation != nullptr ? operation : "");
-
-    context->End(query.Get());
-    context->Flush();
-
-    auto start = std::chrono::steady_clock::now();
-    for (;;)
-    {
-        hr = context->GetData(query.Get(), nullptr, 0, 0);
-        if (hr == S_OK)
-            return S_OK;
-
-        if (FAILED(hr))
-            return fail_step("ID3D11DeviceContext::GetData", hr, operation != nullptr ? operation : "");
-
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start);
-        if (elapsed.count() >= timeout_ms)
-        {
-            std::string message = "NativeRecorder GPU synchronization timed out";
-            if (operation != nullptr && *operation != '\0')
-            {
-                message += " after ";
-                message += operation;
-            }
-            set_last_error(message);
-            return DXGI_ERROR_WAS_STILL_DRAWING;
-        }
-
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
 }
 
 HRESULT fail_exception(const char* operation, const std::exception& ex, const std::string& details = {})
@@ -556,7 +510,17 @@ struct SharedTextureNv12Converter
     ComPtr<ID3D11VideoContext> video_context;
     ComPtr<ID3D11VideoProcessorEnumerator> video_processor_enum;
     ComPtr<ID3D11VideoProcessor> video_processor;
+    HANDLE cached_shared_handle = nullptr;
+    ComPtr<ID3D11Texture2D> cached_source_texture;
+    ComPtr<IDXGIKeyedMutex> cached_keyed_mutex;
     ComPtr<ID3D11Texture2D> source_copy_texture;
+    ComPtr<ID3D11VideoProcessorInputView> source_copy_input_view;
+    struct OutputViewCacheEntry
+    {
+        ID3D11Texture2D* texture = nullptr;
+        ComPtr<ID3D11VideoProcessorOutputView> view;
+    };
+    std::vector<OutputViewCacheEntry> output_view_cache;
     std::string adapter_name;
     LUID adapter_luid{};
     UINT source_format_support = 0;
@@ -691,11 +655,13 @@ struct SharedTextureNv12Converter
             if (existing.Width == source_desc.Width &&
                 existing.Height == source_desc.Height &&
                 existing.Format == source_desc.Format &&
-                (existing.BindFlags & required_bind_flags) == required_bind_flags)
+                (existing.BindFlags & required_bind_flags) == required_bind_flags &&
+                source_copy_input_view)
             {
                 return S_OK;
             }
 
+            source_copy_input_view.Reset();
             source_copy_texture.Reset();
         }
 
@@ -705,26 +671,53 @@ struct SharedTextureNv12Converter
         copy_desc.CPUAccessFlags = 0;
         copy_desc.MiscFlags = 0;
 
-        return device->CreateTexture2D(&copy_desc, nullptr, &source_copy_texture);
-    }
+        HRESULT hr = device->CreateTexture2D(&copy_desc, nullptr, &source_copy_texture);
+        if (FAILED(hr))
+            return hr;
 
-    HRESULT convert_shared_texture(HANDLE shared_handle, DXGI_FORMAT source_format, ComPtr<ID3D11Texture2D>& nv12_texture)
-    {
-        if (!initialized)
-            return E_UNEXPECTED;
-        if (shared_handle == nullptr)
-            return E_POINTER;
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_view_desc{};
+        input_view_desc.FourCC = 0;
+        input_view_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        input_view_desc.Texture2D.MipSlice = 0;
+        input_view_desc.Texture2D.ArraySlice = 0;
 
-        ComPtr<ID3D11Texture2D> source_texture;
-        HRESULT hr = device->OpenSharedResource(shared_handle, __uuidof(ID3D11Texture2D), &source_texture);
+        hr = video_device->CreateVideoProcessorInputView(
+            source_copy_texture.Get(),
+            video_processor_enum.Get(),
+            &input_view_desc,
+            &source_copy_input_view);
         if (FAILED(hr))
         {
-            set_last_error("NativeRecorder failed to open shared texture on the source adapter: " + hresult_to_string(hr));
+            source_copy_texture.Reset();
             return hr;
         }
 
-        D3D11_TEXTURE2D_DESC source_desc{};
-        source_texture->GetDesc(&source_desc);
+        return S_OK;
+    }
+
+    HRESULT ensure_shared_source_texture(HANDLE shared_handle, DXGI_FORMAT source_format, D3D11_TEXTURE2D_DESC& source_desc)
+    {
+        if (shared_handle == nullptr)
+            return E_POINTER;
+
+        if (shared_handle != cached_shared_handle || !cached_source_texture)
+        {
+            cached_keyed_mutex.Reset();
+            cached_source_texture.Reset();
+            cached_shared_handle = nullptr;
+
+            HRESULT hr = device->OpenSharedResource(shared_handle, __uuidof(ID3D11Texture2D), &cached_source_texture);
+            if (FAILED(hr))
+            {
+                set_last_error("NativeRecorder failed to open shared texture on the source adapter: " + hresult_to_string(hr));
+                return hr;
+            }
+
+            cached_shared_handle = shared_handle;
+            (void) cached_source_texture.As(&cached_keyed_mutex);
+        }
+
+        cached_source_texture->GetDesc(&source_desc);
         if (source_desc.Width != static_cast<UINT>(source_width()) ||
             source_desc.Height != static_cast<UINT>(source_height()))
         {
@@ -744,17 +737,82 @@ struct SharedTextureNv12Converter
             return E_INVALIDARG;
         }
 
-        ComPtr<IDXGIKeyedMutex> keyed_mutex;
-        hr = source_texture.As(&keyed_mutex);
-
-        hr = ensure_source_copy_texture(source_desc);
+        HRESULT hr = ensure_source_copy_texture(source_desc);
         if (FAILED(hr))
             return fail_step("CreateTexture2D(source copy)", hr, "source=" + texture_desc_to_string(source_desc));
 
-        bool mutex_acquired = false;
-        if (keyed_mutex)
+        return S_OK;
+    }
+
+    HRESULT ensure_output_view(ID3D11Texture2D* output_texture, ID3D11VideoProcessorOutputView** output_view)
+    {
+        if (output_texture == nullptr || output_view == nullptr)
+            return E_POINTER;
+
+        *output_view = nullptr;
+        for (auto& entry : output_view_cache)
         {
-            hr = keyed_mutex->AcquireSync(kEncoderReadKey, kSharedTextureAcquireTimeoutMs);
+            if (entry.texture == output_texture && entry.view)
+            {
+                *output_view = entry.view.Get();
+                return S_OK;
+            }
+        }
+
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{};
+        output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        output_view_desc.Texture2D.MipSlice = 0;
+
+        OutputViewCacheEntry entry{};
+        entry.texture = output_texture;
+        HRESULT hr = video_device->CreateVideoProcessorOutputView(
+            output_texture,
+            video_processor_enum.Get(),
+            &output_view_desc,
+            &entry.view);
+        if (FAILED(hr))
+            return hr;
+
+        output_view_cache.push_back(std::move(entry));
+        *output_view = output_view_cache.back().view.Get();
+        return S_OK;
+    }
+
+    HRESULT create_nv12_texture(ComPtr<ID3D11Texture2D>& nv12_texture)
+    {
+        D3D11_TEXTURE2D_DESC output_desc{};
+        output_desc.Width = static_cast<UINT>(encoded_width());
+        output_desc.Height = static_cast<UINT>(encoded_height());
+        output_desc.MipLevels = 1;
+        output_desc.ArraySize = 1;
+        output_desc.Format = DXGI_FORMAT_NV12;
+        output_desc.SampleDesc.Count = 1;
+        output_desc.Usage = D3D11_USAGE_DEFAULT;
+        output_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        HRESULT hr = device->CreateTexture2D(&output_desc, nullptr, &nv12_texture);
+        if (FAILED(hr))
+            return fail_step("CreateTexture2D(NV12 output)", hr, "output=" + texture_desc_to_string(output_desc));
+
+        return S_OK;
+    }
+
+    HRESULT convert_shared_texture_to(HANDLE shared_handle, DXGI_FORMAT source_format, ID3D11Texture2D* output_texture)
+    {
+        if (!initialized)
+            return E_UNEXPECTED;
+        if (output_texture == nullptr)
+            return E_POINTER;
+
+        D3D11_TEXTURE2D_DESC source_desc{};
+        HRESULT hr = ensure_shared_source_texture(shared_handle, source_format, source_desc);
+        if (FAILED(hr))
+            return hr;
+
+        bool mutex_acquired = false;
+        if (cached_keyed_mutex)
+        {
+            hr = cached_keyed_mutex->AcquireSync(kEncoderReadKey, kSharedTextureAcquireTimeoutMs);
             if (hr == WAIT_TIMEOUT || hr == DXGI_ERROR_WAIT_TIMEOUT)
             {
                 set_last_error("NativeRecorder shared texture was not ready; dropping one frame.");
@@ -766,56 +824,19 @@ struct SharedTextureNv12Converter
             mutex_acquired = true;
         }
 
-        device_context->CopyResource(source_copy_texture.Get(), source_texture.Get());
-        hr = wait_for_d3d11_gpu(device_context.Get(), "CopyResource(shared source)");
-        if (FAILED(hr))
-            return hr;
-
-        if (keyed_mutex)
+        device_context->CopyResource(source_copy_texture.Get(), cached_source_texture.Get());
+        if (cached_keyed_mutex)
         {
-            HRESULT release_hr = keyed_mutex->ReleaseSync(kGameWriteKey);
+            HRESULT release_hr = cached_keyed_mutex->ReleaseSync(kGameWriteKey);
             mutex_acquired = false;
             if (FAILED(release_hr))
                 return fail_step("IDXGIKeyedMutex::ReleaseSync", release_hr, "source=" + texture_desc_to_string(source_desc));
         }
 
-        D3D11_TEXTURE2D_DESC output_desc{};
-        output_desc.Width = static_cast<UINT>(encoded_width());
-        output_desc.Height = static_cast<UINT>(encoded_height());
-        output_desc.MipLevels = 1;
-        output_desc.ArraySize = 1;
-        output_desc.Format = DXGI_FORMAT_NV12;
-        output_desc.SampleDesc.Count = 1;
-        output_desc.Usage = D3D11_USAGE_DEFAULT;
-        output_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-        hr = device->CreateTexture2D(&output_desc, nullptr, &nv12_texture);
+        ID3D11VideoProcessorOutputView* output_view = nullptr;
+        hr = ensure_output_view(output_texture, &output_view);
         if (FAILED(hr))
-            return fail_step("CreateTexture2D(NV12 output)", hr, "output=" + texture_desc_to_string(output_desc));
-
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_view_desc{};
-        input_view_desc.FourCC = 0;
-        input_view_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        input_view_desc.Texture2D.MipSlice = 0;
-        input_view_desc.Texture2D.ArraySlice = 0;
-
-        ComPtr<ID3D11VideoProcessorInputView> input_view;
-        hr = video_device->CreateVideoProcessorInputView(source_copy_texture.Get(), video_processor_enum.Get(), &input_view_desc, &input_view);
-        if (FAILED(hr))
-        {
-            if (mutex_acquired && keyed_mutex)
-                keyed_mutex->ReleaseSync(kGameWriteKey);
-            return fail_step("CreateVideoProcessorInputView", hr, "source=" + texture_desc_to_string(source_desc));
-        }
-
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{};
-        output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-        output_view_desc.Texture2D.MipSlice = 0;
-
-        ComPtr<ID3D11VideoProcessorOutputView> output_view;
-        hr = video_device->CreateVideoProcessorOutputView(nv12_texture.Get(), video_processor_enum.Get(), &output_view_desc, &output_view);
-        if (FAILED(hr))
-            return fail_step("CreateVideoProcessorOutputView", hr, "output=" + texture_desc_to_string(output_desc));
+            return fail_step("CreateVideoProcessorOutputView", hr);
 
         D3D11_VIDEO_PROCESSOR_STREAM stream{};
         stream.Enable = TRUE;
@@ -823,16 +844,16 @@ struct SharedTextureNv12Converter
         stream.InputFrameOrField = 0;
         stream.PastFrames = 0;
         stream.FutureFrames = 0;
-        stream.pInputSurface = input_view.Get();
+        stream.pInputSurface = source_copy_input_view.Get();
 
         hr = video_context->VideoProcessorBlt(
             video_processor.Get(),
-            output_view.Get(),
+            output_view,
             static_cast<UINT>(frame_index),
             1,
             &stream);
         if (FAILED(hr))
-            return fail_step("VideoProcessorBlt", hr, "source=" + texture_desc_to_string(source_desc) + "; output=" + texture_desc_to_string(output_desc));
+            return fail_step("VideoProcessorBlt", hr, "source=" + texture_desc_to_string(source_desc));
 
         ++frame_index;
         return S_OK;
@@ -840,7 +861,12 @@ struct SharedTextureNv12Converter
 
     void reset()
     {
+        output_view_cache.clear();
+        source_copy_input_view.Reset();
         source_copy_texture.Reset();
+        cached_keyed_mutex.Reset();
+        cached_source_texture.Reset();
+        cached_shared_handle = nullptr;
         video_processor.Reset();
         video_processor_enum.Reset();
         video_context.Reset();
@@ -1303,6 +1329,178 @@ struct LibavMp4Muxer
         return result;
     }
 };
+
+struct AsyncLibavMp4Muxer
+{
+    struct WorkItem
+    {
+        enum class Kind
+        {
+            Video,
+            Audio,
+        };
+
+        Kind kind = Kind::Video;
+        std::vector<uint8_t> data;
+        bool key_frame = false;
+        int64_t timestamp_hns = 0;
+        int64_t duration_hns = 0;
+    };
+
+    LibavMp4Muxer muxer;
+    std::thread worker;
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    std::deque<WorkItem> queue;
+    std::atomic<HRESULT> worker_result{S_OK};
+    bool accepting = false;
+    bool stopping = false;
+
+    ~AsyncLibavMp4Muxer()
+    {
+        close();
+    }
+
+    HRESULT open(
+        const std::wstring& path,
+        const pr_video_config& video_config,
+        const pr_audio_config& audio_config,
+        const std::vector<uint8_t>& video_extradata)
+    {
+        HRESULT hr = muxer.open(path, video_config, audio_config, video_extradata);
+        if (FAILED(hr))
+            return hr;
+
+        worker_result.store(S_OK);
+        accepting = true;
+        stopping = false;
+        worker = std::thread([this] { worker_loop(); });
+        return S_OK;
+    }
+
+    HRESULT enqueue_video_packet(const std::vector<uint8_t>& data, bool key_frame, int64_t timestamp_hns, int64_t duration_hns)
+    {
+        if (data.empty())
+            return S_OK;
+
+        HRESULT result = worker_result.load();
+        if (FAILED(result))
+            return result;
+
+        WorkItem item{};
+        item.kind = WorkItem::Kind::Video;
+        item.data = data;
+        item.key_frame = key_frame;
+        item.timestamp_hns = timestamp_hns;
+        item.duration_hns = duration_hns;
+
+        std::unique_lock lock(queue_mutex);
+        if (!accepting)
+            return E_ABORT;
+        if (queue.size() >= kMaxMuxQueueItems)
+        {
+            set_last_error("NativeRecorder mux queue is full; dropping one encoded video packet.");
+            return S_OK;
+        }
+
+        queue.push_back(std::move(item));
+        lock.unlock();
+        queue_cv.notify_one();
+        return S_OK;
+    }
+
+    HRESULT enqueue_audio(const void* data, int32_t byte_count, int64_t timestamp_hns)
+    {
+        if (data == nullptr || byte_count <= 0)
+            return S_OK;
+
+        HRESULT result = worker_result.load();
+        if (FAILED(result))
+            return result;
+
+        WorkItem item{};
+        item.kind = WorkItem::Kind::Audio;
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        item.data.assign(bytes, bytes + byte_count);
+        item.timestamp_hns = timestamp_hns;
+
+        std::unique_lock lock(queue_mutex);
+        if (!accepting)
+            return S_OK;
+        if (queue.size() >= kMaxMuxQueueItems)
+        {
+            set_last_error("NativeRecorder mux queue is full; dropping one audio packet.");
+            return S_OK;
+        }
+
+        queue.push_back(std::move(item));
+        lock.unlock();
+        queue_cv.notify_one();
+        return S_OK;
+    }
+
+    HRESULT close()
+    {
+        {
+            std::lock_guard lock(queue_mutex);
+            accepting = false;
+            stopping = true;
+        }
+        queue_cv.notify_one();
+
+        if (worker.joinable())
+            worker.join();
+
+        HRESULT result = worker_result.load();
+        HRESULT close_hr = muxer.close();
+        if (FAILED(close_hr) && SUCCEEDED(result))
+            result = close_hr;
+
+        return result;
+    }
+
+    void worker_loop()
+    {
+        for (;;)
+        {
+            WorkItem item;
+            {
+                std::unique_lock lock(queue_mutex);
+                queue_cv.wait(lock, [this] { return stopping || !queue.empty(); });
+                if (queue.empty())
+                {
+                    if (stopping)
+                        return;
+                    continue;
+                }
+
+                item = std::move(queue.front());
+                queue.pop_front();
+            }
+
+            HRESULT hr = S_OK;
+            if (item.kind == WorkItem::Kind::Video)
+            {
+                hr = muxer.write_video_packet(item.data, item.key_frame, item.timestamp_hns, item.duration_hns);
+            }
+            else
+            {
+                hr = muxer.write_audio(item.data.data(), static_cast<int32_t>(item.data.size()), item.timestamp_hns);
+            }
+
+            if (FAILED(hr))
+            {
+                worker_result.store(hr);
+                std::lock_guard lock(queue_mutex);
+                accepting = false;
+                stopping = true;
+                queue.clear();
+                queue_cv.notify_one();
+                return;
+            }
+        }
+    }
+};
 }
 
 struct NvencLibavRecorderBackend final : NativeRecorderBackend
@@ -1312,7 +1510,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
     std::wstring output_path;
     SharedTextureNv12Converter converter;
     std::unique_ptr<NvEncoderD3D11> encoder;
-    LibavMp4Muxer muxer;
+    AsyncLibavMp4Muxer muxer;
     bool initialized = false;
     bool stopped = false;
     uint64_t submitted_frames = 0;
@@ -1379,7 +1577,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                 &initialize_params,
                 nvenc_codec_guid(video.codec),
                 nvenc_preset_guid(),
-                NV_ENC_TUNING_INFO_LOW_LATENCY);
+                NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY);
 
             initialize_params.frameRateNum = static_cast<uint32_t>(std::max(1, video.fps));
             initialize_params.frameRateDen = 1;
@@ -1389,7 +1587,8 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
             initialize_params.darHeight = static_cast<uint32_t>(encoded_height);
             initialize_params.enablePTD = 1;
 #if defined(_WIN32)
-            initialize_params.enableEncodeAsync = 0;
+            initialize_params.enableEncodeAsync =
+                encoder->GetCapabilityValue(nvenc_codec_guid(video.codec), NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT) ? 1 : 0;
 #endif
 
             auto* cfg = initialize_params.encodeConfig;
@@ -1398,8 +1597,10 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
             cfg->rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
             cfg->rcParams.averageBitRate = static_cast<uint32_t>(video.bitrate_bps > 0 ? video.bitrate_bps : 12'000'000);
             cfg->rcParams.maxBitRate = cfg->rcParams.averageBitRate;
-            cfg->rcParams.vbvBufferSize = std::max<uint32_t>(cfg->rcParams.averageBitRate / std::max(1, video.fps), cfg->rcParams.averageBitRate / 4);
+            cfg->rcParams.vbvBufferSize = std::max<uint32_t>(1, cfg->rcParams.averageBitRate / std::max(1, video.fps));
             cfg->rcParams.vbvInitialDelay = cfg->rcParams.vbvBufferSize;
+            cfg->rcParams.zeroReorderDelay = 1;
+            cfg->rcParams.lowDelayKeyFrameScale = 1;
             cfg->rcParams.enableLookahead = 0;
             cfg->rcParams.lookaheadDepth = 0;
 
@@ -1408,12 +1609,16 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                 cfg->encodeCodecConfig.h264Config.idrPeriod = cfg->gopLength;
                 cfg->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
                 cfg->encodeCodecConfig.h264Config.outputAUD = 0;
+                cfg->encodeCodecConfig.h264Config.maxNumRefFrames = 1;
+                cfg->encodeCodecConfig.h264Config.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
             }
             else
             {
                 cfg->encodeCodecConfig.hevcConfig.idrPeriod = cfg->gopLength;
                 cfg->encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
                 cfg->encodeCodecConfig.hevcConfig.outputAUD = 0;
+                cfg->encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = 1;
+                cfg->encodeCodecConfig.hevcConfig.numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
             }
 
             encoder->CreateEncoder(&initialize_params);
@@ -1457,11 +1662,6 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
         if (FAILED(hr))
             return hr;
 
-        ComPtr<ID3D11Texture2D> nv12_texture;
-        hr = converter.convert_shared_texture(shared_handle, source_format, nv12_texture);
-        if (FAILED(hr))
-            return hr;
-
         try
         {
             const NvEncInputFrame* input_frame = encoder->GetNextInputFrame();
@@ -1469,8 +1669,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
             if (input_texture == nullptr)
                 return E_POINTER;
 
-            converter.device_context->CopyResource(input_texture, nv12_texture.Get());
-            hr = wait_for_d3d11_gpu(converter.device_context.Get(), "CopyResource(NVENC input)");
+            hr = converter.convert_shared_texture_to(shared_handle, source_format, input_texture);
             if (FAILED(hr))
                 return hr;
 
@@ -1488,7 +1687,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                     continue;
 
                 int64_t packet_timestamp = take_output_timestamp(static_cast<int64_t>(packet.timeStamp));
-                hr = muxer.write_video_packet(
+                hr = muxer.enqueue_video_packet(
                     packet.frame,
                     nvenc_output_is_key_frame(packet.pictureType),
                     packet_timestamp,
@@ -1532,7 +1731,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
         if (!initialized)
             return S_OK;
 
-        HRESULT hr = muxer.write_audio(data, byte_count, timestamp_hns);
+        HRESULT hr = muxer.enqueue_audio(data, byte_count, timestamp_hns);
         if (FAILED(hr))
             return hr;
 
@@ -1559,7 +1758,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
                         continue;
 
                     int64_t packet_timestamp = take_output_timestamp(static_cast<int64_t>(packet.timeStamp));
-                    HRESULT hr = muxer.write_video_packet(
+                    HRESULT hr = muxer.enqueue_video_packet(
                         packet.frame,
                         nvenc_output_is_key_frame(packet.pictureType),
                         packet_timestamp,
@@ -1604,7 +1803,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
     SharedTextureNv12Converter converter;
     amf::AMFContextPtr context;
     amf::AMFComponentPtr encoder;
-    LibavMp4Muxer muxer;
+    AsyncLibavMp4Muxer muxer;
     bool initialized = false;
     bool stopped = false;
     bool factory_initialized = false;
@@ -1613,6 +1812,14 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
     uint64_t audio_packets = 0;
     int64_t video_sample_duration_hns = 0;
     std::deque<int64_t> pending_video_timestamps_hns;
+    struct AmfInputSlot
+    {
+        ComPtr<ID3D11Texture2D> texture;
+        bool in_use = false;
+    };
+    std::vector<AmfInputSlot> nv12_pool;
+    std::deque<size_t> pending_video_slots;
+    size_t next_nv12_slot = 0;
 
     AmfLibavRecorderBackend(const pr_video_config& video_config, const pr_audio_config& audio_config, std::wstring output)
         : video(video_config), audio(audio_config), output_path(std::move(output))
@@ -1801,6 +2008,57 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         return S_OK;
     }
 
+    HRESULT ensure_nv12_pool()
+    {
+        if (!nv12_pool.empty())
+            return S_OK;
+
+        nv12_pool.reserve(kAmfNv12PoolSize);
+        for (size_t i = 0; i < kAmfNv12PoolSize; ++i)
+        {
+            AmfInputSlot slot{};
+            HRESULT hr = converter.create_nv12_texture(slot.texture);
+            if (FAILED(hr))
+                return hr;
+            nv12_pool.push_back(std::move(slot));
+        }
+
+        next_nv12_slot = 0;
+        return S_OK;
+    }
+
+    HRESULT acquire_nv12_slot(size_t& slot_index, ID3D11Texture2D** texture)
+    {
+        if (texture == nullptr)
+            return E_POINTER;
+
+        HRESULT hr = ensure_nv12_pool();
+        if (FAILED(hr))
+            return hr;
+
+        for (size_t offset = 0; offset < nv12_pool.size(); ++offset)
+        {
+            size_t index = (next_nv12_slot + offset) % nv12_pool.size();
+            if (nv12_pool[index].in_use)
+                continue;
+
+            nv12_pool[index].in_use = true;
+            next_nv12_slot = (index + 1) % nv12_pool.size();
+            slot_index = index;
+            *texture = nv12_pool[index].texture.Get();
+            return S_OK;
+        }
+
+        set_last_error("NativeRecorder AMF NV12 texture pool is full; dropping one frame.");
+        return DXGI_ERROR_WAS_STILL_DRAWING;
+    }
+
+    void release_nv12_slot(size_t slot_index)
+    {
+        if (slot_index < nv12_pool.size())
+            nv12_pool[slot_index].in_use = false;
+    }
+
     HRESULT submit_shared_texture(ID3D11Device* source_device, HANDLE shared_handle, DXGI_FORMAT source_format, int64_t timestamp_hns) override
     {
         if (stopped)
@@ -1812,15 +2070,33 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         if (FAILED(hr))
             return hr;
 
-        ComPtr<ID3D11Texture2D> nv12_texture;
-        hr = converter.convert_shared_texture(shared_handle, source_format, nv12_texture);
+        size_t slot_index = 0;
+        ID3D11Texture2D* nv12_texture = nullptr;
+        hr = acquire_nv12_slot(slot_index, &nv12_texture);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+        {
+            HRESULT drain_hr = drain_output(false);
+            if (FAILED(drain_hr))
+                return drain_hr;
+            hr = acquire_nv12_slot(slot_index, &nv12_texture);
+        }
         if (FAILED(hr))
             return hr;
 
+        hr = converter.convert_shared_texture_to(shared_handle, source_format, nv12_texture);
+        if (FAILED(hr))
+        {
+            release_nv12_slot(slot_index);
+            return hr;
+        }
+
         amf::AMFSurfacePtr surface;
-        AMF_RESULT result = context->CreateSurfaceFromDX11Native(nv12_texture.Get(), &surface, nullptr);
+        AMF_RESULT result = context->CreateSurfaceFromDX11Native(nv12_texture, &surface, nullptr);
         if (!amf_result_success(result))
+        {
+            release_nv12_slot(slot_index);
             return fail_amf("AMF CreateSurfaceFromDX11Native", result);
+        }
 
         surface->SetPts(static_cast<amf_pts>(std::max<int64_t>(0, timestamp_hns)));
         surface->SetDuration(static_cast<amf_pts>(video_sample_duration_hns));
@@ -1845,18 +2121,26 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         {
             hr = drain_output(false);
             if (FAILED(hr))
+            {
+                release_nv12_slot(slot_index);
                 return hr;
+            }
             result = encoder->SubmitInput(surface);
         }
         if (result == AMF_INPUT_FULL)
         {
+            release_nv12_slot(slot_index);
             set_last_error("NativeRecorder AMF input queue is full; dropping one frame.");
             return DXGI_ERROR_WAS_STILL_DRAWING;
         }
         if (result != AMF_OK && result != AMF_NEED_MORE_INPUT)
+        {
+            release_nv12_slot(slot_index);
             return fail_amf("AMF SubmitInput", result);
+        }
 
         pending_video_timestamps_hns.push_back(std::max<int64_t>(0, timestamp_hns));
+        pending_video_slots.push_back(slot_index);
         ++submitted_frames;
         return drain_output(false);
     }
@@ -1914,7 +2198,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
 
             int64_t timestamp = take_output_timestamp(static_cast<int64_t>(data->GetPts()));
 
-            HRESULT hr = muxer.write_video_packet(packet, key_frame, timestamp, video_sample_duration_hns);
+            HRESULT hr = muxer.enqueue_video_packet(packet, key_frame, timestamp, video_sample_duration_hns);
             if (FAILED(hr))
                 return hr;
             ++written_packets;
@@ -1927,6 +2211,12 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         {
             int64_t timestamp = pending_video_timestamps_hns.front();
             pending_video_timestamps_hns.pop_front();
+            if (!pending_video_slots.empty())
+            {
+                size_t slot_index = pending_video_slots.front();
+                pending_video_slots.pop_front();
+                release_nv12_slot(slot_index);
+            }
             return timestamp;
         }
 
@@ -1943,7 +2233,7 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
         if (!initialized)
             return S_OK;
 
-        HRESULT hr = muxer.write_audio(data, byte_count, timestamp_hns);
+        HRESULT hr = muxer.enqueue_audio(data, byte_count, timestamp_hns);
         if (FAILED(hr))
             return hr;
 
@@ -1976,6 +2266,10 @@ struct AmfLibavRecorderBackend final : NativeRecorderBackend
             result = mux_hr;
 
         context.Release();
+        pending_video_timestamps_hns.clear();
+        pending_video_slots.clear();
+        nv12_pool.clear();
+        next_nv12_slot = 0;
         converter.reset();
 
         if (SUCCEEDED(result))
