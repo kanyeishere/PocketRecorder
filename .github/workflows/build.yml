@@ -31,9 +31,6 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Prepare NativeRecorder dependencies
-        env:
-          VIDEO_CODEC_SDK_URL: ${{ secrets.VIDEO_CODEC_SDK_URL || vars.VIDEO_CODEC_SDK_URL }}
-          FFMPEG_URL: ${{ vars.FFMPEG_URL }}
         run: .\scripts\Prepare-NativeRecorderDeps.ps1
 
       - name: Build NativeRecorder

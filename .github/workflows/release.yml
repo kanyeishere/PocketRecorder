@@ -43,32 +43,15 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=v$version" >> $env:GITHUB_OUTPUT
 
-      - name: Update version in manifest
+      - name: Patch manifest version for package
         run: |
-          # We are in detached HEAD (tag checkout), switch to the default branch
-          $branch = git symbolic-ref refs/remotes/origin/HEAD 2>$null
-          if (-not $branch) {
-            $branch = git branch -r | Where-Object {$_ -notmatch 'origin/HEAD|->'} | Select-Object -First 1
-          }
-          $branch = ($branch -replace '^refs/remotes/origin/', '' -replace '^origin/', '').Trim()
-          Write-Host "Switching to branch: $branch"
-          git checkout $branch
-          git pull origin $branch
-
           $version = "${{ steps.version.outputs.version }}"
-          Write-Host "Updating PocketRecorder.json to version $version"
+          Write-Host "Patching PocketRecorder.json to version $version for this release package"
 
           $manifest = Get-Content -Raw "PocketRecorder.json" | ConvertFrom-Json
           $manifest.AssemblyVersion = $version
           $manifest | ConvertTo-Json -Depth 10 | Set-Content "PocketRecorder.json"
           Write-Host "Updated PocketRecorder.json"
-
-          # Commit and push the version bump
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add PocketRecorder.json
-          git commit -m "Bump version to $version [skip ci]"
-          git push origin $branch
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
@@ -79,9 +62,6 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Prepare NativeRecorder dependencies
-        env:
-          VIDEO_CODEC_SDK_URL: ${{ secrets.VIDEO_CODEC_SDK_URL || vars.VIDEO_CODEC_SDK_URL }}
-          FFMPEG_URL: ${{ vars.FFMPEG_URL }}
         run: .\scripts\Prepare-NativeRecorderDeps.ps1
 
       - name: Build NativeRecorder
