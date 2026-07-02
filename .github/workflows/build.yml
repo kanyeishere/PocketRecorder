@@ -56,7 +56,7 @@ jobs:
         run: |
           $outputDir = "bin\x64\Release"
           $requiredFiles = @(
-            "NativeRecorder.abi9.dll",
+            "NativeRecorder.abi12.dll",
             "avformat-*.dll",
             "avcodec-*.dll",
             "avutil-*.dll",
