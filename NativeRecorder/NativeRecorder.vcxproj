@@ -41,6 +41,7 @@
   <PropertyGroup>
     <OutDir>$(ProjectDir)bin\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(ProjectDir)obj\$(Platform)\$(Configuration)\</IntDir>
+    <FfmpegRoot Condition="'$(FfmpegRoot)' == ''">$(ProjectDir)build\deps\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</FfmpegRoot>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
@@ -49,12 +50,13 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(VideoCodecSdkDir)\Interface;$(VideoCodecSdkDir)\Samples\NvCodec;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(VideoCodecSdkDir)\Interface;$(VideoCodecSdkDir)\Samples\NvCodec;$(VideoCodecSdkDir)\Samples\Utils;$(FfmpegRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>mfplat.lib;mfreadwrite.lib;mfuuid.lib;d3d11.lib;dxgi.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(VideoCodecSdkDir)\Lib\win\x64;$(FfmpegRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>mfplat.lib;mfreadwrite.lib;mfuuid.lib;d3d11.lib;dxgi.lib;ole32.lib;nvencodeapi.lib;avformat.lib;avcodec.lib;avutil.lib;swresample.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -76,6 +78,8 @@
 
   <ItemGroup>
     <ClCompile Include="src\native_recorder.cpp" />
+    <ClCompile Include="$(VideoCodecSdkDir)\Samples\NvCodec\NvEncoder\NvEncoder.cpp" />
+    <ClCompile Include="$(VideoCodecSdkDir)\Samples\NvCodec\NvEncoder\NvEncoderD3D11.cpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

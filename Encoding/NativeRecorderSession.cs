@@ -50,6 +50,9 @@ internal sealed class NativeRecorderSession : IDisposable
         NativeRecorderBackend.Stop(handle);
     }
 
+    public string GetLastStatus()
+        => NativeRecorderBackend.GetLastStatus();
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)

@@ -9,9 +9,9 @@ namespace Recorder.Encoding;
 
 internal static unsafe class NativeRecorderBackend
 {
-    private const int ExpectedAbiVersion = 6;
+    private const int ExpectedAbiVersion = 8;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
-    private static readonly string[] NativeDllFileNames = ["NativeRecorder.abi6.dll", "NativeRecorder.abi5.dll", "NativeRecorder.abi4.dll", "NativeRecorder.abi3.dll", "NativeRecorder.abi2.dll", "NativeRecorder.dll"];
+    private static readonly string[] NativeDllFileNames = ["NativeRecorder.abi8.dll", "NativeRecorder.abi7.dll", "NativeRecorder.abi6.dll", "NativeRecorder.abi5.dll", "NativeRecorder.abi4.dll", "NativeRecorder.abi3.dll", "NativeRecorder.abi2.dll", "NativeRecorder.dll"];
     private static readonly object Sync = new();
     private static readonly NativeRecorderDllResolver DllResolver = new(NativeDllFileNames);
     private static bool _loaded;
@@ -213,7 +213,7 @@ internal static unsafe class NativeRecorderBackend
 
             _loaded = true;
             _loadError = null;
-            Plugin.Log?.Info($"[NativeRecorder] Loaded native DLL: {candidate}");
+            Plugin.Log?.Info($"[NativeRecorder] Loaded native DLL: {candidate} (ABI {ExpectedAbiVersion}, NvEncoderD3D11/libavformat preferred)");
             return true;
         }
 
@@ -266,14 +266,14 @@ internal static unsafe class NativeRecorderBackend
         if (hr == 0)
             return;
 
-        string detail = GetLastError();
+        string detail = GetLastStatus();
         if (!string.IsNullOrWhiteSpace(detail))
             throw new InvalidOperationException($"{prefix}: 0x{hr:X8}. {detail}");
 
         throw new InvalidOperationException($"{prefix}: 0x{hr:X8}.");
     }
 
-    private static string GetLastError()
+    public static string GetLastStatus()
     {
         if (_getLastError == null)
             return string.Empty;

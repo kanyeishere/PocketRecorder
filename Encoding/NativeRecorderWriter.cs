@@ -187,7 +187,10 @@ internal sealed class NativeRecorderWriter : IOutputSink
 
                 int submitted = Interlocked.Increment(ref _submittedFrameCount);
                 if (submitted == 1)
+                {
+                    LogNativeStatus("Native backend status");
                     _firstVideoFrameSubmitted.Set();
+                }
 
                 if (submitted % 300 == 0)
                     Plugin.Log!.Info($"[NativeRecorder] Submitted {submitted} texture frames (input={_inputFrameCount}, dropped={_droppedFrameCount}), audioPackets={_audioPackets}");
@@ -262,7 +265,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             Plugin.Log!.Warning("[NativeRecorder] Audio writer did not finish in 5s.");
 
         _session?.Stop();
-        Plugin.Log!.Info("[NativeRecorder] Native writer finalized.");
+        LogNativeStatus("Native writer finalized");
     }
 
     public void Dispose()
@@ -306,6 +309,15 @@ internal sealed class NativeRecorderWriter : IOutputSink
         long pressureTicks = Stopwatch.GetTimestamp() +
             (Stopwatch.Frequency * PressureWindowMs / 1_000);
         Volatile.Write(ref _submitPressureUntilTicks, pressureTicks);
+    }
+
+    private void LogNativeStatus(string prefix)
+    {
+        string status = _session?.GetLastStatus() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(status))
+            Plugin.Log!.Info($"[NativeRecorder] {prefix}.");
+        else
+            Plugin.Log!.Info($"[NativeRecorder] {prefix}: {status}");
     }
 
     private static int ResolveNativeCodec(string codec)

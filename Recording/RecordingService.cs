@@ -339,7 +339,7 @@ internal sealed class RecordingService : IDisposable
                         _recordStart = DateTime.Now;
                     }
 
-                    Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, native=D3D11Texture/MediaFoundation-{GetNativeRecorderCodecLabel(options.VideoCodec)}, asyncStart={startSw.ElapsedMilliseconds}ms");
+                    Plugin.Log!.Info($"[Record] Recording started: {firstFrame.Width}x{firstFrame.Height}@{options.TargetFps}fps, audio={audioFormat != null}, native=D3D11Texture/{GetNativeRecorderCodecLabel(options.VideoCodec)}, asyncStart={startSw.ElapsedMilliseconds}ms");
                     return;
                 }
                 catch (Exception ex)
