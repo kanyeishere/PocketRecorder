@@ -1,4 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <Import Project="lib\native\NativeRecorderDeps.props" Condition="Exists('lib\native\NativeRecorderDeps.props')" />
 
   <PropertyGroup>
     <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
@@ -18,7 +19,7 @@
     <DalamudLibPath>$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
     <DalamudLibPath Condition="Exists('$(APPDATA)\XIVLauncherCN\addon\Hooks\dev\')">$(APPDATA)\XIVLauncherCN\addon\Hooks\dev\</DalamudLibPath>
     <DalamudLibPath Condition="'$(DALAMUD_HOME)' != ''">$(DALAMUD_HOME)\</DalamudLibPath>
-    <NativeRecorderFfmpegRoot Condition="'$(NativeRecorderFfmpegRoot)' == ''">NativeRecorder\build\deps\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</NativeRecorderFfmpegRoot>
+    <NativeRecorderFfmpegRoot Condition="'$(NativeRecorderFfmpegRoot)' == ''">lib\native\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</NativeRecorderFfmpegRoot>
     <RestoreAdditionalProjectSources>
       https://纯本地引用;
     </RestoreAdditionalProjectSources>
@@ -32,7 +33,7 @@
     <EmbeddedResource Include="PocketRecorder.json" />
     <Content Include="PocketRecorder.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
-    <Content Include="NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll" Condition="Exists('NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll')" Link="NativeRecorder.abi8.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll" Condition="Exists('NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll')" Link="NativeRecorder.abi9.dll" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avformat-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avcodec-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avutil-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />

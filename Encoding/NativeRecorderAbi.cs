@@ -30,7 +30,7 @@ internal unsafe delegate int PrGetLastError(byte* buffer, int bufferSize);
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
 internal unsafe struct NativeProbeInfo
 {
-    public int IsNvidiaAdapter;
+    public int IsSupportedAdapter;
     public int SupportsD3D11TextureInput;
     public fixed byte AdapterName[128];
     public fixed byte Message[256];

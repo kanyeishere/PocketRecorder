@@ -9,9 +9,9 @@ namespace Recorder.Encoding;
 
 internal static unsafe class NativeRecorderBackend
 {
-    private const int ExpectedAbiVersion = 8;
+    private const int ExpectedAbiVersion = 9;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
-    private static readonly string[] NativeDllFileNames = ["NativeRecorder.abi8.dll", "NativeRecorder.abi7.dll", "NativeRecorder.abi6.dll", "NativeRecorder.abi5.dll", "NativeRecorder.abi4.dll", "NativeRecorder.abi3.dll", "NativeRecorder.abi2.dll", "NativeRecorder.dll"];
+    private static readonly string[] NativeDllFileNames = ["NativeRecorder.abi9.dll", "NativeRecorder.abi8.dll", "NativeRecorder.abi7.dll", "NativeRecorder.abi6.dll", "NativeRecorder.abi5.dll", "NativeRecorder.abi4.dll", "NativeRecorder.abi3.dll", "NativeRecorder.abi2.dll", "NativeRecorder.dll"];
     private static readonly object Sync = new();
     private static readonly NativeRecorderDllResolver DllResolver = new(NativeDllFileNames);
     private static bool _loaded;
@@ -54,7 +54,7 @@ internal static unsafe class NativeRecorderBackend
                 if (hr != 0)
                     return NativeRecorderProbeResult.Unavailable($"NativeRecorder probe failed: 0x{hr:X8}.");
 
-                if (info.IsNvidiaAdapter == 0 || info.SupportsD3D11TextureInput == 0)
+                if (info.IsSupportedAdapter == 0 || info.SupportsD3D11TextureInput == 0)
                     return NativeRecorderProbeResult.Unavailable(NativeString(info.Message, 256));
 
                 return NativeRecorderProbeResult.Available(NativeString(info.AdapterName, 128));
@@ -213,7 +213,7 @@ internal static unsafe class NativeRecorderBackend
 
             _loaded = true;
             _loadError = null;
-            Plugin.Log?.Info($"[NativeRecorder] Loaded native DLL: {candidate} (ABI {ExpectedAbiVersion}, NvEncoderD3D11/libavformat preferred)");
+            Plugin.Log?.Info($"[NativeRecorder] Loaded native DLL: {candidate} (ABI {ExpectedAbiVersion}, NvEncoderD3D11/libavformat preferred, AMF/libavformat AMD path available)");
             return true;
         }
 

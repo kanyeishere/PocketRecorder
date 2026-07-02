@@ -42,7 +42,7 @@ internal sealed unsafe partial class VideoCaptureService
 
         try
         {
-            if (!EnsureNv12Resources(width, height, outputWidth, outputHeight, format))
+            if (!EnsureNv12Resources(ctx, width, height, outputWidth, outputHeight, format))
             {
                 return _lockedOutputPixelFormat == VideoPixelFormat.Nv12 &&
                        SkipLockedNv12Frame("NV12 resources could not be created");
@@ -209,7 +209,7 @@ internal sealed unsafe partial class VideoCaptureService
     }
 
 
-    private bool EnsureNv12Resources(uint sourceWidth, uint sourceHeight, uint outputWidth, uint outputHeight, DXGI_FORMAT format)
+    private bool EnsureNv12Resources(ID3D11DeviceContext* ctx, uint sourceWidth, uint sourceHeight, uint outputWidth, uint outputHeight, DXGI_FORMAT format)
     {
         int dataSize = checked((int)(outputWidth * outputHeight * 3 / 2));
         if (_nv12OutputBuffer != null &&
@@ -222,7 +222,14 @@ internal sealed unsafe partial class VideoCaptureService
             _nv12DataSize == dataSize)
             return true;
 
-        ReleaseNv12Resources();
+        DrainNv12ReleasedSlots(ctx);
+        if (HasOutstandingNv12Readbacks())
+        {
+            DisableNv12Path("NV12 resources changed while readback slots are still mapped.");
+            return false;
+        }
+
+        ReleaseNv12Resources(ctx);
 
         if (!EnsureNv12Shader())
             return false;
@@ -342,7 +349,6 @@ internal sealed unsafe partial class VideoCaptureService
         _nv12DataSize = dataSize;
         _nv12WriteIndex = 0;
         _nv12ReadyCount = 0;
-        EnsureNv12DrainContext();
         return true;
     }
 
@@ -581,12 +587,14 @@ internal sealed unsafe partial class VideoCaptureService
     }
 
 
-    private void ReleaseNv12Resources()
+    private void ReleaseNv12Resources(ID3D11DeviceContext* drainContext = null)
     {
-        if (_nv12DrainContext != null)
-        {
-            DrainNv12ReleasedSlots(_nv12DrainContext);
-        }
+        if (drainContext != null)
+            DrainNv12ReleasedSlots(drainContext);
+
+        int pendingMappedSlots = CountOutstandingNv12Readbacks();
+        if (pendingMappedSlots > 0)
+            Plugin.Log!.Warning($"[Video] Releasing NV12 resources with {pendingMappedSlots} mapped readback slot(s); skipping cross-thread Unmap.");
 
         if (_nv12SourceSrv != null)
         {
@@ -637,12 +645,6 @@ internal sealed unsafe partial class VideoCaptureService
         _nv12DataSize = 0;
         _nv12WriteIndex = 0;
         _nv12ReadyCount = 0;
-
-        if (_nv12DrainContext != null)
-        {
-            _nv12DrainContext->Release();
-            _nv12DrainContext = null;
-        }
     }
 
     private void ReleaseNv12Shader()
@@ -656,34 +658,67 @@ internal sealed unsafe partial class VideoCaptureService
         _nv12ShaderDevice = IntPtr.Zero;
     }
 
-    private bool EnsureNv12DrainContext()
-    {
-        if (_nv12DrainContext != null)
-            return true;
-
-        if (_device == null)
-            return false;
-
-        ID3D11DeviceContext* drainContext = null;
-        _device->GetImmediateContext(&drainContext);
-        if (drainContext == null)
-        {
-            Plugin.Log!.Warning("[Video] Failed to acquire NV12 drain context.");
-            return false;
-        }
-
-        _nv12DrainContext = drainContext;
-        return true;
-    }
-
     private void DrainDeferredNv12Resources(ID3D11DeviceContext* ctx)
     {
-        if (!_nv12Disabled || _nv12DrainContext == null)
+        if (!_nv12Disabled)
             return;
 
         DrainNv12ReleasedSlots(ctx);
         if (!HasOutstandingNv12Readbacks())
             ReleaseNv12Resources();
+    }
+
+    private void RequestNv12StopCleanup()
+    {
+        if (HasOutstandingNv12Readbacks())
+            Volatile.Write(ref _nv12StopCleanupRequested, 1);
+    }
+
+    private void WaitForNv12StopCleanup()
+    {
+        if (Volatile.Read(ref _nv12StopCleanupRequested) == 0)
+            return;
+
+        Stopwatch waitSw = Stopwatch.StartNew();
+        while (Volatile.Read(ref _nv12StopCleanupRequested) != 0 && waitSw.ElapsedMilliseconds < 250)
+            Thread.Sleep(1);
+
+        if (Volatile.Read(ref _nv12StopCleanupRequested) != 0)
+            Plugin.Log!.Warning($"[Video] NV12 stop cleanup did not run on the render thread within {waitSw.ElapsedMilliseconds}ms; pending mapped slots will not be unmapped from the finalize thread.");
+    }
+
+    private void TryDrainNv12StopCleanup(IntPtr swapChainPtr)
+    {
+        if (Volatile.Read(ref _nv12StopCleanupRequested) == 0)
+            return;
+
+        var swapChain = (IDXGISwapChain*)swapChainPtr;
+        Guid iidDev = IID_ID3D11Device;
+        ID3D11Device* device = null;
+        int hrDev = swapChain->GetDevice(&iidDev, (void**)&device);
+        if (hrDev < 0 || device == null)
+            return;
+
+        ID3D11DeviceContext* ctx = null;
+        device->GetImmediateContext(&ctx);
+        try
+        {
+            if (ctx == null)
+                return;
+
+            DrainNv12ReleasedSlots(ctx);
+            if (!HasOutstandingNv12Readbacks())
+            {
+                ReleaseNv12Resources(ctx);
+                Volatile.Write(ref _nv12StopCleanupRequested, 0);
+            }
+        }
+        finally
+        {
+            if (ctx != null)
+                ctx->Release();
+            device->Release();
+        }
     }
 
     private bool HasOutstandingNv12Readbacks()
@@ -696,6 +731,19 @@ internal sealed unsafe partial class VideoCaptureService
         }
 
         return false;
+    }
+
+    private int CountOutstandingNv12Readbacks()
+    {
+        int count = 0;
+        for (int i = 0; i < _nv12ReadbackSlotStates.Length; i++)
+        {
+            int state = Volatile.Read(ref _nv12ReadbackSlotStates[i]);
+            if (state == Nv12SlotMapped || state == Nv12SlotPendingRelease)
+                count++;
+        }
+
+        return count;
     }
 
 }

@@ -47,6 +47,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
     public bool SupportsAudio => _hasAudio;
     public bool IsVideoBackedUp => _videoQueue != null && _videoQueue.Count >= MaxVideoQueueSize / 2;
     public bool IsVideoUnderPressure => IsVideoBackedUp || IsSubmitPressureActive();
+    public event Action<IOutputSink, string>? FatalError;
 
     public void SetOutputPath(string path) => _outputPath = path;
 
@@ -204,9 +205,15 @@ internal sealed class NativeRecorderWriter : IOutputSink
                 }
 
                 if (_stopped)
+                {
                     Plugin.Log!.Info($"[NativeRecorder] Video writer stopped while submitting: {ex.Message}");
+                }
                 else
+                {
                     Plugin.Log!.Warning($"[NativeRecorder] Video submit failed: {ex.Message}");
+                    if (Volatile.Read(ref _submittedFrameCount) > 0)
+                        NotifyFatalError($"NativeRecorder video submit failed: {ex.Message}");
+                }
 
                 break;
             }
@@ -320,18 +327,29 @@ internal sealed class NativeRecorderWriter : IOutputSink
             Plugin.Log!.Info($"[NativeRecorder] {prefix}: {status}");
     }
 
+    private void NotifyFatalError(string message)
+    {
+        try { FatalError?.Invoke(this, message); }
+        catch (Exception ex)
+        {
+            Plugin.Log!.Warning($"[NativeRecorder] Fatal error callback failed: {ex.Message}");
+        }
+    }
+
     private static int ResolveNativeCodec(string codec)
     {
         if (string.IsNullOrWhiteSpace(codec) ||
             codec.Equals("auto", StringComparison.OrdinalIgnoreCase) ||
             codec.Equals("hevc", StringComparison.OrdinalIgnoreCase) ||
             codec.Equals("h265", StringComparison.OrdinalIgnoreCase) ||
+            codec.Equals("hevc_amf", StringComparison.OrdinalIgnoreCase) ||
             codec.Equals("hevc_nvenc", StringComparison.OrdinalIgnoreCase))
         {
             return NativeCodecHevc;
         }
 
         if (codec.Equals("h264", StringComparison.OrdinalIgnoreCase) ||
+            codec.Equals("h264_amf", StringComparison.OrdinalIgnoreCase) ||
             codec.Equals("h264_nvenc", StringComparison.OrdinalIgnoreCase))
         {
             return NativeCodecH264;

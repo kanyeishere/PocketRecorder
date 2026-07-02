@@ -34,9 +34,11 @@ internal static class RecordingBackendSelector
     {
         return string.Equals(codec, "auto", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(codec, "hevc_nvenc", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(codec, "hevc_amf", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(codec, "h265", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(codec, "h264_nvenc", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(codec, "h264_amf", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(codec, "h264", StringComparison.OrdinalIgnoreCase);
     }
 }

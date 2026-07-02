@@ -14,7 +14,7 @@
 #  define PR_CALL
 #endif
 
-#define PR_ABI_VERSION 8
+#define PR_ABI_VERSION 9
 
 typedef struct pr_recorder_t pr_recorder_t;
 
@@ -45,7 +45,7 @@ enum pr_pixel_format
 
 typedef struct pr_probe_info
 {
-    int32_t is_nvidia_adapter;
+    int32_t is_supported_adapter;
     int32_t supports_d3d11_texture_input;
     char adapter_name[128];
     char message[256];

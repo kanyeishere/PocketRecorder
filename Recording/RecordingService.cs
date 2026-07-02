@@ -312,6 +312,7 @@ internal sealed class RecordingService : IDisposable
                 {
                     var nativeWriter = new NativeRecorderWriter(options.VideoBitrate, options.VideoCodec);
                     writer = nativeWriter;
+                    writer.FatalError += OnWriterFatalError;
                     writer.SetOutputPath(options.OutputPath);
                     writer.Start(
                         new VideoFormat(firstFrame.Width, firstFrame.Height, options.TargetFps, VideoPixelFormat.D3D11Texture),
@@ -379,6 +380,7 @@ internal sealed class RecordingService : IDisposable
                 options.VideoBitrate,
                 encoder.Codec,
                 encoder.Preset);
+            writer.FatalError += OnWriterFatalError;
             writer.SetOutputPath(options.OutputPath);
 
             writer.Start(
@@ -442,6 +444,22 @@ internal sealed class RecordingService : IDisposable
                 try { writer.Dispose(); } catch { }
             }
         }
+    }
+
+    private void OnWriterFatalError(IOutputSink sender, string message)
+    {
+        bool shouldStop;
+        lock (_sync)
+        {
+            shouldStop = ReferenceEquals(_writer, sender) &&
+                         _lifecycle is RecordingLifecycle.Recording or RecordingLifecycle.StartingWriter;
+        }
+
+        if (!shouldStop)
+            return;
+
+        Plugin.Log!.Warning($"[Record] Writer failed; stopping recording automatically. {message}");
+        StopRecording();
     }
 
     private AudioFormat? WaitForAudioFormat(RecordingStartOptions options)
@@ -625,16 +643,7 @@ internal sealed class RecordingService : IDisposable
         void FinalizeRecording()
         {
             Stopwatch finalizeSw = Stopwatch.StartNew();
-            try
-            {
-                videoCapture?.Stop();
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.Warning($"[Record] Video capture stop failed: {ex.Message}");
-            }
-
-            Plugin.Log.Info($"[Record] Capture stopped after {stopSw.ElapsedMilliseconds}ms; finalizing writer.");
+            Plugin.Log.Info($"[Record] Capture input paused after {stopSw.ElapsedMilliseconds}ms; finalizing writer.");
 
             StopAndDisposeAudioCapture(audioCapture);
 
@@ -646,10 +655,21 @@ internal sealed class RecordingService : IDisposable
             {
                 Plugin.Log.Warning($"[Record] Writer stop failed: {ex.Message}");
             }
+
+            try
+            {
+                videoCapture?.Stop();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Warning($"[Record] Video capture stop failed: {ex.Message}");
+            }
             finally
             {
                 DisposeVideoCapture(videoCapture);
             }
+
+            Plugin.Log.Info($"[Record] Capture stopped after {stopSw.ElapsedMilliseconds}ms.");
 
             try { writer?.Dispose(); } catch { }
 

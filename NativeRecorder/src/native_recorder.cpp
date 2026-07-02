@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -10,19 +11,19 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <string>
 #include <vector>
 
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
-#include <mfapi.h>
-#include <mferror.h>
-#include <mfidl.h>
-#include <mfreadwrite.h>
 #include <wrl/client.h>
 
 #include "NvEncoder/NvEncoderD3D11.h"
+#include "common/AMFFactory.h"
+#include "include/components/VideoEncoderVCE.h"
+#include "include/components/VideoEncoderHEVC.h"
 
 extern "C"
 {
@@ -46,6 +47,7 @@ using Microsoft::WRL::ComPtr;
 namespace
 {
 constexpr UINT kNvidiaVendorId = 0x10DE;
+constexpr UINT kAmdVendorId = 0x1002;
 constexpr DWORD kInvalidStream = 0xFFFFFFFFu;
 constexpr UINT64 kGameWriteKey = 0;
 constexpr UINT64 kEncoderReadKey = 1;
@@ -53,8 +55,6 @@ constexpr DWORD kSharedTextureAcquireTimeoutMs = 5;
 
 std::mutex g_error_mutex;
 std::string g_last_error;
-std::mutex g_mf_mutex;
-int g_mf_ref_count = 0;
 
 void set_last_error(const std::string& message)
 {
@@ -264,31 +264,6 @@ HRESULT ensure_thread_com_initialized()
     return hr;
 }
 
-HRESULT retain_mf()
-{
-    std::lock_guard lock(g_mf_mutex);
-    if (g_mf_ref_count == 0)
-    {
-        HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-        if (FAILED(hr))
-            return hr;
-    }
-
-    ++g_mf_ref_count;
-    return S_OK;
-}
-
-void release_mf()
-{
-    std::lock_guard lock(g_mf_mutex);
-    if (g_mf_ref_count <= 0)
-        return;
-
-    --g_mf_ref_count;
-    if (g_mf_ref_count == 0)
-        MFShutdown();
-}
-
 bool nvenc_runtime_present()
 {
     HMODULE module = LoadLibraryW(L"nvEncodeAPI64.dll");
@@ -299,7 +274,17 @@ bool nvenc_runtime_present()
     return true;
 }
 
-HRESULT find_nvidia_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_out = nullptr)
+bool amf_runtime_present()
+{
+    HMODULE module = LoadLibraryW(AMF_DLL_NAME);
+    if (module == nullptr)
+        return false;
+
+    FreeLibrary(module);
+    return true;
+}
+
+HRESULT find_adapter_by_vendor(UINT vendor_id, std::string* adapter_name, IDXGIAdapter1** adapter_out = nullptr)
 {
     if (adapter_out != nullptr)
         *adapter_out = nullptr;
@@ -323,7 +308,7 @@ HRESULT find_nvidia_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_o
         if (FAILED(hr))
             return hr;
 
-        if (desc.VendorId == kNvidiaVendorId)
+        if (desc.VendorId == vendor_id)
         {
             if (adapter_name != nullptr)
                 *adapter_name = wide_to_utf8(desc.Description);
@@ -334,6 +319,16 @@ HRESULT find_nvidia_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_o
     }
 
     return DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT find_nvidia_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_out = nullptr)
+{
+    return find_adapter_by_vendor(kNvidiaVendorId, adapter_name, adapter_out);
+}
+
+HRESULT find_amd_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_out = nullptr)
+{
+    return find_adapter_by_vendor(kAmdVendorId, adapter_name, adapter_out);
 }
 
 HRESULT get_device_adapter_info(
@@ -417,6 +412,36 @@ bool nvenc_output_is_key_frame(NV_ENC_PIC_TYPE picture_type)
     return picture_type == NV_ENC_PIC_TYPE_IDR || picture_type == NV_ENC_PIC_TYPE_I;
 }
 
+const wchar_t* amf_codec_id(int32_t codec)
+{
+    return codec == PR_CODEC_HEVC ? AMFVideoEncoder_HEVC : AMFVideoEncoderVCE_AVC;
+}
+
+std::string amf_result_to_string(AMF_RESULT result)
+{
+    return "AMF_RESULT " + std::to_string(static_cast<int>(result));
+}
+
+HRESULT fail_amf(const char* operation, AMF_RESULT result, const std::string& details = {})
+{
+    std::string message = "NativeRecorder ";
+    message += operation != nullptr ? operation : "AMF operation";
+    message += " failed: ";
+    message += amf_result_to_string(result);
+    if (!details.empty())
+    {
+        message += "; ";
+        message += details;
+    }
+    set_last_error(message);
+    return E_FAIL;
+}
+
+bool amf_result_success(AMF_RESULT result)
+{
+    return result == AMF_OK;
+}
+
 const char* codec_name(int32_t codec)
 {
     switch (codec)
@@ -430,11 +455,6 @@ const char* codec_name(int32_t codec)
     default:
         return "unknown";
     }
-}
-
-const GUID& media_foundation_video_subtype(int32_t codec)
-{
-    return codec == PR_CODEC_HEVC ? MFVideoFormat_HEVC : MFVideoFormat_H264;
 }
 
 uint64_t make_sample_duration_hns(int fps)
@@ -467,62 +487,6 @@ int align_to_even(int value)
     return (safe_value + 1) & ~1;
 }
 
-HRESULT set_video_type_common(IMFMediaType* type, int width, int height, int fps)
-{
-    HRESULT hr = type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    if (FAILED(hr)) return hr;
-    hr = type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    if (FAILED(hr)) return hr;
-    hr = MFSetAttributeSize(type, MF_MT_FRAME_SIZE, static_cast<UINT32>(width), static_cast<UINT32>(height));
-    if (FAILED(hr)) return hr;
-    hr = MFSetAttributeRatio(type, MF_MT_FRAME_RATE, static_cast<UINT32>(std::max(1, fps)), 1);
-    if (FAILED(hr)) return hr;
-    return MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-}
-
-HRESULT set_input_audio_type_common(IMFMediaType* type, const pr_audio_config& audio)
-{
-    UINT32 bytes_per_sample = static_cast<UINT32>(std::max(1, audio.bits_per_sample / 8));
-    UINT32 channels = static_cast<UINT32>(std::max(1, audio.channels));
-    UINT32 sample_rate = static_cast<UINT32>(std::max(1, audio.sample_rate));
-    UINT32 block_align = bytes_per_sample * channels;
-
-    HRESULT hr = type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    if (FAILED(hr)) return hr;
-    hr = type->SetGUID(MF_MT_SUBTYPE, audio.is_float ? MFAudioFormat_Float : MFAudioFormat_PCM);
-    if (FAILED(hr)) return hr;
-    hr = type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
-    if (FAILED(hr)) return hr;
-    hr = type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate);
-    if (FAILED(hr)) return hr;
-    hr = type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, static_cast<UINT32>(audio.bits_per_sample));
-    if (FAILED(hr)) return hr;
-    hr = type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align);
-    if (FAILED(hr)) return hr;
-    return type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, sample_rate * block_align);
-}
-
-HRESULT set_output_aac_type(IMFMediaType* type, const pr_audio_config& audio)
-{
-    UINT32 channels = static_cast<UINT32>(std::max(1, audio.channels));
-    UINT32 sample_rate = static_cast<UINT32>(std::max(1, audio.sample_rate));
-    constexpr UINT32 audio_bitrate_bps = 192'000;
-
-    HRESULT hr = type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    if (FAILED(hr)) return hr;
-    hr = type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-    if (FAILED(hr)) return hr;
-    hr = type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
-    if (FAILED(hr)) return hr;
-    hr = type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate);
-    if (FAILED(hr)) return hr;
-    hr = type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio_bitrate_bps / 8);
-    if (FAILED(hr)) return hr;
-    hr = type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    if (FAILED(hr)) return hr;
-    return type->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
-}
-
 struct NativeRecorderBackend
 {
     virtual ~NativeRecorderBackend() = default;
@@ -536,6 +500,8 @@ struct NativeRecorderBackend
 struct SharedTextureNv12Converter
 {
     pr_video_config video{};
+    UINT required_vendor_id = kNvidiaVendorId;
+    const char* required_vendor_name = "NVIDIA";
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> device_context;
     ComPtr<ID3D11VideoDevice> video_device;
@@ -569,9 +535,10 @@ struct SharedTextureNv12Converter
         HRESULT hr = get_device_adapter_info(source_device, &vendor_id, &adapter_name, &adapter_luid, &adapter);
         if (FAILED(hr))
             return hr;
-        if (vendor_id != kNvidiaVendorId)
+        if (vendor_id != required_vendor_id)
         {
-            set_last_error("NativeRecorder source game device is not on an NVIDIA adapter; using FFmpeg fallback.");
+            set_last_error(std::string("NativeRecorder source game device is not on a ") +
+                required_vendor_name + " adapter; using FFmpeg fallback.");
             return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         }
         if (!adapter)
@@ -634,7 +601,7 @@ struct SharedTextureNv12Converter
                 dxgi_format_to_string(source_format) +
                 ", support=" + hex_uint32(source_format_support) +
                 ". This GPU/driver likely needs shader NV12 shared texture or direct encoder input.");
-            return MF_E_INVALIDMEDIATYPE;
+            return E_INVALIDARG;
         }
 
         hr = video_processor_enum->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &nv12_format_support);
@@ -644,7 +611,7 @@ struct SharedTextureNv12Converter
         {
             set_last_error("NativeRecorder video processor does not support NV12 output; support=" +
                 hex_uint32(nv12_format_support) + ".");
-            return MF_E_INVALIDMEDIATYPE;
+            return E_INVALIDARG;
         }
 
         hr = video_device->CreateVideoProcessor(video_processor_enum.Get(), 0, &video_processor);
@@ -696,7 +663,7 @@ struct SharedTextureNv12Converter
     HRESULT convert_shared_texture(HANDLE shared_handle, DXGI_FORMAT source_format, ComPtr<ID3D11Texture2D>& nv12_texture)
     {
         if (!initialized)
-            return MF_E_NOT_INITIALIZED;
+            return E_UNEXPECTED;
         if (shared_handle == nullptr)
             return E_POINTER;
 
@@ -726,7 +693,7 @@ struct SharedTextureNv12Converter
         if (!is_supported_texture_format(source_desc.Format) || !is_supported_texture_format(source_format))
         {
             set_last_error("NativeRecorder source texture format is not supported.");
-            return MF_E_INVALIDMEDIATYPE;
+            return E_INVALIDARG;
         }
 
         ComPtr<IDXGIKeyedMutex> keyed_mutex;
@@ -1328,7 +1295,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
         if (video.width <= 0 || video.height <= 0 || video.fps <= 0)
             return E_INVALIDARG;
         if (!is_supported_recording_codec(video.codec))
-            return MF_E_TOPO_CODEC_NOT_FOUND;
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         if (!nvenc_runtime_present())
         {
             set_last_error("NVIDIA NVENC runtime nvEncodeAPI64.dll was not found.");
@@ -1428,7 +1395,7 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
     HRESULT submit_shared_texture(ID3D11Device* source_device, HANDLE shared_handle, DXGI_FORMAT source_format, int64_t timestamp_hns) override
     {
         if (stopped)
-            return MF_E_SHUTDOWN;
+            return E_ABORT;
         if (source_device == nullptr || shared_handle == nullptr)
             return E_POINTER;
 
@@ -1557,68 +1524,50 @@ struct NvencLibavRecorderBackend final : NativeRecorderBackend
     }
 };
 
-struct MediaFoundationRecorderBackend final : NativeRecorderBackend
+struct AmfLibavRecorderBackend final : NativeRecorderBackend
 {
     pr_video_config video{};
     pr_audio_config audio{};
     std::wstring output_path;
-    bool mf_retained = false;
+    SharedTextureNv12Converter converter;
+    amf::AMFContextPtr context;
+    amf::AMFComponentPtr encoder;
+    LibavMp4Muxer muxer;
     bool initialized = false;
     bool stopped = false;
-    UINT dxgi_reset_token = 0;
-    DWORD video_stream_index = kInvalidStream;
-    DWORD audio_stream_index = kInvalidStream;
-    int64_t first_video_timestamp_hns = -1;
-    int64_t first_audio_timestamp_hns = -1;
-    int64_t last_video_sample_time_hns = -1;
-    int64_t last_audio_sample_time_hns = -1;
-    uint64_t video_sample_duration_hns = 0;
-    uint64_t frame_index = 0;
+    bool factory_initialized = false;
+    uint64_t submitted_frames = 0;
+    uint64_t written_packets = 0;
+    uint64_t audio_packets = 0;
+    int64_t video_sample_duration_hns = 0;
 
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> device_context;
-    ComPtr<ID3D11VideoDevice> video_device;
-    ComPtr<ID3D11VideoContext> video_context;
-    ComPtr<ID3D11VideoProcessorEnumerator> video_processor_enum;
-    ComPtr<ID3D11VideoProcessor> video_processor;
-    ComPtr<ID3D11Texture2D> source_copy_texture;
-    ComPtr<IMFDXGIDeviceManager> dxgi_manager;
-    ComPtr<IMFSinkWriter> sink_writer;
-
-    MediaFoundationRecorderBackend(const pr_video_config& video_config, const pr_audio_config& audio_config, std::wstring output)
+    AmfLibavRecorderBackend(const pr_video_config& video_config, const pr_audio_config& audio_config, std::wstring output)
         : video(video_config), audio(audio_config), output_path(std::move(output))
     {
+        converter.video = video;
+        converter.required_vendor_id = kAmdVendorId;
+        converter.required_vendor_name = "AMD";
     }
 
-    ~MediaFoundationRecorderBackend() override
+    ~AmfLibavRecorderBackend() override
     {
-        sink_writer.Reset();
-        source_copy_texture.Reset();
-        video_processor.Reset();
-        video_processor_enum.Reset();
-        video_context.Reset();
-        video_device.Reset();
-        device_context.Reset();
-        dxgi_manager.Reset();
-        device.Reset();
-
-        if (mf_retained)
+        stop();
+        if (factory_initialized)
         {
-            release_mf();
-            mf_retained = false;
+            g_AMFFactory.Terminate();
+            factory_initialized = false;
         }
     }
 
     const char* backend_name() const override
     {
-        return "MediaFoundation";
+        return "AMF+libavformat";
     }
 
     HRESULT initialize(ID3D11Device* source_device, DXGI_FORMAT source_format) override
     {
         if (initialized)
             return S_OK;
-
         if (source_device == nullptr)
             return E_POINTER;
         if (output_path.empty())
@@ -1626,260 +1575,163 @@ struct MediaFoundationRecorderBackend final : NativeRecorderBackend
         if (video.width <= 0 || video.height <= 0 || video.fps <= 0)
             return E_INVALIDARG;
         if (!is_supported_recording_codec(video.codec))
-            return MF_E_TOPO_CODEC_NOT_FOUND;
-
-        const int source_width = video.width;
-        const int source_height = video.height;
-        const int encoded_width = align_to_even(source_width);
-        const int encoded_height = align_to_even(source_height);
-
-        std::string adapter_name;
-        UINT vendor_id = 0;
-        LUID adapter_luid{};
-        ComPtr<IDXGIAdapter> adapter;
-        HRESULT hr = get_device_adapter_info(source_device, &vendor_id, &adapter_name, &adapter_luid, &adapter);
-        if (FAILED(hr))
-            return hr;
-        if (vendor_id != kNvidiaVendorId)
-        {
-            set_last_error("NativeRecorder source game device is not on an NVIDIA adapter; using FFmpeg fallback.");
             return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        }
-        if (!adapter)
-            return DXGI_ERROR_NOT_FOUND;
-
-        hr = ensure_thread_com_initialized();
-        if (FAILED(hr))
-            return hr;
-
-        hr = retain_mf();
-        if (FAILED(hr))
-            return hr;
-        mf_retained = true;
-
-        UINT create_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-        D3D_FEATURE_LEVEL feature_levels[] =
+        if (!amf_runtime_present())
         {
-            D3D_FEATURE_LEVEL_11_1,
-            D3D_FEATURE_LEVEL_11_0,
-        };
-        D3D_FEATURE_LEVEL feature_level{};
-        hr = D3D11CreateDevice(
-            adapter.Get(),
-            D3D_DRIVER_TYPE_UNKNOWN,
-            nullptr,
-            create_flags,
-            feature_levels,
-            _countof(feature_levels),
-            D3D11_SDK_VERSION,
-            &device,
-            &feature_level,
-            &device_context);
-        if (FAILED(hr))
-            return fail_step("D3D11CreateDevice", hr, "adapter=" + adapter_name);
-
-        device->GetImmediateContext(&device_context);
-        if (!device_context)
-            return E_FAIL;
-
-        hr = device.As(&video_device);
-        if (FAILED(hr))
-            return fail_step("QueryInterface(ID3D11VideoDevice)", hr);
-        hr = device_context.As(&video_context);
-        if (FAILED(hr))
-            return fail_step("QueryInterface(ID3D11VideoContext)", hr);
-
-        hr = MFCreateDXGIDeviceManager(&dxgi_reset_token, &dxgi_manager);
-        if (FAILED(hr))
-            return fail_step("MFCreateDXGIDeviceManager", hr);
-        hr = dxgi_manager->ResetDevice(device.Get(), dxgi_reset_token);
-        if (FAILED(hr))
-            return fail_step("IMFDXGIDeviceManager::ResetDevice", hr);
-
-        ComPtr<IMFAttributes> attributes;
-        hr = MFCreateAttributes(&attributes, 4);
-        if (FAILED(hr))
-            return hr;
-        hr = attributes->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, dxgi_manager.Get());
-        if (FAILED(hr))
-            return hr;
-        hr = attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-        if (FAILED(hr))
-            return hr;
-
-        hr = MFCreateSinkWriterFromURL(output_path.c_str(), nullptr, attributes.Get(), &sink_writer);
-        if (FAILED(hr))
-            return fail_step("MFCreateSinkWriterFromURL", hr, "output=" + wide_to_utf8(output_path.c_str()));
-
-        ComPtr<IMFMediaType> video_out;
-        hr = MFCreateMediaType(&video_out);
-        if (FAILED(hr))
-            return hr;
-        hr = set_video_type_common(video_out.Get(), encoded_width, encoded_height, video.fps);
-        if (FAILED(hr))
-            return fail_step("Set video output media type common attributes", hr);
-        const char* output_codec_name = codec_name(video.codec);
-        hr = video_out->SetGUID(MF_MT_SUBTYPE, media_foundation_video_subtype(video.codec));
-        if (FAILED(hr))
-            return fail_step("Set video output subtype", hr, std::string("codec=") + output_codec_name);
-        hr = video_out->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(video.bitrate_bps > 0 ? video.bitrate_bps : 12'000'000));
-        if (FAILED(hr))
-            return fail_step("Set video output bitrate", hr);
-        hr = sink_writer->AddStream(video_out.Get(), &video_stream_index);
-        if (FAILED(hr))
-            return fail_step("IMFSinkWriter::AddStream(video)", hr, std::string("codec=") + output_codec_name + ", encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height));
-
-        ComPtr<IMFMediaType> video_in;
-        hr = MFCreateMediaType(&video_in);
-        if (FAILED(hr))
-            return hr;
-        hr = set_video_type_common(video_in.Get(), encoded_width, encoded_height, video.fps);
-        if (FAILED(hr))
-            return fail_step("Set video input media type common attributes", hr);
-        hr = video_in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-        if (FAILED(hr))
-            return fail_step("Set video input subtype NV12", hr);
-        hr = video_in->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
-        if (FAILED(hr))
-            return fail_step("Set video input fixed-size samples", hr);
-        hr = video_in->SetUINT32(MF_MT_SAMPLE_SIZE, static_cast<UINT32>(encoded_width * encoded_height * 3 / 2));
-        if (FAILED(hr))
-            return fail_step("Set video input sample size", hr, "encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height));
-        hr = sink_writer->SetInputMediaType(video_stream_index, video_in.Get(), nullptr);
-        if (FAILED(hr))
-            return fail_step("IMFSinkWriter::SetInputMediaType(video NV12)", hr, "source=" + std::to_string(source_width) + "x" + std::to_string(source_height) + ", encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height));
-
-        if (audio.enabled)
-        {
-            ComPtr<IMFMediaType> audio_out;
-            hr = MFCreateMediaType(&audio_out);
-            if (FAILED(hr))
-                return hr;
-            hr = set_output_aac_type(audio_out.Get(), audio);
-            if (FAILED(hr))
-                return hr;
-            hr = sink_writer->AddStream(audio_out.Get(), &audio_stream_index);
-            if (FAILED(hr))
-                return hr;
-
-            ComPtr<IMFMediaType> audio_in;
-            hr = MFCreateMediaType(&audio_in);
-            if (FAILED(hr))
-                return hr;
-            hr = set_input_audio_type_common(audio_in.Get(), audio);
-            if (FAILED(hr))
-                return hr;
-            hr = sink_writer->SetInputMediaType(audio_stream_index, audio_in.Get(), nullptr);
-            if (FAILED(hr))
-                return hr;
+            set_last_error("AMD AMF runtime amfrt64.dll was not found.");
+            return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
         }
 
-        D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
-        content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-        content.InputFrameRate.Numerator = static_cast<UINT>(std::max(1, video.fps));
-        content.InputFrameRate.Denominator = 1;
-        content.InputWidth = static_cast<UINT>(source_width);
-        content.InputHeight = static_cast<UINT>(source_height);
-        content.OutputFrameRate.Numerator = static_cast<UINT>(std::max(1, video.fps));
-        content.OutputFrameRate.Denominator = 1;
-        content.OutputWidth = static_cast<UINT>(encoded_width);
-        content.OutputHeight = static_cast<UINT>(encoded_height);
-        content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
-
-        hr = video_device->CreateVideoProcessorEnumerator(&content, &video_processor_enum);
+        HRESULT hr = converter.initialize(source_device, source_format);
         if (FAILED(hr))
-            return fail_step("CreateVideoProcessorEnumerator", hr);
+            return hr;
 
-        UINT source_format_support = 0;
-        hr = video_processor_enum->CheckVideoProcessorFormat(source_format, &source_format_support);
+        const int encoded_width = converter.encoded_width();
+        const int encoded_height = converter.encoded_height();
+        video_sample_duration_hns = static_cast<int64_t>(make_sample_duration_hns(video.fps));
+
+        AMF_RESULT amf_result = g_AMFFactory.Init();
+        if (!amf_result_success(amf_result))
+            return fail_amf("AMF factory init", amf_result);
+        factory_initialized = true;
+
+        amf_result = g_AMFFactory.GetFactory()->CreateContext(&context);
+        if (!amf_result_success(amf_result))
+            return fail_amf("AMF CreateContext", amf_result);
+
+        amf_result = context->InitDX11(converter.device.Get());
+        if (!amf_result_success(amf_result))
+            return fail_amf("AMF InitDX11", amf_result, "adapter=" + converter.adapter_name);
+
+        amf_result = g_AMFFactory.GetFactory()->CreateComponent(context, amf_codec_id(video.codec), &encoder);
+        if (!amf_result_success(amf_result))
+            return fail_amf("AMF CreateComponent(encoder)", amf_result, std::string("codec=") + codec_name(video.codec));
+
+        hr = configure_encoder(encoded_width, encoded_height);
         if (FAILED(hr))
-            return fail_step("CheckVideoProcessorFormat(source)", hr, "format=" + dxgi_format_to_string(source_format));
-        if ((source_format_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0)
-        {
-            set_last_error("NativeRecorder video processor does not support source texture as input; format=" +
-                dxgi_format_to_string(source_format) +
-                ", support=" + hex_uint32(source_format_support) +
-                ". This GPU/driver likely needs shader NV12 shared texture or direct NVENC ABGR input.");
-            return MF_E_INVALIDMEDIATYPE;
-        }
+            return hr;
 
-        UINT nv12_format_support = 0;
-        hr = video_processor_enum->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &nv12_format_support);
+        amf_result = encoder->Init(amf::AMF_SURFACE_NV12, encoded_width, encoded_height);
+        if (!amf_result_success(amf_result))
+            return fail_amf("AMF encoder Init(NV12)", amf_result,
+                "encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height));
+
+        std::vector<uint8_t> sequence_params;
+        hr = read_sequence_params(sequence_params);
         if (FAILED(hr))
-            return fail_step("CheckVideoProcessorFormat(NV12)", hr);
-        if ((nv12_format_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0)
-        {
-            set_last_error("NativeRecorder video processor does not support NV12 output; support=" +
-                hex_uint32(nv12_format_support) + ".");
-            return MF_E_INVALIDMEDIATYPE;
-        }
+            return hr;
 
-        hr = video_device->CreateVideoProcessor(video_processor_enum.Get(), 0, &video_processor);
+        hr = muxer.open(output_path, video, audio, sequence_params);
         if (FAILED(hr))
-            return fail_step("CreateVideoProcessor", hr);
+            return hr;
 
-        RECT source_rect{0, 0, source_width, source_height};
-        RECT dest_rect{0, 0, source_width, source_height};
-        RECT output_rect{0, 0, encoded_width, encoded_height};
-        D3D11_VIDEO_COLOR background{};
-        background.RGBA.A = 1.0f;
-        video_context->VideoProcessorSetStreamFrameFormat(video_processor.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-        video_context->VideoProcessorSetStreamSourceRect(video_processor.Get(), 0, TRUE, &source_rect);
-        video_context->VideoProcessorSetStreamDestRect(video_processor.Get(), 0, TRUE, &dest_rect);
-        video_context->VideoProcessorSetOutputTargetRect(video_processor.Get(), TRUE, &output_rect);
-        video_context->VideoProcessorSetOutputBackgroundColor(video_processor.Get(), FALSE, &background);
-
-        hr = sink_writer->BeginWriting();
-        if (FAILED(hr))
-            return fail_step("IMFSinkWriter::BeginWriting", hr);
-
-        video_sample_duration_hns = make_sample_duration_hns(video.fps);
         initialized = true;
-
-        std::string message = "NativeRecorder initialized: source NVIDIA adapter=" + adapter_name +
-            ", luid=" + std::to_string(static_cast<uint32_t>(adapter_luid.HighPart)) + ":" +
-            std::to_string(adapter_luid.LowPart) +
+        std::string message = "NativeRecorder initialized: source AMD adapter=" + converter.adapter_name +
+            ", luid=" + std::to_string(static_cast<uint32_t>(converter.adapter_luid.HighPart)) + ":" +
+            std::to_string(converter.adapter_luid.LowPart) +
             ", sourceFormat=" + dxgi_format_to_string(source_format) +
             ", encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height) +
-            ", pad=" + std::to_string(encoded_width - source_width) + "x" + std::to_string(encoded_height - source_height) +
-            ", vpSourceSupport=" + hex_uint32(source_format_support) +
-            ", vpNv12Support=" + hex_uint32(nv12_format_support) +
-            ", output=" + std::string(output_codec_name) + "/MP4 via Media Foundation D3D11 texture input.";
+            ", pad=" + std::to_string(encoded_width - video.width) + "x" + std::to_string(encoded_height - video.height) +
+            ", vpSourceSupport=" + hex_uint32(converter.source_format_support) +
+            ", vpNv12Support=" + hex_uint32(converter.nv12_format_support) +
+            ", output=" + std::string(codec_name(video.codec)) + "/MP4 via AMF + libavformat.";
         set_last_error(message);
         return S_OK;
     }
 
-    HRESULT ensure_source_copy_texture(const D3D11_TEXTURE2D_DESC& source_desc)
+    HRESULT configure_encoder(int encoded_width, int encoded_height)
     {
-        if (source_copy_texture)
-        {
-            D3D11_TEXTURE2D_DESC existing{};
-            source_copy_texture->GetDesc(&existing);
-            constexpr UINT required_bind_flags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-            if (existing.Width == source_desc.Width &&
-                existing.Height == source_desc.Height &&
-                existing.Format == source_desc.Format &&
-                (existing.BindFlags & required_bind_flags) == required_bind_flags)
-            {
-                return S_OK;
-            }
+        const int fps = std::max(1, video.fps);
+        const int64_t bitrate = video.bitrate_bps > 0 ? video.bitrate_bps : 12'000'000;
+        AMF_RESULT result = AMF_OK;
 
-            source_copy_texture.Reset();
+        if (video.codec == PR_CODEC_H264)
+        {
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_USAGE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 Usage)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_PROFILE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PROFILE_HIGH)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 Profile)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMESIZE, amf::AMFVariant(AMFConstructSize(encoded_width, encoded_height)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 FrameSize)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, amf::AMFVariant(AMFConstructRate(fps, 1)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 FrameRate)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 TargetBitrate)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 PeakBitrate)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 RateControl)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 QualityPreset)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_MAX_CONSECUTIVE_BPICTURES, amf::AMFVariant(static_cast<amf_int64>(0)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 BFrames)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, amf::AMFVariant(static_cast<amf_int64>(fps * 2)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 IDRPeriod)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING, amf::AMFVariant(static_cast<amf_int64>(fps * 2)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(H264 HeaderInsertion)", result);
+        }
+        else
+        {
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_USAGE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC Usage)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PROFILE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC Profile)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMESIZE, amf::AMFVariant(AMFConstructSize(encoded_width, encoded_height)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC FrameSize)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMERATE, amf::AMFVariant(AMFConstructRate(fps, 1)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC FrameRate)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC TargetBitrate)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, amf::AMFVariant(static_cast<amf_int64>(bitrate)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC PeakBitrate)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC RateControl)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC QualityPreset)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, amf::AMFVariant(static_cast<amf_int64>(fps * 2)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC GOP)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, amf::AMFVariant(static_cast<amf_int64>(1)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC IDR)", result);
+            result = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED)));
+            if (!amf_result_success(result)) return fail_amf("AMF SetProperty(HEVC HeaderInsertion)", result);
         }
 
-        D3D11_TEXTURE2D_DESC copy_desc = source_desc;
-        copy_desc.Usage = D3D11_USAGE_DEFAULT;
-        copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        copy_desc.CPUAccessFlags = 0;
-        copy_desc.MiscFlags = 0;
-
-        return device->CreateTexture2D(&copy_desc, nullptr, &source_copy_texture);
+        return S_OK;
     }
 
-    HRESULT submit_shared_texture(ID3D11Device* source_device, HANDLE shared_handle, DXGI_FORMAT source_format, int64_t timestamp_hns)
+    HRESULT read_sequence_params(std::vector<uint8_t>& sequence_params)
+    {
+        amf::AMFVariant extra_data;
+        const wchar_t* property = video.codec == PR_CODEC_HEVC
+            ? AMF_VIDEO_ENCODER_HEVC_EXTRADATA
+            : AMF_VIDEO_ENCODER_EXTRADATA;
+        AMF_RESULT result = encoder->GetProperty(property, &extra_data);
+        if (!amf_result_success(result))
+            return fail_amf("AMF GetProperty(extradata)", result, std::string("codec=") + codec_name(video.codec));
+
+        amf::AMFInterface* extra_interface = AMFVariantGetInterface(&extra_data);
+        if (extra_interface == nullptr)
+        {
+            set_last_error("NativeRecorder AMF encoder returned empty extradata.");
+            return E_FAIL;
+        }
+
+        amf::AMFBufferPtr buffer(extra_interface);
+        if (buffer == nullptr || buffer->GetNative() == nullptr || buffer->GetSize() == 0)
+        {
+            set_last_error("NativeRecorder AMF encoder returned invalid extradata buffer.");
+            return E_FAIL;
+        }
+
+        const auto* data = static_cast<const uint8_t*>(buffer->GetNative());
+        sequence_params.assign(data, data + buffer->GetSize());
+        return S_OK;
+    }
+
+    HRESULT submit_shared_texture(ID3D11Device* source_device, HANDLE shared_handle, DXGI_FORMAT source_format, int64_t timestamp_hns) override
     {
         if (stopped)
-            return MF_E_SHUTDOWN;
+            return E_ABORT;
         if (source_device == nullptr || shared_handle == nullptr)
             return E_POINTER;
 
@@ -1887,228 +1739,128 @@ struct MediaFoundationRecorderBackend final : NativeRecorderBackend
         if (FAILED(hr))
             return hr;
 
-        ComPtr<ID3D11Texture2D> source_texture;
-        hr = device->OpenSharedResource(shared_handle, __uuidof(ID3D11Texture2D), &source_texture);
-        if (FAILED(hr))
-        {
-            set_last_error("NativeRecorder failed to open shared texture on the source adapter: " + hresult_to_string(hr));
-            return hr;
-        }
-
-        D3D11_TEXTURE2D_DESC source_desc{};
-        source_texture->GetDesc(&source_desc);
-        if (source_desc.Width != static_cast<UINT>(video.width) ||
-            source_desc.Height != static_cast<UINT>(video.height))
-        {
-            set_last_error("NativeRecorder source texture size changed; expected=" +
-                std::to_string(video.width) + "x" + std::to_string(video.height) +
-                ", actual=" + texture_desc_to_string(source_desc));
-            return E_INVALIDARG;
-        }
-        if (source_desc.SampleDesc.Count != 1)
-        {
-            set_last_error("NativeRecorder does not support MSAA swap-chain textures.");
-            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        }
-        if (!is_supported_texture_format(source_desc.Format) || !is_supported_texture_format(source_format))
-        {
-            set_last_error("NativeRecorder source texture format is not supported.");
-            return MF_E_INVALIDMEDIATYPE;
-        }
-
-        const int encoded_width = align_to_even(video.width);
-        const int encoded_height = align_to_even(video.height);
-
-        ComPtr<IDXGIKeyedMutex> keyed_mutex;
-        hr = source_texture.As(&keyed_mutex);
-
-        hr = ensure_source_copy_texture(source_desc);
-        if (FAILED(hr))
-            return fail_step("CreateTexture2D(source copy)", hr, "source=" + texture_desc_to_string(source_desc));
-
-        bool mutex_acquired = false;
-        if (keyed_mutex)
-        {
-            hr = keyed_mutex->AcquireSync(kEncoderReadKey, kSharedTextureAcquireTimeoutMs);
-            if (hr == WAIT_TIMEOUT || hr == DXGI_ERROR_WAIT_TIMEOUT)
-            {
-                set_last_error("NativeRecorder shared texture was not ready; dropping one frame.");
-                return DXGI_ERROR_WAS_STILL_DRAWING;
-            }
-            if (FAILED(hr))
-                return fail_step("IDXGIKeyedMutex::AcquireSync", hr, "source=" + texture_desc_to_string(source_desc));
-
-            mutex_acquired = true;
-        }
-
-        device_context->CopyResource(source_copy_texture.Get(), source_texture.Get());
-        if (keyed_mutex)
-        {
-            HRESULT release_hr = keyed_mutex->ReleaseSync(kGameWriteKey);
-            mutex_acquired = false;
-            if (FAILED(release_hr))
-                return fail_step("IDXGIKeyedMutex::ReleaseSync", release_hr, "source=" + texture_desc_to_string(source_desc));
-        }
-
-        D3D11_TEXTURE2D_DESC output_desc{};
-        output_desc.Width = static_cast<UINT>(encoded_width);
-        output_desc.Height = static_cast<UINT>(encoded_height);
-        output_desc.MipLevels = 1;
-        output_desc.ArraySize = 1;
-        output_desc.Format = DXGI_FORMAT_NV12;
-        output_desc.SampleDesc.Count = 1;
-        output_desc.Usage = D3D11_USAGE_DEFAULT;
-        output_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
         ComPtr<ID3D11Texture2D> nv12_texture;
-        hr = device->CreateTexture2D(&output_desc, nullptr, &nv12_texture);
+        hr = converter.convert_shared_texture(shared_handle, source_format, nv12_texture);
         if (FAILED(hr))
-            return fail_step("CreateTexture2D(NV12 output)", hr, "output=" + texture_desc_to_string(output_desc));
+            return hr;
 
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_view_desc{};
-        input_view_desc.FourCC = 0;
-        input_view_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        input_view_desc.Texture2D.MipSlice = 0;
-        input_view_desc.Texture2D.ArraySlice = 0;
+        amf::AMFSurfacePtr surface;
+        AMF_RESULT result = context->CreateSurfaceFromDX11Native(nv12_texture.Get(), &surface, nullptr);
+        if (!amf_result_success(result))
+            return fail_amf("AMF CreateSurfaceFromDX11Native", result);
 
-        ComPtr<ID3D11VideoProcessorInputView> input_view;
-        hr = video_device->CreateVideoProcessorInputView(source_copy_texture.Get(), video_processor_enum.Get(), &input_view_desc, &input_view);
-        if (FAILED(hr))
+        surface->SetPts(static_cast<amf_pts>(std::max<int64_t>(0, timestamp_hns)));
+        surface->SetDuration(static_cast<amf_pts>(video_sample_duration_hns));
+
+        if (submitted_frames == 0)
         {
-            if (mutex_acquired && keyed_mutex)
-                keyed_mutex->ReleaseSync(kGameWriteKey);
-            return fail_step("CreateVideoProcessorInputView", hr, "source=" + texture_desc_to_string(source_desc));
+            if (video.codec == PR_CODEC_H264)
+            {
+                surface->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR)));
+                surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, amf::AMFVariant(true));
+                surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, amf::AMFVariant(true));
+            }
+            else
+            {
+                surface->SetProperty(AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE, amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_IDR)));
+                surface->SetProperty(AMF_VIDEO_ENCODER_HEVC_INSERT_HEADER, amf::AMFVariant(true));
+            }
         }
 
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{};
-        output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-        output_view_desc.Texture2D.MipSlice = 0;
+        result = encoder->SubmitInput(surface);
+        if (result == AMF_INPUT_FULL)
+        {
+            hr = drain_output(false);
+            if (FAILED(hr))
+                return hr;
+            result = encoder->SubmitInput(surface);
+        }
+        if (result == AMF_INPUT_FULL)
+        {
+            set_last_error("NativeRecorder AMF input queue is full; dropping one frame.");
+            return DXGI_ERROR_WAS_STILL_DRAWING;
+        }
+        if (result != AMF_OK && result != AMF_NEED_MORE_INPUT)
+            return fail_amf("AMF SubmitInput", result);
 
-        ComPtr<ID3D11VideoProcessorOutputView> output_view;
-        hr = video_device->CreateVideoProcessorOutputView(nv12_texture.Get(), video_processor_enum.Get(), &output_view_desc, &output_view);
-        if (FAILED(hr))
-            return fail_step("CreateVideoProcessorOutputView", hr, "output=" + texture_desc_to_string(output_desc));
+        ++submitted_frames;
+        return drain_output(false);
+    }
 
-        D3D11_VIDEO_PROCESSOR_STREAM stream{};
-        stream.Enable = TRUE;
-        stream.OutputIndex = 0;
-        stream.InputFrameOrField = 0;
-        stream.PastFrames = 0;
-        stream.FutureFrames = 0;
-        stream.pInputSurface = input_view.Get();
+    HRESULT drain_output(bool flushing)
+    {
+        if (!encoder)
+            return S_OK;
 
-        hr = video_context->VideoProcessorBlt(
-            video_processor.Get(),
-            output_view.Get(),
-            static_cast<UINT>(frame_index),
-            1,
-            &stream);
-        if (FAILED(hr))
-            return fail_step("VideoProcessorBlt", hr, "source=" + texture_desc_to_string(source_desc) + "; output=" + texture_desc_to_string(output_desc));
+        int repeat_count = 0;
+        while (true)
+        {
+            amf::AMFDataPtr data;
+            AMF_RESULT result = encoder->QueryOutput(&data);
+            if (result == AMF_REPEAT)
+            {
+                if (!flushing || repeat_count++ >= 1000)
+                    return S_OK;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            if (result == AMF_EOF)
+                return S_OK;
+            if (!amf_result_success(result))
+                return fail_amf("AMF QueryOutput", result);
+            if (data == nullptr)
+            {
+                if (!flushing || repeat_count++ >= 1000)
+                    return S_OK;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
 
-        ComPtr<IMFMediaBuffer> dxgi_buffer;
-        hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_texture.Get(), 0, FALSE, &dxgi_buffer);
-        if (FAILED(hr))
-            return fail_step("MFCreateDXGISurfaceBuffer(NV12)", hr, "output=" + texture_desc_to_string(output_desc));
+            amf::AMFBufferPtr buffer(data);
+            if (buffer == nullptr || buffer->GetNative() == nullptr || buffer->GetSize() == 0)
+                continue;
 
-        DWORD nv12_byte_count = static_cast<DWORD>(encoded_width * encoded_height * 3 / 2);
-        hr = dxgi_buffer->SetCurrentLength(nv12_byte_count);
-        if (FAILED(hr))
-            return fail_step("IMFMediaBuffer::SetCurrentLength(NV12)", hr, "bytes=" + std::to_string(nv12_byte_count));
+            const auto* bytes = static_cast<const uint8_t*>(buffer->GetNative());
+            std::vector<uint8_t> packet(bytes, bytes + buffer->GetSize());
+            bool key_frame = false;
+            if (video.codec == PR_CODEC_H264)
+            {
+                amf_int64 output_type = AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_P;
+                buffer->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &output_type);
+                key_frame = output_type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR ||
+                    output_type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_I;
+            }
+            else
+            {
+                amf_int64 output_type = AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_P;
+                buffer->GetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE, &output_type);
+                key_frame = output_type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_IDR ||
+                    output_type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_I;
+            }
 
-        ComPtr<IMFSample> sample;
-        hr = MFCreateSample(&sample);
-        if (FAILED(hr))
-            return fail_step("MFCreateSample(video)", hr);
-        hr = sample->AddBuffer(dxgi_buffer.Get());
-        if (FAILED(hr))
-            return fail_step("IMFSample::AddBuffer(video)", hr);
+            int64_t timestamp = static_cast<int64_t>(data->GetPts());
+            if (timestamp <= 0)
+                timestamp = static_cast<int64_t>(submitted_frames) * video_sample_duration_hns;
 
-        if (first_video_timestamp_hns < 0)
-            first_video_timestamp_hns = timestamp_hns;
-
-        int64_t sample_time = std::max<int64_t>(0, timestamp_hns - first_video_timestamp_hns);
-        if (last_video_sample_time_hns >= 0 && sample_time <= last_video_sample_time_hns)
-            sample_time = last_video_sample_time_hns + static_cast<int64_t>(video_sample_duration_hns);
-
-        hr = sample->SetSampleTime(sample_time);
-        if (FAILED(hr))
-            return fail_step("IMFSample::SetSampleTime(video)", hr, "sampleTime=" + std::to_string(sample_time));
-        hr = sample->SetSampleDuration(static_cast<LONGLONG>(video_sample_duration_hns));
-        if (FAILED(hr))
-            return fail_step("IMFSample::SetSampleDuration(video)", hr, "duration=" + std::to_string(video_sample_duration_hns));
-
-        hr = sink_writer->WriteSample(video_stream_index, sample.Get());
-        if (FAILED(hr))
-            return fail_step("IMFSinkWriter::WriteSample(video)", hr, "sampleTime=" + std::to_string(sample_time) + ", duration=" + std::to_string(video_sample_duration_hns));
-
-        last_video_sample_time_hns = sample_time;
-        ++frame_index;
-        return S_OK;
+            HRESULT hr = muxer.write_video_packet(packet, key_frame, timestamp, video_sample_duration_hns);
+            if (FAILED(hr))
+                return hr;
+            ++written_packets;
+        }
     }
 
     HRESULT submit_audio(const void* data, int32_t byte_count, int64_t timestamp_hns) override
     {
-        if (!audio.enabled || audio_stream_index == kInvalidStream)
+        if (!audio.enabled)
             return S_OK;
         if (!initialized)
-            return MF_E_NOT_INITIALIZED;
-        if (data == nullptr || byte_count <= 0)
-            return E_INVALIDARG;
+            return S_OK;
 
-        HRESULT hr = ensure_thread_com_initialized();
+        HRESULT hr = muxer.write_audio(data, byte_count, timestamp_hns);
         if (FAILED(hr))
             return hr;
 
-        ComPtr<IMFMediaBuffer> buffer;
-        hr = MFCreateMemoryBuffer(static_cast<DWORD>(byte_count), &buffer);
-        if (FAILED(hr))
-            return hr;
-
-        BYTE* dst = nullptr;
-        DWORD max_length = 0;
-        DWORD current_length = 0;
-        hr = buffer->Lock(&dst, &max_length, &current_length);
-        if (FAILED(hr))
-            return hr;
-
-        std::memcpy(dst, data, static_cast<size_t>(byte_count));
-        buffer->Unlock();
-        hr = buffer->SetCurrentLength(static_cast<DWORD>(byte_count));
-        if (FAILED(hr))
-            return hr;
-
-        ComPtr<IMFSample> sample;
-        hr = MFCreateSample(&sample);
-        if (FAILED(hr))
-            return hr;
-        hr = sample->AddBuffer(buffer.Get());
-        if (FAILED(hr))
-            return hr;
-
-        int block_align = std::max(1, audio.channels * audio.bits_per_sample / 8);
-        int64_t sample_count = byte_count / block_align;
-        int64_t duration_hns = sample_count * 10'000'000ll / std::max(1, audio.sample_rate);
-
-        if (first_audio_timestamp_hns < 0)
-            first_audio_timestamp_hns = timestamp_hns;
-
-        int64_t sample_time = std::max<int64_t>(0, timestamp_hns - first_audio_timestamp_hns);
-        if (last_audio_sample_time_hns >= 0 && sample_time <= last_audio_sample_time_hns)
-            sample_time = last_audio_sample_time_hns + duration_hns;
-
-        hr = sample->SetSampleTime(sample_time);
-        if (FAILED(hr))
-            return hr;
-        hr = sample->SetSampleDuration(duration_hns);
-        if (FAILED(hr))
-            return hr;
-
-        hr = sink_writer->WriteSample(audio_stream_index, sample.Get());
-        if (FAILED(hr))
-            return hr;
-
-        last_audio_sample_time_hns = sample_time;
+        ++audio_packets;
         return S_OK;
     }
 
@@ -2118,18 +1870,36 @@ struct MediaFoundationRecorderBackend final : NativeRecorderBackend
             return S_OK;
 
         stopped = true;
-        if (sink_writer)
+        HRESULT result = S_OK;
+        if (encoder)
         {
-            HRESULT hr = sink_writer->Finalize();
-            if (SUCCEEDED(hr))
-            {
-                set_last_error("NativeRecorder finalized via Media Foundation D3D11 texture input. submitted=" +
-                    std::to_string(frame_index));
-            }
-            return hr;
+            AMF_RESULT amf_result = encoder->Drain();
+            if (!amf_result_success(amf_result) && amf_result != AMF_INPUT_FULL)
+                result = fail_amf("AMF encoder Drain", amf_result);
+
+            if (SUCCEEDED(result))
+                result = drain_output(true);
+
+            encoder->Terminate();
+            encoder.Release();
         }
 
-        return S_OK;
+        HRESULT mux_hr = muxer.close();
+        if (FAILED(mux_hr) && SUCCEEDED(result))
+            result = mux_hr;
+
+        context.Release();
+        converter.reset();
+
+        if (SUCCEEDED(result))
+        {
+            set_last_error("NativeRecorder finalized via AMF + libavformat. submitted=" +
+                std::to_string(submitted_frames) +
+                ", packets=" + std::to_string(written_packets) +
+                ", audioPackets=" + std::to_string(audio_packets));
+        }
+
+        return result;
     }
 };
 
@@ -2146,31 +1916,45 @@ struct pr_recorder_t
         if (backend)
             return S_OK;
 
-        std::string nvenc_failure;
+        UINT vendor_id = 0;
+        std::string adapter_name;
+        HRESULT info_hr = get_device_adapter_info(source_device, &vendor_id, &adapter_name);
+        if (FAILED(info_hr))
+            return info_hr;
+
+        if (vendor_id == kAmdVendorId)
         {
-            auto nvenc_backend = std::make_unique<NvencLibavRecorderBackend>(video, audio, output_path);
-            HRESULT hr = nvenc_backend->initialize(source_device, source_format);
+            auto amf_backend = std::make_unique<AmfLibavRecorderBackend>(video, audio, output_path);
+            HRESULT hr = amf_backend->initialize(source_device, source_format);
             if (SUCCEEDED(hr))
             {
-                backend = std::move(nvenc_backend);
+                backend = std::move(amf_backend);
                 return S_OK;
             }
 
-            nvenc_failure = get_last_error_copy();
-        }
-
-        auto media_foundation_backend = std::make_unique<MediaFoundationRecorderBackend>(video, audio, output_path);
-        HRESULT hr = media_foundation_backend->initialize(source_device, source_format);
-        if (FAILED(hr))
+            set_last_error("NativeRecorder AMF + libavformat path unavailable; using FFmpeg fallback. " +
+                get_last_error_copy());
             return hr;
-
-        backend = std::move(media_foundation_backend);
-        if (!nvenc_failure.empty())
-        {
-            set_last_error("NativeRecorder NvEncoderD3D11 + libavformat path unavailable; using Media Foundation fallback. " +
-                nvenc_failure);
         }
-        return S_OK;
+
+        if (vendor_id != kNvidiaVendorId)
+        {
+            set_last_error("NativeRecorder source game device is not on an NVIDIA or AMD adapter; using FFmpeg fallback. adapter=" +
+                adapter_name);
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        }
+
+        auto nvenc_backend = std::make_unique<NvencLibavRecorderBackend>(video, audio, output_path);
+        HRESULT hr = nvenc_backend->initialize(source_device, source_format);
+        if (SUCCEEDED(hr))
+        {
+            backend = std::move(nvenc_backend);
+            return S_OK;
+        }
+
+        set_last_error("NativeRecorder NvEncoderD3D11 + libavformat path unavailable; using FFmpeg fallback. " +
+            get_last_error_copy());
+        return hr;
     }
 
     HRESULT submit_shared_texture(ID3D11Device* source_device, HANDLE shared_handle, DXGI_FORMAT source_format, int64_t timestamp_hns)
@@ -2222,37 +2006,45 @@ PR_API int32_t PR_CALL pr_probe(pr_probe_info* info)
 
     std::string adapter_name;
     hr = find_nvidia_adapter(&adapter_name);
+    if (SUCCEEDED(hr))
+    {
+        if (!nvenc_runtime_present())
+        {
+            copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
+            copy_text(info->message, sizeof(info->message), "NVIDIA adapter was found, but nvEncodeAPI64.dll was not found.");
+            info->is_supported_adapter = 1;
+            set_last_error(info->message);
+            return PR_OK;
+        }
+
+        copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
+        copy_text(info->message, sizeof(info->message), "NativeRecorder NVIDIA D3D11 texture path is available (NvEncoderD3D11 + libavformat, FFmpeg fallback on runtime failure).");
+        info->is_supported_adapter = 1;
+        info->supports_d3d11_texture_input = 1;
+        set_last_error(info->message);
+        return PR_OK;
+    }
+
+    hr = find_amd_adapter(&adapter_name);
     if (FAILED(hr))
     {
-        copy_text(info->message, sizeof(info->message), "No NVIDIA DXGI adapter was found.");
+        copy_text(info->message, sizeof(info->message), "No NVIDIA or AMD DXGI adapter was found.");
         set_last_error(info->message);
         return PR_OK;
     }
 
-    if (!nvenc_runtime_present())
+    if (!amf_runtime_present())
     {
         copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-        copy_text(info->message, sizeof(info->message), "NVIDIA adapter was found, but nvEncodeAPI64.dll was not found.");
-        info->is_nvidia_adapter = 1;
+        copy_text(info->message, sizeof(info->message), "AMD adapter was found, but amfrt64.dll was not found.");
+        info->is_supported_adapter = 0;
         set_last_error(info->message);
         return PR_OK;
     }
-
-    HRESULT mf_hr = retain_mf();
-    if (FAILED(mf_hr))
-    {
-        std::string message = "Media Foundation startup failed: " + hresult_to_string(mf_hr);
-        copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-        copy_text(info->message, sizeof(info->message), message.c_str());
-        info->is_nvidia_adapter = 1;
-        set_last_error(message);
-        return PR_OK;
-    }
-    release_mf();
 
     copy_text(info->adapter_name, sizeof(info->adapter_name), adapter_name.c_str());
-    copy_text(info->message, sizeof(info->message), "NativeRecorder NVIDIA D3D11 texture path is available (NvEncoderD3D11 + libavformat preferred, Media Foundation fallback).");
-    info->is_nvidia_adapter = 1;
+    copy_text(info->message, sizeof(info->message), "NativeRecorder AMD D3D11 texture path is available (AMF + libavformat preferred, FFmpeg fallback on runtime failure).");
+    info->is_supported_adapter = 1;
     info->supports_d3d11_texture_input = 1;
     set_last_error(info->message);
     return PR_OK;
@@ -2272,7 +2064,7 @@ PR_API int32_t PR_CALL pr_create(const pr_video_config* video, const pr_audio_co
 
     if (!is_supported_recording_codec(video->codec))
     {
-        set_last_error("NativeRecorder Media Foundation backend currently supports H.264 and HEVC only.");
+        set_last_error("NativeRecorder currently supports H.264 and HEVC only.");
         return PR_E_NOT_AVAILABLE;
     }
 

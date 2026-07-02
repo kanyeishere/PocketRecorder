@@ -27,8 +27,48 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Prepare NativeRecorder dependencies
+        env:
+          VIDEO_CODEC_SDK_URL: ${{ secrets.VIDEO_CODEC_SDK_URL || vars.VIDEO_CODEC_SDK_URL }}
+          FFMPEG_URL: ${{ vars.FFMPEG_URL }}
+        run: .\scripts\Prepare-NativeRecorderDeps.ps1
+
+      - name: Build NativeRecorder
+        run: |
+          msbuild NativeRecorder\NativeRecorder.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:VideoCodecSdkDir="$env:NATIVE_RECORDER_VIDEO_CODEC_SDK_DIR" `
+            /p:FfmpegRoot="$env:NATIVE_RECORDER_FFMPEG_ROOT" `
+            /p:AmfSdkDir="$env:NATIVE_RECORDER_AMF_DIR" `
+            /v:minimal
+
       - name: Build Plugin
-        run: dotnet build --configuration Release /p:DALAMUD_HOME="${{ github.workspace }}\lib"
+        run: |
+          dotnet build --configuration Release `
+            /p:Platform=x64 `
+            /p:DALAMUD_HOME="${{ github.workspace }}\lib" `
+            /p:NativeRecorderFfmpegRoot="$env:NATIVE_RECORDER_FFMPEG_ROOT"
+
+      - name: Verify packaged native files
+        run: |
+          $outputDir = "bin\x64\Release"
+          $requiredFiles = @(
+            "NativeRecorder.abi9.dll",
+            "avformat-*.dll",
+            "avcodec-*.dll",
+            "avutil-*.dll",
+            "swresample-*.dll"
+          )
+          foreach ($pattern in $requiredFiles) {
+            $matches = @(Get-ChildItem $outputDir -Filter $pattern -File)
+            if ($matches.Count -eq 0) {
+              throw "Required native package file missing: $outputDir\$pattern"
+            }
+          }
 
       - name: Store Build Artifacts
         uses: actions/upload-artifact@v4

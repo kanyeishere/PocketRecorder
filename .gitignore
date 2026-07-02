@@ -2,6 +2,12 @@
 bin/
 obj/
 NativeRecorder/build/
+!lib/native/
+!lib/native/**
+lib/native/NativeRecorderDeps.props
+lib/native/_*/
+lib/native/*.zip
+lib/native/*.7z
 
 ## Visual Studio / Rider
 .vs/

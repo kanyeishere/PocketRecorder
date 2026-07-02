@@ -1,0 +1,11 @@
+frameNumber : 1
+meHintCountsPerBlock[0].numCandsPerBlk16x16 : 1
+meHintCountsPerBlock[0].numCandsPerBlk8x16 : 0
+meHintCountsPerBlock[0].numCandsPerBlk16x8 : 0
+meHintCountsPerBlock[0].numCandsPerBlk8x8 : 0
+meHintCountsPerBlock[1].numCandsPerBlk16x16 : 1
+meHintCountsPerBlock[1].numCandsPerBlk8x16 : 0
+meHintCountsPerBlock[1].numCandsPerBlk16x8 : 0
+meHintCountsPerBlock[1].numCandsPerBlk8x8 : 0
+externalMEHintFile : HEVC_IBP_BFrameHints.dat
+

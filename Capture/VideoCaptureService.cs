@@ -39,7 +39,6 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private IntPtr _nv12ShaderDevice;
     private readonly IntPtr[] _nv12ReadbackBuffers = new IntPtr[StagingTextureCount];
     private readonly int[] _nv12ReadbackSlotStates = new int[StagingTextureCount];
-    private ID3D11DeviceContext* _nv12DrainContext;
     private readonly IntPtr[] _nativeSharedTextures = new IntPtr[NativeSharedTextureCount];
     private readonly IntPtr[] _nativeSharedMutexes = new IntPtr[NativeSharedTextureCount];
     private readonly IntPtr[] _nativeSharedHandles = new IntPtr[NativeSharedTextureCount];
@@ -88,6 +87,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private int _errorCount;
     private int _consecutiveBlackFrames;
     private bool _presentHookEnabled;
+    private int _nv12StopCleanupRequested;
     private bool _diagnosedFirstFrame;
     private bool _diagnosedReadbackFrame;
     private bool _loggedBackBufferSuccess;
@@ -232,6 +232,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         _lockedOutputPixelFormat = null;
         _presentDetourDepth = 0;
         _stopStarted = 0;
+        _nv12StopCleanupRequested = 0;
         Array.Clear(_nv12ReadbackSlotStates);
         Array.Clear(_nativeSharedSlotStates);
         _nv12PerfStats.Reset();
@@ -258,6 +259,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             return;
 
         RequestStop();
+        WaitForNv12StopCleanup();
 
         // 卸载 hook
         if (_presentHook != null)
@@ -283,6 +285,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     public void RequestStop()
     {
         _capturing = false;
+        RequestNv12StopCleanup();
     }
 
     // ──────────────────────────────────────────────────────────
@@ -369,6 +372,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                 if (_errorCount <= 5 || _errorCount % 100 == 0)
                     Plugin.Log!.Warning($"[Video] Capture in Present hook failed (#{_errorCount}): {ex.Message}");
             }
+        }
+        else
+        {
+            TryDrainNv12StopCleanup(swapChainPtr);
         }
 
         try

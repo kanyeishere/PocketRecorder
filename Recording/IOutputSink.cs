@@ -9,6 +9,9 @@ namespace Recorder.Recording;
 /// </summary>
 internal interface IOutputSink : IDisposable
 {
+    /// <summary>输出链路发生不可恢复错误，录制服务应主动停止。</summary>
+    event Action<IOutputSink, string>? FatalError;
+
     /// <summary>是否支持音频输入。</summary>
     bool SupportsAudio { get; }
 

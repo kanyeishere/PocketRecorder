@@ -54,6 +54,7 @@ internal sealed class FFmpegWriter : IOutputSink
     public bool SupportsAudio => _hasAudio;
     public bool IsVideoBackedUp => _videoQueue != null && _videoQueue.Count >= MaxQueueSize / 2;
     public bool IsVideoUnderPressure => IsVideoBackedUp || IsWritePressureActive();
+    public event Action<IOutputSink, string>? FatalError;
 
     public FFmpegWriter(string ffmpegPath, int videoBitrate, string videoCodec, string preset)
     {
@@ -346,9 +347,14 @@ internal sealed class FFmpegWriter : IOutputSink
                 if (!frameStored)
                     frameToWrite.ReturnBuffer();
                 if (_stopped)
+                {
                     Plugin.Log!.Info($"[FFmpeg] Video writer stopped while writing: {ex.Message}");
+                }
                 else
+                {
                     Plugin.Log!.Warning($"[FFmpeg] Video write failed: {ex.Message}");
+                    NotifyFatalError($"FFmpeg video write failed: {ex.Message}");
+                }
                 break;
             }
         }
@@ -645,7 +651,7 @@ internal sealed class FFmpegWriter : IOutputSink
         _finalVideoDuration = finalVideoDuration;
         _stopped = true;
 
-        Plugin.Log!.Info($"[FFmpeg] Stopping... input={_inputFrameCount}, output={_frameCount}, tailDuplicates={_tailDuplicateFrameCount}, dropped={_droppedFrameCount}, staleDrops={_staleFrameDropCount}, nativeCopies={_nativeManagedCopyFrameCount}, audioPackets={_audioPackets}");
+        Plugin.Log!.Info($"[FFmpeg] Stopping... input={Volatile.Read(ref _inputFrameCount)}, output={Volatile.Read(ref _frameCount)}, tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, dropped={Volatile.Read(ref _droppedFrameCount)}, staleDrops={Volatile.Read(ref _staleFrameDropCount)}, nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, audioPackets={Volatile.Read(ref _audioPackets)}");
 
         // 完成视频队列
         try { _videoQueue?.CompleteAdding(); } catch { }
@@ -688,6 +694,15 @@ internal sealed class FFmpegWriter : IOutputSink
     {
         try { _stdin?.Flush(); } catch { }
         try { _stdin?.Close(); } catch { }
+    }
+
+    private void NotifyFatalError(string message)
+    {
+        try { FatalError?.Invoke(this, message); }
+        catch (Exception ex)
+        {
+            Plugin.Log!.Warning($"[FFmpeg] Fatal error callback failed: {ex.Message}");
+        }
     }
 
     public void Dispose()
