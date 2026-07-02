@@ -277,6 +277,23 @@ foreach ($runtimeDependencyName in $runtimeDependencyNames.Keys) {
     Copy-Item -Path $runtimeDependency.FullName -Destination (Join-Path $prefixDir "bin\$runtimeDependencyName") -Force
 }
 
+foreach ($relativePath in @("share", "lib\pkgconfig", "include\libavdevice", "include\libavfilter", "include\libswscale")) {
+    $extraPath = Join-Path $prefixDir $relativePath
+    if (Test-Path $extraPath) {
+        Remove-Item -Recurse -Force $extraPath
+    }
+}
+
+foreach ($pattern in @("avdevice-*.dll", "avfilter-*.dll", "swscale-*.dll", "*.lib")) {
+    Get-ChildItem (Join-Path $prefixDir "bin") -Filter $pattern -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+}
+
+foreach ($pattern in @("*.def", "*.exp", "*.dll.a", "avdevice.lib", "avfilter.lib", "swscale.lib")) {
+    Get-ChildItem (Join-Path $prefixDir "lib") -Filter $pattern -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+}
+
 foreach ($licenseName in @("LICENSE.md", "COPYING.LGPLv2.1", "COPYING.LGPLv3", "COPYING.GPLv2", "COPYING.GPLv3")) {
     $licensePath = Join-Path $SourceDir $licenseName
     if (Test-Path $licensePath) {

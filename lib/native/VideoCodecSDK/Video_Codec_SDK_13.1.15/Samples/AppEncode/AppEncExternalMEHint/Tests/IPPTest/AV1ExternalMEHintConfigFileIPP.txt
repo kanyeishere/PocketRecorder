@@ -1,9 +1,0 @@
-frameNumber : 1
-meHintCountsPerBlock[0].numCandsPerSb : 1
-meHintCountsPerBlock[1].numCandsPerSb : 0
-externalMEHintFile : AV1_IPP_Frame1Hints.dat
-
-frameNumber : 2
-meHintCountsPerBlock[0].numCandsPerSb : 1
-meHintCountsPerBlock[1].numCandsPerSb : 0
-externalMEHintFile : AV1_IPP_Frame2Hints.dat
