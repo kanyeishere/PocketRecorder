@@ -78,11 +78,30 @@ jobs:
 
       - name: Build Plugin
         run: |
+          $version = "${{ steps.version.outputs.version }}"
           dotnet build --configuration Release `
             /p:Platform=x64 `
+            /p:Version="$version" `
+            /p:AssemblyVersion="$version" `
+            /p:FileVersion="$version" `
+            /p:InformationalVersion="$version" `
             /p:DALAMUD_HOME="${{ github.workspace }}\lib" `
             /p:NativeRecorderFfmpegRoot="$env:NATIVE_RECORDER_FFMPEG_ROOT" `
             /p:NativeRecorderAutoBuild=false
+
+      - name: Verify plugin assembly version
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $assemblyPath = "bin\x64\Release\PocketRecorder.dll"
+          if (-not (Test-Path $assemblyPath)) {
+            throw "Plugin assembly not found: $assemblyPath"
+          }
+
+          $actualVersion = [System.Reflection.AssemblyName]::GetAssemblyName($assemblyPath).Version.ToString()
+          Write-Host "PocketRecorder.dll assembly version: $actualVersion"
+          if ($actualVersion -ne $version) {
+            throw "Plugin assembly version '$actualVersion' does not match release version '$version'."
+          }
 
       - name: Verify packaged native files
         run: |
