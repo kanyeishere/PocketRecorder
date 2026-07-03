@@ -1,4 +1,5 @@
 using Dalamud.Plugin.Services;
+using OmenTools.OmenService;
 using Recorder.Capture;
 using Recorder.Diagnostics;
 using System;
@@ -26,6 +27,7 @@ internal sealed class RecordingService : IDisposable
     private RecordingBackendPlan? _backendPlan;
     private readonly RecordingBackendSelector _backendSelector;
     private readonly RecordingFinalizer _finalizer;
+    private long _lastNvencDriverToastTicks;
 
     private int _sessionId;
     private RecordingLifecycle _lifecycle = RecordingLifecycle.Idle;
@@ -360,6 +362,7 @@ internal sealed class RecordingService : IDisposable
                 RecordingDiagnosticLog.WriteIfEnabled(
                     backendPlan.Backend.DisplayName,
                     $"backend failed before start, fallback=FFmpeg rawvideo, exception={ex}");
+                NotifyUserForActionableNativeFailure(ex);
                 SwitchToFFmpegFallback(request.SessionId, ex.Message);
                 return;
             }
@@ -551,6 +554,53 @@ internal sealed class RecordingService : IDisposable
 
         AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", "switched capture to FFmpeg fallback; D3D11 texture preference disabled");
         RecordingDiagnosticLog.WriteIfEnabled("Record", "switched capture to FFmpeg fallback; D3D11 texture preference disabled");
+    }
+
+    private void NotifyUserForActionableNativeFailure(Exception ex)
+    {
+        string failureText = ex.ToString();
+        if (!IsNvencDriverVersionFailure(failureText))
+            return;
+
+        ShowNvencDriverUpdateToast(throttle: true);
+    }
+
+#if DEBUG
+    internal void ShowNvencDriverUpdateToastForTesting()
+    {
+        ShowNvencDriverUpdateToast(throttle: false);
+    }
+#endif
+
+    private void ShowNvencDriverUpdateToast(bool throttle)
+    {
+        long nowTicks = Stopwatch.GetTimestamp();
+        long previousTicks = Volatile.Read(ref _lastNvencDriverToastTicks);
+        if (throttle &&
+            previousTicks != 0 &&
+            nowTicks - previousTicks < Stopwatch.Frequency * 60)
+        {
+            return;
+        }
+
+        Volatile.Write(ref _lastNvencDriverToastTicks, nowTicks);
+        _ = Plugin.Framework.RunOnFrameworkThread(() =>
+        {
+            try
+            {
+                NotifyHelper.ToastError("Pocket Recorder: NVIDIA 驱动版本过旧，请更新显卡驱动。已自动切换 FFmpeg 录制。");
+            }
+            catch (Exception notifyEx)
+            {
+                _environment.Log.Warning($"[Record] Failed to show NVENC driver toast: {notifyEx.Message}");
+            }
+        });
+    }
+
+    private static bool IsNvencDriverVersionFailure(string text)
+    {
+        return text.Contains("Current Driver Version does not support this NvEncodeAPI version", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("NV_ENC_ERR_INVALID_VERSION", StringComparison.OrdinalIgnoreCase);
     }
 
     public void StopRecording()

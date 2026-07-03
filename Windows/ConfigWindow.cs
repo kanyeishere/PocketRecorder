@@ -267,6 +267,9 @@ internal sealed class ConfigWindow : Window
             config.ForceFFmpegFallbackForTesting = forceFFmpeg;
             SaveConfig(config);
         }
+
+        if (ImGui.Button("本地测试 NVIDIA 驱动提醒", new Vector2(-1, 0)))
+            _plugin.RecordingService.ShowNvencDriverUpdateToastForTesting();
 #endif
 
         ImGui.TextDisabled($"编码模式: {GetEncodingModeText(config)}");
