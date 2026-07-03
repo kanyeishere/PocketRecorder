@@ -20,6 +20,12 @@
     <DalamudLibPath Condition="Exists('$(APPDATA)\XIVLauncherCN\addon\Hooks\dev\')">$(APPDATA)\XIVLauncherCN\addon\Hooks\dev\</DalamudLibPath>
     <DalamudLibPath Condition="'$(DALAMUD_HOME)' != ''">$(DALAMUD_HOME)\</DalamudLibPath>
     <NativeRecorderFfmpegRoot Condition="'$(NativeRecorderFfmpegRoot)' == ''">lib\native\ffmpeg-btbn-lgpl-shared\ffmpeg-master-latest-win64-lgpl-shared</NativeRecorderFfmpegRoot>
+    <NativeRecorderAutoBuild Condition="'$(NativeRecorderAutoBuild)' == '' and '$(OS)' == 'Windows_NT'">true</NativeRecorderAutoBuild>
+    <NativeRecorderAutoBuild Condition="'$(NativeRecorderAutoBuild)' == ''">false</NativeRecorderAutoBuild>
+    <NativeRecorderBuildConfiguration Condition="'$(NativeRecorderBuildConfiguration)' == ''">$(Configuration)</NativeRecorderBuildConfiguration>
+    <NativeRecorderBuildPlatform Condition="'$(NativeRecorderBuildPlatform)' == ''">x64</NativeRecorderBuildPlatform>
+    <NativeRecorderProject>$(MSBuildProjectDirectory)\NativeRecorder\NativeRecorder.vcxproj</NativeRecorderProject>
+    <NativeRecorderOutputDll>$(MSBuildProjectDirectory)\NativeRecorder\bin\$(NativeRecorderBuildPlatform)\$(NativeRecorderBuildConfiguration)\NativeRecorder.dll</NativeRecorderOutputDll>
     <RestoreAdditionalProjectSources>
       https://纯本地引用;
     </RestoreAdditionalProjectSources>
@@ -33,7 +39,7 @@
     <EmbeddedResource Include="PocketRecorder.json" />
     <Content Include="PocketRecorder.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
-    <Content Include="NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll" Condition="Exists('NativeRecorder\bin\x64\$(Configuration)\NativeRecorder.dll')" Link="NativeRecorder.abi12.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(NativeRecorderOutputDll)" Condition="'$(NativeRecorderAutoBuild)' == 'true' or Exists('$(NativeRecorderOutputDll)')" Link="NativeRecorder.abi12.dll" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avformat-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avcodec-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(NativeRecorderFfmpegRoot)\bin\avutil-*.dll" Condition="Exists('$(NativeRecorderFfmpegRoot)\bin')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
@@ -55,6 +61,13 @@
 
   <ItemGroup>
     <ProjectReference Include="OmenTools\OmenTools.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <NativeRecorderBuildInput Include="NativeRecorder\NativeRecorder.vcxproj" />
+    <NativeRecorderBuildInput Include="NativeRecorder\include\**\*.*" />
+    <NativeRecorderBuildInput Include="NativeRecorder\src\**\*.*" />
+    <NativeRecorderBuildInput Include="lib\native\NativeRecorderDeps.props" Condition="Exists('lib\native\NativeRecorderDeps.props')" />
   </ItemGroup>
 
   <ItemGroup>
@@ -91,5 +104,14 @@
       <Private>false</Private>
     </Reference>
   </ItemGroup>
+
+  <Target Name="BuildNativeRecorder"
+          BeforeTargets="PrepareForBuild"
+          Condition="'$(NativeRecorderAutoBuild)' == 'true' and '$(DesignTimeBuild)' != 'true' and Exists('$(NativeRecorderProject)')"
+          Inputs="@(NativeRecorderBuildInput)"
+          Outputs="$(NativeRecorderOutputDll)">
+    <Message Text="Building NativeRecorder: $(NativeRecorderBuildConfiguration)|$(NativeRecorderBuildPlatform)" Importance="high" />
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\Build-NativeRecorder.ps1&quot; -ProjectPath &quot;$(NativeRecorderProject)&quot; -Configuration &quot;$(NativeRecorderBuildConfiguration)&quot; -Platform &quot;$(NativeRecorderBuildPlatform)&quot; -FfmpegRoot &quot;$(FfmpegRoot)&quot; -AmfSdkDir &quot;$(AmfSdkDir)&quot; -VideoCodecSdkDir &quot;$(VideoCodecSdkDir)&quot;" />
+  </Target>
 
 </Project>

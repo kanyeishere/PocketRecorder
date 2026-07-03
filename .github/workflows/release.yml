@@ -81,7 +81,8 @@ jobs:
           dotnet build --configuration Release `
             /p:Platform=x64 `
             /p:DALAMUD_HOME="${{ github.workspace }}\lib" `
-            /p:NativeRecorderFfmpegRoot="$env:NATIVE_RECORDER_FFMPEG_ROOT"
+            /p:NativeRecorderFfmpegRoot="$env:NATIVE_RECORDER_FFMPEG_ROOT" `
+            /p:NativeRecorderAutoBuild=false
 
       - name: Verify packaged native files
         run: |
