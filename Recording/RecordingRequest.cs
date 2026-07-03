@@ -13,6 +13,7 @@ internal sealed record RecordingRequest(
     string VideoCodec,
     string EncoderPreset,
     bool UseHardwareEncoder,
+    bool IncludeOverlay,
     bool ForceFFmpegFallbackForTesting)
 {
     public VideoFormat ToVideoFormat(VideoFrame frame)

@@ -137,6 +137,7 @@ internal sealed class RecordingService : IDisposable
                 config.VideoCodec,
                 config.EncoderPreset,
                 config.UseHardwareEncoder,
+                config.IncludeOverlay,
                 config.EffectiveForceFFmpegFallbackForTesting);
             backendPlan = _backendSelector.SelectInitial(request);
 
@@ -183,6 +184,7 @@ internal sealed class RecordingService : IDisposable
             _gameInterop,
             OnVideoFrame,
             ShouldCaptureVideoFrame);
+        videoCapture.IncludeOverlay = request.IncludeOverlay;
         videoCapture.PreferD3D11TextureFrames = backendPlan.PrefersD3D11TextureFrames;
 
         lock (_sync)
@@ -219,7 +221,7 @@ internal sealed class RecordingService : IDisposable
         }
 
         _environment.Log.Info($"[Record] Preparation started -> {request.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
-        _environment.Log.Info($"[Record] Config: fps={request.TargetFps}, bitrate={request.VideoBitrate}, codec={request.VideoCodec}, preset={request.EncoderPreset}, audio={request.AudioCaptureMode}, hw={request.UseHardwareEncoder}, backend={backendPlan.Backend.DisplayName} ({backendPlan.Reason})");
+        _environment.Log.Info($"[Record] Config: fps={request.TargetFps}, bitrate={request.VideoBitrate}, codec={request.VideoCodec}, preset={request.EncoderPreset}, audio={request.AudioCaptureMode}, hw={request.UseHardwareEncoder}, overlay={request.IncludeOverlay}, backend={backendPlan.Backend.DisplayName} ({backendPlan.Reason})");
         AmdRecordingDiagnosticLog.Write("Record", $"preparation started, startSyncMs={startSw.ElapsedMilliseconds}");
         RecordingStateChanged?.Invoke(true);
         return true;

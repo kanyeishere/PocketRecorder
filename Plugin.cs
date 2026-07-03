@@ -117,7 +117,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         CommandManager.AddHandler(commandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Pocket Recorder: start, end, toggle, status, autorecord on/off/toggle, floating on/off/toggle, fps, bitrate, audio, output, config, help。",
+            HelpMessage = "Pocket Recorder: start, end, toggle, status, autorecord on/off/toggle, floating on/off/toggle, fps, bitrate, audio, overlay, output, config, help。",
         });
     }
 
@@ -177,6 +177,12 @@ public sealed class Plugin : IDalamudPlugin
 
             case "audio":
                 HandleAudioCommand(parts);
+                break;
+
+            case "overlay":
+            case "ui":
+            case "imgui":
+                HandleOverlayCommand(parts);
                 break;
 
             case "output":
@@ -345,7 +351,18 @@ public sealed class Plugin : IDalamudPlugin
 
         Print($"录制状态: {RecordingService.Phase.ToDisplayText()}{elapsed}。");
         Print($"倒计时自动录制: {OnOff(Config.AutoRecordEightPlayerDuty)}。{AutoDutyRecordingService.StatusText}");
-        Print($"参数: {Config.TargetFps} FPS / {Config.VideoBitrate / 1_000_000} Mbps / 声音 {AudioModeText(Config.AudioCaptureMode)}。");
+        Print($"参数: {Config.TargetFps} FPS / {Config.VideoBitrate / 1_000_000} Mbps / 声音 {AudioModeText(Config.AudioCaptureMode)} / 卫月界面 {OnOff(Config.IncludeOverlay)}。");
+    }
+
+    private void HandleOverlayCommand(string[] parts)
+    {
+        HandleSwitchCommand(
+            parts,
+            Config.IncludeOverlay,
+            $"录制卫月界面: {OnOff(Config.IncludeOverlay)}。",
+            "用法: overlay on | off | toggle | status",
+            enabled => Config.IncludeOverlay = enabled,
+            enabled => $"录制卫月界面已{(enabled ? "开启" : "关闭")}，下次录制生效。");
     }
 
     private void HandleSwitchCommand(
@@ -419,7 +436,7 @@ public sealed class Plugin : IDalamudPlugin
         Print("命令: start, end, toggle, status, config, output");
         Print("自动录制: autorecord on/off/toggle/status");
         Print("悬浮按钮: floating on/off/toggle/status");
-        Print("参数: fps 60, bitrate 32, audio game/system/off/status");
+        Print("参数: fps 60, bitrate 32, audio game/system/off/status, overlay on/off/status");
         Print("短命令同样可用: /pktr start, /pktr end");
     }
 

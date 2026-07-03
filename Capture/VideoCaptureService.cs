@@ -109,6 +109,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     public int CurrentWidth { get; private set; }
     public int CurrentHeight { get; private set; }
     public bool PreferD3D11TextureFrames { get; set; }
+    public bool IncludeOverlay { get; set; }
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int PresentDelegate(IntPtr swapChain, uint syncInterval, uint flags);
@@ -157,7 +158,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         {
             _capturing = true;
             _captureMethod = "PresentHook";
-            Plugin.Log!.Info($"[Video] Capture started, targetFps={_targetFps}, method=PresentHook");
+            Plugin.Log!.Info($"[Video] Capture started, targetFps={_targetFps}, method=PresentHook, includeOverlay={IncludeOverlay}");
             return true;
         }
 
@@ -274,31 +275,40 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private int OnPresentDetour(IntPtr swapChainPtr, uint syncInterval, uint flags)
     {
         Interlocked.Increment(ref _presentDetourDepth);
-        if (_capturing)
+        if (_capturing && !IncludeOverlay)
         {
-            try
-            {
-                CaptureBeforePresent(swapChainPtr);
-            }
-            catch (Exception ex)
-            {
-                _errorCount++;
-                if (_errorCount <= 5 || _errorCount % 100 == 0)
-                    Plugin.Log!.Warning($"[Video] Capture in Present hook failed (#{_errorCount}): {ex.Message}");
-            }
+            TryCaptureInPresentHook(swapChainPtr, "before");
         }
-        else
+        else if (!_capturing)
         {
             TryDrainNv12StopCleanup(swapChainPtr);
         }
 
         try
         {
-            return _presentHook!.Original(swapChainPtr, syncInterval, flags);
+            int result = _presentHook!.Original(swapChainPtr, syncInterval, flags);
+            if (_capturing && IncludeOverlay)
+                TryCaptureInPresentHook(swapChainPtr, "after");
+
+            return result;
         }
         finally
         {
             Interlocked.Decrement(ref _presentDetourDepth);
+        }
+    }
+
+    private void TryCaptureInPresentHook(IntPtr swapChainPtr, string phase)
+    {
+        try
+        {
+            CaptureBeforePresent(swapChainPtr);
+        }
+        catch (Exception ex)
+        {
+            _errorCount++;
+            if (_errorCount <= 5 || _errorCount % 100 == 0)
+                Plugin.Log!.Warning($"[Video] Capture {phase} Present failed (#{_errorCount}): {ex.Message}");
         }
     }
 

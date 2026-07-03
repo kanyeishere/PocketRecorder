@@ -185,6 +185,14 @@ internal sealed class ConfigWindow : Window
         }
         SaveConfigAfterItemEdit(config);
 
+        bool includeOverlay = config.IncludeOverlay;
+        if (ImGui.Checkbox("录制卫月界面", ref includeOverlay))
+        {
+            config.IncludeOverlay = includeOverlay;
+            SaveConfig(config);
+        }
+        ImGui.TextDisabled("开启后会包含 Dalamud/ImGui 叠加层，下次录制生效。");
+
         string[] modes = { "自动", "兼容", "高级" };
         int modeIdx = config.VideoCodec == "auto"
             ? (config.UseHardwareEncoder ? 0 : 1)
