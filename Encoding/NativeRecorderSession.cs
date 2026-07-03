@@ -66,11 +66,14 @@ internal sealed class NativeRecorderSession : IDisposable
     }
 }
 
-internal readonly record struct NativeRecorderProbeResult(bool IsAvailable, string Message)
+internal readonly record struct NativeRecorderProbeResult(
+    bool IsAvailable,
+    string Message,
+    string? DiagnosticDetails = null)
 {
-    public static NativeRecorderProbeResult Available(string adapterName)
-        => new(true, string.IsNullOrWhiteSpace(adapterName) ? "NVIDIA D3D11 texture recorder available." : adapterName);
+    public static NativeRecorderProbeResult Available(string message, string? diagnosticDetails = null)
+        => new(true, message, diagnosticDetails);
 
-    public static NativeRecorderProbeResult Unavailable(string reason)
-        => new(false, reason);
+    public static NativeRecorderProbeResult Unavailable(string reason, string? diagnosticDetails = null)
+        => new(false, reason, diagnosticDetails);
 }

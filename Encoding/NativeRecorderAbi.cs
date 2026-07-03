@@ -10,6 +10,9 @@ internal unsafe delegate int PrGetAbiVersion();
 internal unsafe delegate int PrProbe(ref NativeProbeInfo info);
 
 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+internal unsafe delegate int PrGetDiagnosticsReport(byte* buffer, int bufferSize);
+
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 internal unsafe delegate int PrCreate(ref NativeVideoConfig video, ref NativeAudioConfig audio, out IntPtr recorder);
 
 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]

@@ -17,20 +17,33 @@ internal sealed class RecordingBackendSelector
 
     public RecordingBackendPlan SelectInitial(RecordingRequest request)
     {
+        string? nativeRecorderProbeReason = null;
+
         foreach (IRecordingBackend backend in EnumeratePreferredBackends())
         {
             RecordingBackendProbeResult probe = backend.Probe(request);
             if (probe.IsAvailable)
-                return new RecordingBackendPlan(backend, probe);
+            {
+                string? nativeProbeReason = backend.Id == _nativeRecorder.Id
+                    ? probe.Reason
+                    : nativeRecorderProbeReason;
+                return new RecordingBackendPlan(backend, probe, nativeProbeReason);
+            }
 
             if (backend.Id == _nativeRecorder.Id)
+            {
+                nativeRecorderProbeReason = probe.DiagnosticDetails ?? probe.Reason;
                 _log.Info($"[Record] NativeRecorder unavailable: {probe.Reason}");
+            }
         }
 
-        return SelectFFmpeg(request, "no preferred backend available");
+        return SelectFFmpeg(request, "no preferred backend available", nativeRecorderProbeReason);
     }
 
-    public RecordingBackendPlan SelectFFmpeg(RecordingRequest request, string reason)
+    public RecordingBackendPlan SelectFFmpeg(
+        RecordingRequest request,
+        string reason,
+        string? nativeRecorderProbeReason = null)
     {
         RecordingBackendProbeResult probe = _ffmpeg.Probe(request);
         string probeReason = string.IsNullOrWhiteSpace(reason)
@@ -38,7 +51,8 @@ internal sealed class RecordingBackendSelector
             : $"{reason}; {probe.Reason}";
         return new RecordingBackendPlan(
             _ffmpeg,
-            probe with { Reason = probeReason });
+            probe with { Reason = probeReason },
+            nativeRecorderProbeReason);
     }
 
     private IEnumerable<IRecordingBackend> EnumeratePreferredBackends()

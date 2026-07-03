@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -38,8 +40,10 @@ internal static class AmdRecordingDiagnosticLog
         => !string.IsNullOrWhiteSpace(codec) &&
            codec.EndsWith("_amf", StringComparison.OrdinalIgnoreCase);
 
-    public static bool IsAmdRelevant(string? codec, string? nativeReason)
-        => IsAmdCodec(codec) || ContainsAmdMarker(nativeReason);
+    public static bool IsAmdRelevant(string? codec, string? nativeReason, string? selectedBackendReason = null)
+        => IsAmdCodec(codec) ||
+           ContainsAmdMarker(nativeReason) ||
+           ContainsAmdMarker(selectedBackendReason);
 
     public static void StartSession(
         int sessionId,
@@ -49,16 +53,29 @@ internal static class AmdRecordingDiagnosticLog
         string encoderPreset,
         bool useHardwareEncoder,
         AudioCaptureMode audioCaptureMode,
+        bool includeOverlay,
+        bool forceFfmpegFallback,
         bool preferNativeRecorder,
-        string nativeReason)
+        string selectedBackendReason,
+        string? nativeRecorderProbeReason)
     {
-        string[] headerLines =
-        [
+        string effectiveNativeProbeReason = string.IsNullOrWhiteSpace(nativeRecorderProbeReason)
+            ? selectedBackendReason
+            : nativeRecorderProbeReason;
+
+        var headerLines = new List<string>
+        {
             $"sessionId={sessionId}",
+            $"pluginVersion={Assembly.GetExecutingAssembly().GetName().Version}",
+            $"runtime={RuntimeInformation.FrameworkDescription}, os={RuntimeInformation.OSDescription}, processArch={RuntimeInformation.ProcessArchitecture}",
             $"requestedCodec={requestedCodec}, preset={encoderPreset}, bitrate={videoBitrate}, fps={targetFps}",
             $"hardware={useHardwareEncoder}, audio={audioCaptureMode}, preferNative={preferNativeRecorder}",
-            $"nativeProbe={nativeReason}",
-        ];
+            $"captureConfig=includeOverlay={includeOverlay}, forceFFmpegFallback={forceFfmpegFallback}",
+            $"nativeProbe={effectiveNativeProbeReason}",
+        };
+
+        if (!string.Equals(selectedBackendReason, effectiveNativeProbeReason, StringComparison.Ordinal))
+            headerLines.Add($"selectedBackendReason={selectedBackendReason}");
 
         try
         {
@@ -66,10 +83,10 @@ internal static class AmdRecordingDiagnosticLog
             {
                 _logPath = null;
                 _pendingSessionId = sessionId;
-                _pendingHeaderLines = headerLines;
+                _pendingHeaderLines = headerLines.ToArray();
                 SessionLines.Clear();
 
-                if (!IsAmdRelevant(requestedCodec, nativeReason))
+                if (!IsAmdRelevant(requestedCodec, effectiveNativeProbeReason, selectedBackendReason))
                     return;
 
                 StartLogNoLock(sessionId, "recording start matched AMD/AMF");

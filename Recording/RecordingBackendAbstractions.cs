@@ -26,18 +26,22 @@ internal sealed record RecordingBackendCapabilities(
     bool AcceptsBgra,
     bool SupportsAudio);
 
-internal readonly record struct RecordingBackendProbeResult(bool IsAvailable, string Reason)
+internal readonly record struct RecordingBackendProbeResult(
+    bool IsAvailable,
+    string Reason,
+    string? DiagnosticDetails = null)
 {
-    public static RecordingBackendProbeResult Available(string reason)
-        => new(true, reason);
+    public static RecordingBackendProbeResult Available(string reason, string? diagnosticDetails = null)
+        => new(true, reason, diagnosticDetails);
 
-    public static RecordingBackendProbeResult Unavailable(string reason)
-        => new(false, reason);
+    public static RecordingBackendProbeResult Unavailable(string reason, string? diagnosticDetails = null)
+        => new(false, reason, diagnosticDetails);
 }
 
 internal sealed record RecordingBackendPlan(
     IRecordingBackend Backend,
-    RecordingBackendProbeResult Probe)
+    RecordingBackendProbeResult Probe,
+    string? NativeRecorderProbeReason = null)
 {
     public string PreparingText => Backend.PreparingText;
     public bool PrefersD3D11TextureFrames => Backend.PrefersD3D11TextureFrames;

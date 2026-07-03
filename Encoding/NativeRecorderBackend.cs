@@ -21,6 +21,7 @@ internal static unsafe class NativeRecorderBackend
 
     private static PrGetAbiVersion? _getAbiVersion;
     private static PrProbe? _probe;
+    private static PrGetDiagnosticsReport? _getDiagnosticsReport;
     private static PrCreate? _create;
     private static PrSubmitD3D11SharedTexture? _submitD3D11SharedTexture;
     private static PrSubmitAudio? _submitAudio;
@@ -41,27 +42,52 @@ internal static unsafe class NativeRecorderBackend
         lock (Sync)
         {
             if (!EnsureLoadedNoLock())
-                return NativeRecorderProbeResult.Unavailable(_loadError ?? "NativeRecorder.dll was not found.");
+            {
+                string reason = _loadError ?? "NativeRecorder.dll was not found.";
+                return NativeRecorderProbeResult.Unavailable(reason, BuildManagedDiagnostics(reason));
+            }
 
             try
             {
                 int abi = _getAbiVersion!.Invoke();
                 if (abi != ExpectedAbiVersion)
-                    return NativeRecorderProbeResult.Unavailable($"NativeRecorder ABI mismatch: expected {ExpectedAbiVersion}, got {abi}.");
+                {
+                    string reason = $"NativeRecorder ABI mismatch: expected {ExpectedAbiVersion}, got {abi}.";
+                    return NativeRecorderProbeResult.Unavailable(reason, BuildManagedDiagnostics(reason));
+                }
 
                 NativeProbeInfo info = default;
                 int hr = _probe!(ref info);
                 if (hr != 0)
-                    return NativeRecorderProbeResult.Unavailable($"NativeRecorder probe failed: 0x{hr:X8}.");
+                {
+                    string reason = $"NativeRecorder probe failed: 0x{hr:X8}.";
+                    return NativeRecorderProbeResult.Unavailable(reason, BuildProbeDiagnostics(abi, info, reason));
+                }
+
+                string adapterName = NativeString(info.AdapterName, 128);
+                string nativeMessage = NativeString(info.Message, 256);
 
                 if (info.IsSupportedAdapter == 0 || info.SupportsD3D11TextureInput == 0)
-                    return NativeRecorderProbeResult.Unavailable(NativeString(info.Message, 256));
+                {
+                    string reason = string.IsNullOrWhiteSpace(nativeMessage)
+                        ? "NativeRecorder probe reported unavailable."
+                        : nativeMessage;
+                    return NativeRecorderProbeResult.Unavailable(
+                        reason,
+                        BuildProbeDiagnostics(abi, info, reason, adapterName, nativeMessage));
+                }
 
-                return NativeRecorderProbeResult.Available(NativeString(info.AdapterName, 128));
+                string availableReason = string.IsNullOrWhiteSpace(adapterName)
+                    ? "NativeRecorder D3D11 texture recorder available."
+                    : adapterName;
+                return NativeRecorderProbeResult.Available(
+                    availableReason,
+                    BuildProbeDiagnostics(abi, info, nativeMessage, adapterName, nativeMessage));
             }
             catch (Exception ex)
             {
-                return NativeRecorderProbeResult.Unavailable($"NativeRecorder probe exception: {ex.Message}");
+                string reason = $"NativeRecorder probe exception: {ex.Message}";
+                return NativeRecorderProbeResult.Unavailable(reason, BuildManagedDiagnostics(reason));
             }
         }
     }
@@ -213,6 +239,7 @@ internal static unsafe class NativeRecorderBackend
 
             _loaded = true;
             _loadError = null;
+            TryGetExport("pr_get_diagnostics_report", out _getDiagnosticsReport);
             Plugin.Log?.Info($"[NativeRecorder] Loaded native DLL: {candidate} (ABI {ExpectedAbiVersion}, NvEncoderD3D11/libavformat preferred, AMF/libavformat AMD path available)");
             return true;
         }
@@ -249,6 +276,86 @@ internal static unsafe class NativeRecorderBackend
 
         return System.Text.Encoding.UTF8.GetString(bytes, length);
     }
+
+    private static string BuildProbeDiagnostics(
+        int abi,
+        NativeProbeInfo info,
+        string reason,
+        string? adapterName = null,
+        string? nativeMessage = null)
+    {
+        adapterName ??= NativeString(info.AdapterName, 128);
+        nativeMessage ??= NativeString(info.Message, 256);
+
+        var parts = new List<string>
+        {
+            $"abi={abi}/{ExpectedAbiVersion}",
+            $"adapter={ValueOrNone(adapterName)}",
+            $"isSupportedAdapter={info.IsSupportedAdapter}",
+            $"supportsD3D11TextureInput={info.SupportsD3D11TextureInput}",
+            $"message={ValueOrNone(nativeMessage)}",
+        };
+
+        string nativeReport = GetNativeDiagnosticsReportNoLock();
+        if (!string.IsNullOrWhiteSpace(nativeReport))
+            parts.Add($"nativeReport={nativeReport}");
+
+        string lastStatus = GetLastStatus();
+        if (!string.IsNullOrWhiteSpace(lastStatus) &&
+            !string.Equals(lastStatus, nativeMessage, StringComparison.Ordinal))
+        {
+            parts.Add($"lastStatus={lastStatus}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(reason) &&
+            !string.Equals(reason, nativeMessage, StringComparison.Ordinal))
+        {
+            parts.Add($"reason={reason}");
+        }
+
+        return string.Join("; ", parts);
+    }
+
+    private static string BuildManagedDiagnostics(string reason)
+    {
+        var parts = new List<string>
+        {
+            $"abi=not-loaded/{ExpectedAbiVersion}",
+            $"reason={ValueOrNone(reason)}",
+        };
+
+        string nativeReport = GetNativeDiagnosticsReportNoLock();
+        if (!string.IsNullOrWhiteSpace(nativeReport))
+            parts.Add($"nativeReport={nativeReport}");
+
+        string lastStatus = GetLastStatus();
+        if (!string.IsNullOrWhiteSpace(lastStatus))
+            parts.Add($"lastStatus={lastStatus}");
+
+        return string.Join("; ", parts);
+    }
+
+    private static string GetNativeDiagnosticsReportNoLock()
+    {
+        if (_getDiagnosticsReport == null)
+            return string.Empty;
+
+        byte[] buffer = new byte[4096];
+        fixed (byte* bufferPtr = buffer)
+        {
+            if (_getDiagnosticsReport(bufferPtr, buffer.Length) != 0)
+                return string.Empty;
+        }
+
+        int length = Array.IndexOf(buffer, (byte)0);
+        if (length < 0)
+            length = buffer.Length;
+
+        return System.Text.Encoding.UTF8.GetString(buffer, 0, length);
+    }
+
+    private static string ValueOrNone(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "<none>" : value;
 
     private static int ToNativePixelFormat(VideoPixelFormat pixelFormat)
     {

@@ -31,8 +31,8 @@ internal sealed class NativeRecorderRecordingBackend : IRecordingBackend
 
         NativeRecorderProbeResult probe = NativeRecorderBackend.Probe();
         return probe.IsAvailable
-            ? RecordingBackendProbeResult.Available(probe.Message)
-            : RecordingBackendProbeResult.Unavailable(probe.Message);
+            ? RecordingBackendProbeResult.Available(probe.Message, probe.DiagnosticDetails)
+            : RecordingBackendProbeResult.Unavailable(probe.Message, probe.DiagnosticDetails);
     }
 
     public RecordingBackendStartResult Start(

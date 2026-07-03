@@ -164,8 +164,11 @@ internal sealed class RecordingService : IDisposable
             request.EncoderPreset,
             request.UseHardwareEncoder,
             request.AudioCaptureMode,
+            request.IncludeOverlay,
+            request.ForceFFmpegFallbackForTesting,
             backendPlan.PrefersD3D11TextureFrames,
-            backendPlan.Reason);
+            backendPlan.Reason,
+            backendPlan.NativeRecorderProbeReason);
 
         if (request.AudioCaptureMode != AudioCaptureMode.Off)
         {

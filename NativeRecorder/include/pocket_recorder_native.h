@@ -72,6 +72,7 @@ typedef struct pr_audio_config
 
 PR_API int32_t PR_CALL pr_get_abi_version(void);
 PR_API int32_t PR_CALL pr_probe(pr_probe_info* info);
+PR_API int32_t PR_CALL pr_get_diagnostics_report(char* buffer, int32_t buffer_size);
 PR_API int32_t PR_CALL pr_create(const pr_video_config* video, const pr_audio_config* audio, pr_recorder_t** recorder);
 PR_API int32_t PR_CALL pr_submit_d3d11_texture(
     pr_recorder_t* recorder,

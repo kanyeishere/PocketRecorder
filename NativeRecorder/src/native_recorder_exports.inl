@@ -164,6 +164,26 @@ PR_API int32_t PR_CALL pr_probe(pr_probe_info* info)
     return PR_OK;
 }
 
+PR_API int32_t PR_CALL pr_get_diagnostics_report(char* buffer, int32_t buffer_size)
+{
+    if (buffer == nullptr || buffer_size <= 0)
+        return PR_E_INVALID_ARGUMENT;
+
+    HRESULT hr = ensure_thread_com_initialized();
+    std::string report;
+    if (FAILED(hr))
+        report = "com=failed: " + hresult_to_string(hr) + "; ";
+    else
+        report = "com=ok; ";
+
+    report += native_runtime_report();
+    report += "; ";
+    report += dxgi_adapter_report();
+
+    copy_text(buffer, static_cast<size_t>(buffer_size), report.c_str());
+    return PR_OK;
+}
+
 PR_API int32_t PR_CALL pr_create(const pr_video_config* video, const pr_audio_config* audio, pr_recorder_t** recorder)
 {
     if (video == nullptr || recorder == nullptr)

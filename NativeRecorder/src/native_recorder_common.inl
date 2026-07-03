@@ -193,6 +193,96 @@ std::string hex_uint32(uint32_t value)
     return buffer;
 }
 
+bool nvenc_runtime_present();
+bool amf_runtime_present();
+
+std::string memory_mb(size_t bytes)
+{
+    return std::to_string(static_cast<unsigned long long>(bytes / (1024ull * 1024ull))) + "MB";
+}
+
+std::string dxgi_adapter_report()
+{
+    ComPtr<IDXGIFactory1> factory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr))
+        return "dxgiAdapters=CreateDXGIFactory1 failed: " + hresult_to_string(hr);
+
+    std::string report = "dxgiAdapters=[";
+    bool first = true;
+
+    for (UINT index = 0;; ++index)
+    {
+        ComPtr<IDXGIAdapter1> adapter;
+        hr = factory->EnumAdapters1(index, &adapter);
+        if (hr == DXGI_ERROR_NOT_FOUND)
+            break;
+        if (FAILED(hr))
+        {
+            if (!first)
+                report += " | ";
+            report += "#" + std::to_string(index) + ": EnumAdapters1 failed: " + hresult_to_string(hr);
+            break;
+        }
+
+        DXGI_ADAPTER_DESC1 desc{};
+        hr = adapter->GetDesc1(&desc);
+        if (FAILED(hr))
+        {
+            if (!first)
+                report += " | ";
+            report += "#" + std::to_string(index) + ": GetDesc1 failed: " + hresult_to_string(hr);
+            first = false;
+            continue;
+        }
+
+        UINT output_count = 0;
+        for (;; ++output_count)
+        {
+            ComPtr<IDXGIOutput> output;
+            HRESULT output_hr = adapter->EnumOutputs(output_count, &output);
+            if (output_hr == DXGI_ERROR_NOT_FOUND)
+                break;
+            if (FAILED(output_hr))
+                break;
+        }
+
+        if (!first)
+            report += " | ";
+        first = false;
+
+        report += "#" + std::to_string(index) +
+            ": name=\"" + wide_to_utf8(desc.Description) + "\"" +
+            ", vendor=" + hex_uint32(desc.VendorId) +
+            ", device=" + hex_uint32(desc.DeviceId) +
+            ", subsys=" + hex_uint32(desc.SubSysId) +
+            ", rev=" + std::to_string(desc.Revision) +
+            ", dedicatedVideo=" + memory_mb(desc.DedicatedVideoMemory) +
+            ", dedicatedSystem=" + memory_mb(desc.DedicatedSystemMemory) +
+            ", sharedSystem=" + memory_mb(desc.SharedSystemMemory) +
+            ", outputs=" + std::to_string(output_count) +
+            ", flags=" + hex_uint32(desc.Flags);
+    }
+
+    if (first)
+        report += "<none>";
+
+    report += "]";
+    return report;
+}
+
+std::string native_runtime_report()
+{
+    return std::string("nativeRuntime={") +
+        "abi=" + std::to_string(PR_ABI_VERSION) +
+        ", nvencRuntime=" + (nvenc_runtime_present() ? "present" : "missing") +
+        ", amfRuntime=" + (amf_runtime_present() ? "present" : "missing") +
+        ", avformat=" + std::to_string(avformat_version()) +
+        ", avcodec=" + std::to_string(avcodec_version()) +
+        ", avutil=" + std::to_string(avutil_version()) +
+        "}";
+}
+
 std::string texture_desc_to_string(const D3D11_TEXTURE2D_DESC& desc)
 {
     return std::to_string(desc.Width) + "x" + std::to_string(desc.Height) +

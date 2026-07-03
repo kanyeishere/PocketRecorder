@@ -58,7 +58,7 @@ internal sealed class FFmpegRecordingBackend : IRecordingBackend
             AmdRecordingDiagnosticLog.WriteForAmdCodec(
                 encoder.Codec,
                 "FFmpeg",
-                $"selected encoder codec={encoder.Codec}, preset={encoder.Preset}, isHardware={encoder.IsHardware}, reason={encoder.Reason}, firstFrame={DescribeFrame(frame)}");
+                $"selected encoder codec={encoder.Codec}, preset={encoder.Preset}, isHardware={encoder.IsHardware}, reason={encoder.Reason}, diagnostics={encoder.DiagnosticDetails}, ffmpegPath={ffmpegPath}, firstFrame={DescribeFrame(frame)}");
 
             writer = new FFmpegWriter(
                 ffmpegPath,
