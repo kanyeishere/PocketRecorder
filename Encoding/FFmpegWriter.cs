@@ -4,6 +4,7 @@ using Recorder.Recording;
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Threading;
@@ -33,6 +34,7 @@ internal sealed class FFmpegWriter : IOutputSink
     private int _staleFrameDropCount;
     private int _nativeManagedCopyFrameCount;
     private int _audioPackets;
+    private int _droppedAudioPacketCount;
     private TimeSpan? _finalVideoDuration;
     private long _managedNativeCopyUntilTicks;
 
@@ -42,6 +44,9 @@ internal sealed class FFmpegWriter : IOutputSink
     private BlockingCollection<byte[]>? _audioQueue;
     private Thread? _audioWriterThread;
     private const int MaxQueueSize = 10; // 限制队列深度，避免内存暴涨
+    private const int MaxAudioQueueSize = 100;
+    private const int VideoInputThreadQueueSize = 32;
+    private const int AudioInputThreadQueueSize = 512;
     private const int NativeCopyPressureWindowMs = 1_000;
 
     private readonly string _ffmpegPath;
@@ -79,6 +84,7 @@ internal sealed class FFmpegWriter : IOutputSink
         _staleFrameDropCount = 0;
         _nativeManagedCopyFrameCount = 0;
         _audioPackets = 0;
+        _droppedAudioPacketCount = 0;
         _finalVideoDuration = null;
         _managedNativeCopyUntilTicks = 0;
         _stdinWritePerfStats.Reset();
@@ -96,6 +102,8 @@ internal sealed class FFmpegWriter : IOutputSink
 
         // ── 视频输入：stdin rawvideo ──
         args.Add("-use_wallclock_as_timestamps"); args.Add("1");
+        args.Add("-thread_queue_size"); args.Add(VideoInputThreadQueueSize.ToString(CultureInfo.InvariantCulture));
+        args.Add("-rtbufsize"); args.Add("200M");
         args.Add("-f"); args.Add("rawvideo");
         args.Add("-pix_fmt"); args.Add(GetFFmpegPixelFormat(video.PixelFormat));
         args.Add("-video_size"); args.Add($"{video.Width}x{video.Height}");
@@ -130,6 +138,7 @@ internal sealed class FFmpegWriter : IOutputSink
             args.Add("-f"); args.Add(audioFmt);
             args.Add("-ar"); args.Add($"{audio.SampleRate}");
             args.Add("-ac"); args.Add($"{audio.Channels}");
+            args.Add("-thread_queue_size"); args.Add(AudioInputThreadQueueSize.ToString(CultureInfo.InvariantCulture));
             args.Add("-i"); args.Add($"\\\\.\\pipe\\{pipeName}");
 
             Plugin.Log!.Info($"[FFmpeg] Audio: {audioFmt} {audio.SampleRate}Hz {audio.Channels}ch");
@@ -141,18 +150,19 @@ internal sealed class FFmpegWriter : IOutputSink
         {
             args.Add("-preset"); args.Add(_preset);
         }
-        args.Add("-b:v"); args.Add($"{_videoBitrate}");
+        if (_videoBitrate > 0)
+        {
+            args.Add("-b:v"); args.Add(_videoBitrate.ToString(CultureInfo.InvariantCulture));
+            args.Add("-maxrate"); args.Add(_videoBitrate.ToString(CultureInfo.InvariantCulture));
+            args.Add("-bufsize"); args.Add(GetVbvBufferSizeArgument(_videoBitrate, _videoFps));
+        }
+        args.Add("-g"); args.Add(Math.Max(1, _videoFps * 2).ToString(CultureInfo.InvariantCulture));
         if (IsSoftwareX26x(_videoCodec))
         {
             args.Add("-pix_fmt"); args.Add("yuv420p");
             args.Add("-threads"); args.Add(GetSoftwareEncoderThreadCount().ToString());
-            if (_videoCodec.Equals("libx264", StringComparison.OrdinalIgnoreCase))
-            {
-                args.Add("-tune"); args.Add("zerolatency");
-                args.Add("-x264-params"); args.Add("bframes=0:sync-lookahead=0");
-            }
         }
-        args.Add("-rtbufsize"); args.Add("200M");
+        FFmpegEncodingOptions.AddLowLatencyVideoOptions(args, _videoCodec);
         args.Add("-fps_mode"); args.Add("vfr");
 
         // ── 音频编码器 ──
@@ -164,6 +174,7 @@ internal sealed class FFmpegWriter : IOutputSink
         }
 
         // MP4 快速启动
+        args.Add("-flush_packets"); args.Add("0");
         args.Add("-movflags"); args.Add("+faststart");
         args.Add(_outputPath);
 
@@ -178,7 +189,7 @@ internal sealed class FFmpegWriter : IOutputSink
             FileName = _ffmpegPath,
             RedirectStandardInput = true,
             RedirectStandardError = true,
-            RedirectStandardOutput = true,
+            RedirectStandardOutput = false,
             UseShellExecute = false,
             CreateNoWindow = true,
         };
@@ -220,7 +231,7 @@ internal sealed class FFmpegWriter : IOutputSink
 
         if (audio != null)
         {
-            _audioQueue = new BlockingCollection<byte[]>(100);
+            _audioQueue = new BlockingCollection<byte[]>(MaxAudioQueueSize);
             _audioWriterThread = new Thread(AudioWriterLoop)
             {
                 IsBackground = true,
@@ -243,6 +254,14 @@ internal sealed class FFmpegWriter : IOutputSink
             return Math.Max(2, cpuThreads / 2);
 
         return Math.Min(8, Math.Max(4, cpuThreads / 3));
+    }
+
+    private static string GetVbvBufferSizeArgument(int bitrate, int fps)
+    {
+        long safeBitrate = Math.Max(1, bitrate);
+        long safeFps = Math.Max(1, fps);
+        long threeFrameBufferBits = Math.Max(1, safeBitrate / safeFps * 3);
+        return threeFrameBufferBits.ToString(CultureInfo.InvariantCulture);
     }
 
     private static string GetFFmpegPixelFormat(VideoPixelFormat pixelFormat)
@@ -289,7 +308,7 @@ internal sealed class FFmpegWriter : IOutputSink
                 {
                     int copied = Interlocked.Increment(ref _nativeManagedCopyFrameCount);
                     if (copied <= 5 || copied % 300 == 0)
-                        Plugin.Log!.Info($"[FFmpeg] Detached native frame to managed buffer under writer pressure. nativeCopies={copied}");
+                        Plugin.Log!.Info($"[FFmpeg] Detached native frame to managed buffer before enqueue. nativeCopies={copied}");
                 }
             }
             catch (Exception ex)
@@ -345,10 +364,34 @@ internal sealed class FFmpegWriter : IOutputSink
     {
         if (_stopped || _audioQueue == null) return;
 
-        // 非阻塞入队
-        if (!_audioQueue.TryAdd(packet.Data, 0))
+        bool added = false;
+        while (!added)
         {
-            Plugin.Log!.Warning("[FFmpeg] Audio queue full, dropped a packet.");
+            try
+            {
+                added = _audioQueue.TryAdd(packet.Data, 0);
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+
+            if (added)
+                return;
+
+            if (_audioQueue.TryTake(out _))
+            {
+                int dropped = Interlocked.Increment(ref _droppedAudioPacketCount);
+                if (dropped <= 5 || dropped % 100 == 0)
+                    Plugin.Log!.Warning($"[FFmpeg] Audio queue full, dropped oldest packet to catch up. droppedAudio={dropped}");
+            }
+            else
+            {
+                int dropped = Interlocked.Increment(ref _droppedAudioPacketCount);
+                if (dropped <= 5 || dropped % 100 == 0)
+                    Plugin.Log!.Warning($"[FFmpeg] Audio queue full, dropped incoming packet. droppedAudio={dropped}");
+                return;
+            }
         }
     }
 
@@ -407,7 +450,7 @@ internal sealed class FFmpegWriter : IOutputSink
         _stdinWritePerfStats.FlushIfAny();
         _nativeSnapshotPerfStats.FlushIfAny();
 
-        Plugin.Log!.Info($"[FFmpeg] Video writer thread exiting. input={_inputFrameCount}, output={_frameCount}, tailDuplicates={_tailDuplicateFrameCount}, dropped={_droppedFrameCount}, staleDrops={_staleFrameDropCount}, nativeCopies={_nativeManagedCopyFrameCount}");
+        Plugin.Log!.Info($"[FFmpeg] Video writer thread exiting. input={_inputFrameCount}, output={_frameCount}, tailDuplicates={_tailDuplicateFrameCount}, dropped={_droppedFrameCount}, staleDrops={_staleFrameDropCount}, nativeCopies={_nativeManagedCopyFrameCount}, droppedAudio={_droppedAudioPacketCount}");
     }
 
     public bool WaitForFirstVideoFrameWritten(int timeoutMs)
@@ -455,15 +498,12 @@ internal sealed class FFmpegWriter : IOutputSink
             _tailDuplicateFrameCount++;
 
         if (_frameCount % 300 == 0)
-            Plugin.Log!.Info($"[FFmpeg] Written {_frameCount} video frames (input={_inputFrameCount}, tailDuplicates={_tailDuplicateFrameCount}, dropped={_droppedFrameCount}, staleDrops={_staleFrameDropCount}, nativeCopies={_nativeManagedCopyFrameCount}), {_audioPackets} audio packets");
+            Plugin.Log!.Info($"[FFmpeg] Written {_frameCount} video frames (input={_inputFrameCount}, tailDuplicates={_tailDuplicateFrameCount}, dropped={_droppedFrameCount}, staleDrops={_staleFrameDropCount}, nativeCopies={_nativeManagedCopyFrameCount}), {_audioPackets} audio packets, droppedAudio={_droppedAudioPacketCount}");
     }
 
     private bool ShouldDetachNativeFrameBeforeEnqueue(VideoFrame frame)
     {
-        if (!frame.IsNative || _videoQueue == null)
-            return false;
-
-        return _videoQueue.Count > 0 || IsWritePressureActive();
+        return frame.IsNative;
     }
 
     private bool ShouldCoalesceQueuedFrames()
@@ -681,11 +721,11 @@ internal sealed class FFmpegWriter : IOutputSink
         _finalVideoDuration = finalVideoDuration;
         _stopped = true;
 
-        Plugin.Log!.Info($"[FFmpeg] Stopping... input={Volatile.Read(ref _inputFrameCount)}, output={Volatile.Read(ref _frameCount)}, tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, dropped={Volatile.Read(ref _droppedFrameCount)}, staleDrops={Volatile.Read(ref _staleFrameDropCount)}, nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, audioPackets={Volatile.Read(ref _audioPackets)}");
+        Plugin.Log!.Info($"[FFmpeg] Stopping... input={Volatile.Read(ref _inputFrameCount)}, output={Volatile.Read(ref _frameCount)}, tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, dropped={Volatile.Read(ref _droppedFrameCount)}, staleDrops={Volatile.Read(ref _staleFrameDropCount)}, nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, audioPackets={Volatile.Read(ref _audioPackets)}, droppedAudio={Volatile.Read(ref _droppedAudioPacketCount)}");
         AmdRecordingDiagnosticLog.WriteForAmdCodec(
             _videoCodec,
             "FFmpeg",
-            $"stopping, input={Volatile.Read(ref _inputFrameCount)}, output={Volatile.Read(ref _frameCount)}, tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, dropped={Volatile.Read(ref _droppedFrameCount)}, staleDrops={Volatile.Read(ref _staleFrameDropCount)}, nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, audioPackets={Volatile.Read(ref _audioPackets)}, finalDuration={finalVideoDuration}");
+            $"stopping, input={Volatile.Read(ref _inputFrameCount)}, output={Volatile.Read(ref _frameCount)}, tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, dropped={Volatile.Read(ref _droppedFrameCount)}, staleDrops={Volatile.Read(ref _staleFrameDropCount)}, nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, audioPackets={Volatile.Read(ref _audioPackets)}, droppedAudio={Volatile.Read(ref _droppedAudioPacketCount)}, finalDuration={finalVideoDuration}");
 
         // 完成视频队列
         try { _videoQueue?.CompleteAdding(); } catch { }

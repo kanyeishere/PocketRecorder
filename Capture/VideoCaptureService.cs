@@ -106,7 +106,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private const int NativeSlotPendingDropRelease = 2;
     private const ulong NativeGameWriteKey = 0;
     private const ulong NativeEncoderReadKey = 1;
-    private const uint NativeKeyedMutexTimeoutMs = 0;
+    private const uint NativeKeyedMutexTimeoutMs = 1;
     private const uint D3D11ResourceMiscShared = 0x2;
     private const uint D3D11ResourceMiscSharedKeyedMutex = 0x100;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);

@@ -189,6 +189,7 @@ internal static class FFmpegEncoderSelector
             args.Add("-preset");
             args.Add(preset);
         }
+        FFmpegEncodingOptions.AddLowLatencyVideoOptions(args, codec);
 
         args.Add("-f");
         args.Add("null");

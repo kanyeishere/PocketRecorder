@@ -8,7 +8,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 14;
+    public int Version { get; set; } = 15;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
@@ -30,6 +30,9 @@ public class Configuration : IPluginConfiguration
 
     /// <summary>历史配置项；NativeRecorder 现在固定优先启用，不再暴露 UI 开关。</summary>
     public bool EnableNativeRecorderExperimental { get; set; } = true;
+
+    /// <summary>本地测试开关；启用时强制跳过 NativeRecorder，走 FFmpeg fallback。</summary>
+    public bool ForceFFmpegFallbackForTesting { get; set; } = false;
 
     /// <summary>FFmpeg 可执行文件路径，空则从 PATH 查找。</summary>
     public string FFmpegPath { get; set; } = string.Empty;
@@ -189,6 +192,13 @@ public class Configuration : IPluginConfiguration
                 : AudioCaptureMode.Off;
 
             config.Version = 14;
+            config.Save(pi);
+        }
+
+        if (config.Version < 15)
+        {
+            config.ForceFFmpegFallbackForTesting = false;
+            config.Version = 15;
             config.Save(pi);
         }
 

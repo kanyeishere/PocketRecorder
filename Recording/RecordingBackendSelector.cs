@@ -7,6 +7,12 @@ internal static class RecordingBackendSelector
 {
     public static bool ShouldPreferNativeRecorder(Configuration config, out string reason)
     {
+        if (config.ForceFFmpegFallbackForTesting)
+        {
+            reason = "FFmpeg fallback forced for local testing";
+            return false;
+        }
+
         if (!config.UseHardwareEncoder)
         {
             reason = "hardware encoder disabled";
