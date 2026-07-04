@@ -39,7 +39,6 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private int _audioPackets;
     private long _submitPressureUntilTicks;
     private long _videoFrameDurationHns;
-    private long _firstVideoTimestampHns;
     private long _lastSubmittedVideoTimestampHns;
 
     public NativeRecorderWriter(int videoBitrate, string videoCodec)
@@ -71,7 +70,6 @@ internal sealed class NativeRecorderWriter : IOutputSink
         _audioPackets = 0;
         _submitPressureUntilTicks = 0;
         _videoFrameDurationHns = Math.Max(1, 10_000_000L / _videoFps);
-        _firstVideoTimestampHns = -1;
         _lastSubmittedVideoTimestampHns = -1;
         _firstVideoFrameException = null;
         _firstVideoFrameSubmitted.Reset();
@@ -114,7 +112,10 @@ internal sealed class NativeRecorderWriter : IOutputSink
         }
 
         Plugin.Log!.Info($"[NativeRecorder] Started native D3D11 texture writer: {videoFormat.Width}x{videoFormat.Height}@{_videoFps}fps, codec={_nativeCodecName}, requested={_videoCodec}, audio={audioFormat != null}, bitrate={_videoBitrate}");
-        Plugin.Log!.Info($"[NativeRecorder] Video timing: monotonic capture timestamps, frameDurationHns={_videoFrameDurationHns}");
+        string timingMessage = $"video timing: CFR output timestamps, frameDurationHns={_videoFrameDurationHns}; capture timestamps retained for diagnostics.";
+        Plugin.Log!.Info($"[NativeRecorder] {timingMessage}");
+        RecordingDiagnosticLog.WriteIfEnabled("NativeRecorder", timingMessage);
+        AmdRecordingDiagnosticLog.Write("NativeRecorder", timingMessage);
     }
 
     public void WriteVideoFrame(VideoFrame frame)
@@ -179,7 +180,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
                 long dequeueTicks = Stopwatch.GetTimestamp();
                 long queueWaitTicks = Math.Max(0, dequeueTicks - queuedFrame.EnqueueTicks);
                 bool isFirstSubmittedFrame = Volatile.Read(ref _submittedFrameCount) == 0;
-                long videoTimestampHns = GetMonotonicVideoTimestampHns(frame);
+                long videoTimestampHns = GetConstantFrameVideoTimestampHns();
                 long submitStartTicks = Stopwatch.GetTimestamp();
                 bool accepted = SubmitD3D11TextureWithStartupRetry(frame, videoTimestampHns, isFirstSubmittedFrame);
                 long submitTicks = Stopwatch.GetTimestamp() - submitStartTicks;
@@ -278,23 +279,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
             $"timing diagnostics: {timingSummary}");
     }
 
-    private long GetMonotonicVideoTimestampHns(VideoFrame frame)
-    {
-        long first = Volatile.Read(ref _firstVideoTimestampHns);
-        if (first < 0)
-        {
-            Interlocked.CompareExchange(ref _firstVideoTimestampHns, frame.TimestampHns, -1);
-            first = Volatile.Read(ref _firstVideoTimestampHns);
-        }
-
-        long timestampHns = Math.Max(0, frame.TimestampHns - first);
-
-        long last = Volatile.Read(ref _lastSubmittedVideoTimestampHns);
-        if (last >= 0 && timestampHns <= last)
-            timestampHns = last + 1;
-
-        return timestampHns;
-    }
+    private long GetConstantFrameVideoTimestampHns()
+        => Math.Max(0, (long)Volatile.Read(ref _submittedFrameCount) * _videoFrameDurationHns);
 
     private bool SubmitD3D11TextureWithStartupRetry(VideoFrame frame, long timestampHns, bool isFirstSubmittedFrame)
     {
