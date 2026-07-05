@@ -132,11 +132,31 @@ internal static class ConfigurationMigrator
 
         if (config.Version < 16)
         {
-            config.VideoOutputScaleMode = VideoOutputScaleMode.Original;
+            if (string.IsNullOrWhiteSpace(config.InstallId))
+                config.InstallId = Guid.NewGuid().ToString("N");
+
+            config.EnablePocketBackendTelemetry = true;
             SaveVersion(config, pi, 16);
         }
 
+        if (config.Version < 17)
+        {
+            SaveVersion(config, pi, 17);
+        }
+
+        if (config.Version < 18)
+        {
+            config.VideoOutputScaleMode = VideoOutputScaleMode.Original;
+            SaveVersion(config, pi, 18);
+        }
+
         config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
+
+        if (string.IsNullOrWhiteSpace(config.InstallId))
+        {
+            config.InstallId = Guid.NewGuid().ToString("N");
+            config.Save(pi);
+        }
 
         if (!config.EnableNativeRecorderExperimental)
         {
