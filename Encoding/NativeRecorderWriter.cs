@@ -44,6 +44,12 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private int _lookaheadFrameHitCount;
     private int _lookaheadMissCount;
     private int _audioPackets;
+    private long _nextSourceFrameId;
+    private long _lastSubmittedSourceFrameId;
+    private long _maxSubmittedSourceFrameId;
+    private long _sourceFrameRepeatCount;
+    private long _sourceFrameRegressionCount;
+    private long _maxSourceFrameRegressionDistance;
     private long _submitPressureUntilTicks;
     private long _videoFrameDurationHns;
     private long _videoFrameDurationTicks;
@@ -84,6 +90,12 @@ internal sealed class NativeRecorderWriter : IOutputSink
         _lookaheadFrameHitCount = 0;
         _lookaheadMissCount = 0;
         _audioPackets = 0;
+        _nextSourceFrameId = 0;
+        _lastSubmittedSourceFrameId = 0;
+        _maxSubmittedSourceFrameId = 0;
+        _sourceFrameRepeatCount = 0;
+        _sourceFrameRegressionCount = 0;
+        _maxSourceFrameRegressionDistance = 0;
         _submitPressureUntilTicks = 0;
         _videoFrameDurationHns = Math.Max(1, 10_000_000L / _videoFps);
         _videoFrameDurationTicks = Math.Max(1, Stopwatch.Frequency / _videoFps);
@@ -152,7 +164,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
             return;
         }
 
-        NativeQueuedVideoFrame queuedFrame = new(frame, Stopwatch.GetTimestamp());
+        long sourceFrameId = Interlocked.Increment(ref _nextSourceFrameId);
+        NativeQueuedVideoFrame queuedFrame = new(frame, Stopwatch.GetTimestamp(), sourceFrameId);
         if (_videoQueue.TryEnqueueDropOldest(queuedFrame, droppedFrame => droppedFrame.Frame.ReturnBuffer(), out int droppedCount))
         {
             if (droppedCount > 0)
@@ -192,7 +205,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
     {
         Plugin.Log!.Info("[NativeRecorder] Video writer thread started.");
 
-        VideoFrame? retainedFrame = null;
+        NativeQueuedVideoFrame retainedFrame = default;
+        bool hasRetainedFrame = false;
         long nextOutputFrameIndex = 0;
         long nextOutputDueTicks = 0;
 
@@ -204,9 +218,10 @@ internal sealed class NativeRecorderWriter : IOutputSink
             }
             else
             {
-                retainedFrame = firstQueuedFrame.Frame;
+                retainedFrame = firstQueuedFrame;
+                hasRetainedFrame = true;
                 long firstQueueWaitTicks = Math.Max(0, Stopwatch.GetTimestamp() - firstQueuedFrame.EnqueueTicks);
-                if (SubmitOutputTick(retainedFrame, 0, duplicate: false, recordCaptureTiming: true, firstQueueWaitTicks))
+                if (SubmitOutputTick(retainedFrame.Frame, retainedFrame.SourceFrameId, 0, duplicate: false, recordCaptureTiming: true, firstQueueWaitTicks))
                 {
                     nextOutputFrameIndex = 1;
                     nextOutputDueTicks = Stopwatch.GetTimestamp() + _videoFrameDurationTicks;
@@ -217,13 +232,17 @@ internal sealed class NativeRecorderWriter : IOutputSink
                         if (!ShouldContinueOutput(nextOutputFrameIndex))
                             break;
 
-                        VideoFrame? latestFrame = SelectLatestFrameWithLookahead(nextOutputDueTicks, out long queueWaitTicks);
-                        bool hasNewFrame = latestFrame != null;
-                        VideoFrame frameToSubmit = latestFrame ?? retainedFrame!;
+                        bool hasNewFrame = TrySelectLatestFrameWithLookahead(
+                            nextOutputDueTicks,
+                            out NativeQueuedVideoFrame latestFrame,
+                            out long queueWaitTicks);
+                        VideoFrame frameToSubmit = hasNewFrame ? latestFrame.Frame : retainedFrame.Frame;
+                        long sourceFrameId = hasNewFrame ? latestFrame.SourceFrameId : retainedFrame.SourceFrameId;
                         long timestampHns = nextOutputFrameIndex * _videoFrameDurationHns;
 
                         bool accepted = SubmitOutputTick(
                             frameToSubmit,
+                            sourceFrameId,
                             timestampHns,
                             duplicate: !hasNewFrame,
                             recordCaptureTiming: hasNewFrame,
@@ -231,12 +250,13 @@ internal sealed class NativeRecorderWriter : IOutputSink
 
                         if (accepted && hasNewFrame)
                         {
-                            retainedFrame!.ReturnBuffer();
+                            retainedFrame.Frame.ReturnBuffer();
                             retainedFrame = latestFrame;
-                            latestFrame = null;
+                            hasRetainedFrame = true;
+                            latestFrame = default;
                         }
 
-                        latestFrame?.ReturnBuffer();
+                        latestFrame.Frame?.ReturnBuffer();
                         nextOutputFrameIndex++;
                         nextOutputDueTicks += _videoFrameDurationTicks;
                     }
@@ -269,7 +289,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
             }
         }
 
-        retainedFrame?.ReturnBuffer();
+        if (hasRetainedFrame)
+            retainedFrame.Frame.ReturnBuffer();
 
         if (Volatile.Read(ref _submittedFrameCount) == 0 && _firstVideoFrameException == null)
             _firstVideoFrameSubmitted.Set();
@@ -277,17 +298,18 @@ internal sealed class NativeRecorderWriter : IOutputSink
         DrainQueuedVideoFrames();
         string timingSummary = _timingDiagnostics.BuildSummary();
         string dropSummary = BuildDropSummary();
-        Plugin.Log!.Info($"[NativeRecorder] Video writer thread exiting. input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}");
+        string sourceFrameSummary = BuildSourceFrameSummary();
+        Plugin.Log!.Info($"[NativeRecorder] Video writer thread exiting. input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, {sourceFrameSummary}");
         Plugin.Log!.Info($"[NativeRecorder] Timing diagnostics: {timingSummary}");
         RecordingDiagnosticLog.WriteIfEnabled(
             "NativeRecorder",
-            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}");
+            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, {sourceFrameSummary}");
         RecordingDiagnosticLog.WriteIfEnabled(
             "NativeRecorder",
             $"timing diagnostics: {timingSummary}");
         AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
-            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}");
+            $"video writer exiting, input={_inputFrameCount}, submitted={_submittedFrameCount}, duplicates={_duplicateFrameCount}, {dropSummary}, {sourceFrameSummary}");
         AmdRecordingDiagnosticLog.Write(
             "NativeRecorder",
             $"timing diagnostics: {timingSummary}");
@@ -305,25 +327,33 @@ internal sealed class NativeRecorderWriter : IOutputSink
         return false;
     }
 
-    private VideoFrame? SelectLatestFrameWithLookahead(long outputDueTicks, out long queueWaitTicks)
+    private bool TrySelectLatestFrameWithLookahead(
+        long outputDueTicks,
+        out NativeQueuedVideoFrame selectedFrame,
+        out long queueWaitTicks)
     {
-        VideoFrame? frame = DrainToLatestQueuedFrame(out queueWaitTicks);
-        if (frame != null || _stopped)
-            return frame;
+        if (TryDrainToLatestQueuedFrame(out selectedFrame, out queueWaitTicks))
+            return true;
+        if (_stopped)
+            return false;
 
-        return WaitForLookaheadFrame(outputDueTicks + _outputLookaheadTicks, out queueWaitTicks);
+        return TryWaitForLookaheadFrame(outputDueTicks + _outputLookaheadTicks, out selectedFrame, out queueWaitTicks);
     }
 
-    private VideoFrame? DrainToLatestQueuedFrame(out long queueWaitTicks)
+    private bool TryDrainToLatestQueuedFrame(out NativeQueuedVideoFrame selectedFrame, out long queueWaitTicks)
     {
         queueWaitTicks = 0;
         if (!_videoQueue!.TryTake(out NativeQueuedVideoFrame queuedFrame))
-            return null;
+        {
+            selectedFrame = default;
+            return false;
+        }
 
-        return DrainToLatestQueuedFrame(queuedFrame, out queueWaitTicks);
+        selectedFrame = DrainToLatestQueuedFrame(queuedFrame, out queueWaitTicks);
+        return true;
     }
 
-    private VideoFrame DrainToLatestQueuedFrame(NativeQueuedVideoFrame firstQueuedFrame, out long queueWaitTicks)
+    private NativeQueuedVideoFrame DrainToLatestQueuedFrame(NativeQueuedVideoFrame firstQueuedFrame, out long queueWaitTicks)
     {
         queueWaitTicks = 0;
         NativeQueuedVideoFrame latestQueuedFrame = firstQueuedFrame;
@@ -345,19 +375,24 @@ internal sealed class NativeRecorderWriter : IOutputSink
         }
 
         queueWaitTicks = Math.Max(0, Stopwatch.GetTimestamp() - latestQueuedFrame.EnqueueTicks);
-        return latestQueuedFrame.Frame;
+        return latestQueuedFrame;
     }
 
-    private VideoFrame? WaitForLookaheadFrame(long deadlineTicks, out long queueWaitTicks)
+    private bool TryWaitForLookaheadFrame(
+        long deadlineTicks,
+        out NativeQueuedVideoFrame selectedFrame,
+        out long queueWaitTicks)
     {
         queueWaitTicks = 0;
+        selectedFrame = default;
 
         while (!_stopped)
         {
             if (_videoQueue!.TryTake(out NativeQueuedVideoFrame queuedFrame))
             {
                 Interlocked.Increment(ref _lookaheadFrameHitCount);
-                return DrainToLatestQueuedFrame(queuedFrame, out queueWaitTicks);
+                selectedFrame = DrainToLatestQueuedFrame(queuedFrame, out queueWaitTicks);
+                return true;
             }
 
             long remainingTicks = deadlineTicks - Stopwatch.GetTimestamp();
@@ -369,7 +404,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
 
         if (!_stopped)
             Interlocked.Increment(ref _lookaheadMissCount);
-        return null;
+        return false;
     }
 
     private bool ShouldContinueOutput(long nextOutputFrameIndex)
@@ -417,6 +452,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
 
     private bool SubmitOutputTick(
         VideoFrame frame,
+        long sourceFrameId,
         long timestampHns,
         bool duplicate,
         bool recordCaptureTiming,
@@ -460,6 +496,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
         if (recordCaptureTiming)
             _timingDiagnostics.RecordSubmittedFrame(frame.TimestampHns, queueWaitTicks);
 
+        RecordSubmittedSourceFrame(sourceFrameId, timestampHns, duplicate);
+
         int submitted = Volatile.Read(ref _submittedFrameCount);
         if (submitted > 1)
             MarkSubmitPressureIfSlow(submitTicks);
@@ -468,6 +506,49 @@ internal sealed class NativeRecorderWriter : IOutputSink
             Plugin.Log!.Info($"[NativeRecorder] Submitted {submitted} texture frames (input={_inputFrameCount}, duplicates={_duplicateFrameCount}, {BuildDropSummary()}), audioPackets={_audioPackets}");
 
         return true;
+    }
+
+    private void RecordSubmittedSourceFrame(long sourceFrameId, long timestampHns, bool duplicate)
+    {
+        long previousSourceFrameId = _lastSubmittedSourceFrameId;
+        long previousMaxSourceFrameId = _maxSubmittedSourceFrameId;
+
+        if (previousSourceFrameId <= 0)
+        {
+            _lastSubmittedSourceFrameId = sourceFrameId;
+            _maxSubmittedSourceFrameId = Math.Max(previousMaxSourceFrameId, sourceFrameId);
+            return;
+        }
+
+        if (sourceFrameId == previousSourceFrameId)
+        {
+            Interlocked.Increment(ref _sourceFrameRepeatCount);
+        }
+        else if (sourceFrameId < previousSourceFrameId)
+        {
+            long regressions = Interlocked.Increment(ref _sourceFrameRegressionCount);
+            long distanceFromPrevious = previousSourceFrameId - sourceFrameId;
+            long distanceFromMax = Math.Max(0, previousMaxSourceFrameId - sourceFrameId);
+            UpdateMaxSourceFrameRegressionDistance(Math.Max(distanceFromPrevious, distanceFromMax));
+            Plugin.Log!.Warning(
+                $"[NativeRecorder] Source frame id regressed. outputTimestampHns={timestampHns}, sourceFrameId={sourceFrameId}, previousSourceFrameId={previousSourceFrameId}, maxSourceFrameId={previousMaxSourceFrameId}, regressionDistance={distanceFromPrevious}, distanceFromMax={distanceFromMax}, duplicate={duplicate}, regressions={regressions}");
+        }
+
+        _lastSubmittedSourceFrameId = sourceFrameId;
+        if (sourceFrameId > previousMaxSourceFrameId)
+            _maxSubmittedSourceFrameId = sourceFrameId;
+    }
+
+    private void UpdateMaxSourceFrameRegressionDistance(long distance)
+    {
+        long current;
+        do
+        {
+            current = Volatile.Read(ref _maxSourceFrameRegressionDistance);
+            if (distance <= current)
+                return;
+        }
+        while (Interlocked.CompareExchange(ref _maxSourceFrameRegressionDistance, distance, current) != current);
     }
 
     private bool SubmitOneOutputFrame(VideoFrame frame, long timestampHns, bool duplicate)
@@ -617,7 +698,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
         return _videoQueue.Drain(pendingFrame => pendingFrame.Frame.ReturnBuffer());
     }
 
-    private readonly record struct NativeQueuedVideoFrame(VideoFrame Frame, long EnqueueTicks);
+    private readonly record struct NativeQueuedVideoFrame(VideoFrame Frame, long EnqueueTicks, long SourceFrameId);
 
     private string BuildDropSummary()
     {
@@ -631,6 +712,15 @@ internal sealed class NativeRecorderWriter : IOutputSink
                $"duplicateTickDrops={duplicateTickDrops}, " +
                $"lookaheadHits={Volatile.Read(ref _lookaheadFrameHitCount)}, " +
                $"lookaheadMisses={Volatile.Read(ref _lookaheadMissCount)}";
+    }
+
+    private string BuildSourceFrameSummary()
+    {
+        return $"sourceFrameRepeats={Volatile.Read(ref _sourceFrameRepeatCount)}, " +
+               $"sourceFrameRegressions={Volatile.Read(ref _sourceFrameRegressionCount)}, " +
+               $"maxSourceFrameRegressionDistance={Volatile.Read(ref _maxSourceFrameRegressionDistance)}, " +
+               $"lastSourceFrameId={Volatile.Read(ref _lastSubmittedSourceFrameId)}, " +
+               $"maxSourceFrameId={Volatile.Read(ref _maxSubmittedSourceFrameId)}";
     }
 
     private bool IsSubmitPressureActive()
