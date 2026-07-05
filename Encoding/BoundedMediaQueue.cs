@@ -56,6 +56,9 @@ internal sealed class BoundedMediaQueue<T> : IDisposable
     public bool TryTake(out T item)
         => _queue.TryTake(out item!);
 
+    public bool TryTake(int millisecondsTimeout, out T item)
+        => _queue.TryTake(out item!, Math.Max(0, millisecondsTimeout));
+
     public void CompleteAdding()
     {
         try { _queue.CompleteAdding(); } catch { }

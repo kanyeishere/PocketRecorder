@@ -54,6 +54,7 @@ internal static class AmdRecordingDiagnosticLog
         bool useHardwareEncoder,
         AudioCaptureMode audioCaptureMode,
         bool includeOverlay,
+        VideoOutputScaleMode videoOutputScaleMode,
         bool forceFfmpegFallback,
         bool preferNativeRecorder,
         string selectedBackendReason,
@@ -70,7 +71,7 @@ internal static class AmdRecordingDiagnosticLog
             $"runtime={RuntimeInformation.FrameworkDescription}, os={RuntimeInformation.OSDescription}, processArch={RuntimeInformation.ProcessArchitecture}",
             $"requestedCodec={requestedCodec}, preset={encoderPreset}, bitrate={videoBitrate}, fps={targetFps}",
             $"hardware={useHardwareEncoder}, audio={audioCaptureMode}, preferNative={preferNativeRecorder}",
-            $"captureConfig=includeOverlay={includeOverlay}, forceFFmpegFallback={forceFfmpegFallback}",
+            $"captureConfig=includeOverlay={includeOverlay}, outputScale={videoOutputScaleMode}, forceFFmpegFallback={forceFfmpegFallback}",
             $"nativeProbe={effectiveNativeProbeReason}",
         };
 

@@ -14,7 +14,7 @@
 #  define PR_CALL
 #endif
 
-#define PR_ABI_VERSION 12
+#define PR_ABI_VERSION 13
 
 typedef struct pr_recorder_t pr_recorder_t;
 
@@ -58,6 +58,8 @@ typedef struct pr_video_config
     int32_t bitrate_bps;
     int32_t codec;
     int32_t pixel_format;
+    int32_t output_width;
+    int32_t output_height;
     const wchar_t* output_path;
 } pr_video_config;
 

@@ -29,8 +29,10 @@ struct SharedTextureNv12Converter
 
     int source_width() const { return video.width; }
     int source_height() const { return video.height; }
-    int encoded_width() const { return align_to_even(video.width); }
-    int encoded_height() const { return align_to_even(video.height); }
+    int output_width() const { return video_output_width(video); }
+    int output_height() const { return video_output_height(video); }
+    int encoded_width() const { return video_encoded_width(video); }
+    int encoded_height() const { return video_encoded_height(video); }
 
     HRESULT initialize(ID3D11Device* source_device, DXGI_FORMAT source_format)
     {
@@ -38,7 +40,7 @@ struct SharedTextureNv12Converter
             return S_OK;
         if (source_device == nullptr)
             return E_POINTER;
-        if (video.width <= 0 || video.height <= 0 || video.fps <= 0)
+        if (video.width <= 0 || video.height <= 0 || output_width() <= 0 || output_height() <= 0 || video.fps <= 0)
             return E_INVALIDARG;
 
         UINT vendor_id = 0;
@@ -134,7 +136,7 @@ struct SharedTextureNv12Converter
             return fail_step("CreateVideoProcessor", hr);
 
         RECT source_rect{0, 0, source_width(), source_height()};
-        RECT dest_rect{0, 0, source_width(), source_height()};
+        RECT dest_rect{0, 0, output_width(), output_height()};
         RECT output_rect{0, 0, encoded_width(), encoded_height()};
         D3D11_VIDEO_COLOR background{};
         background.RGBA.A = 1.0f;

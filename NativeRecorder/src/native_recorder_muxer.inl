@@ -36,8 +36,8 @@ struct LibavMp4Muxer
     {
         video = video_config;
         audio = audio_config;
-        encoded_width = align_to_even(video.width);
-        encoded_height = align_to_even(video.height);
+        encoded_width = video_encoded_width(video);
+        encoded_height = video_encoded_height(video);
         output_path_utf8 = wide_to_utf8(output_path.c_str());
         if (output_path_utf8.empty())
             return E_INVALIDARG;

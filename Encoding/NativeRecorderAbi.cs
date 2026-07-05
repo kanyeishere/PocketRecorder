@@ -48,6 +48,8 @@ internal struct NativeVideoConfig
     public int BitrateBps;
     public int Codec;
     public int PixelFormat;
+    public int OutputWidth;
+    public int OutputHeight;
     public IntPtr OutputPath;
 }
 

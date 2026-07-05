@@ -144,6 +144,12 @@ internal sealed class FFmpegWriter : IOutputSink
         }
 
         // ── 视频编码器 ──
+        if (video.HasScaledOutput)
+        {
+            args.Add("-vf");
+            args.Add($"scale={video.OutputWidth}:{video.OutputHeight}:flags=bicubic");
+        }
+
         args.Add("-c:v"); args.Add(_videoCodec);
         if (!string.IsNullOrEmpty(_preset))
         {
@@ -180,7 +186,7 @@ internal sealed class FFmpegWriter : IOutputSink
         AmdRecordingDiagnosticLog.WriteForAmdCodec(
             _videoCodec,
             "FFmpeg",
-            $"starting process, input={video.Width}x{video.Height}@{_videoFps}, pixelFormat={video.PixelFormat}/{GetFFmpegPixelFormat(video.PixelFormat)}, audio={audio != null}, bitrate={_videoBitrate}, preset={_preset}, args={BuildDiagnosticArguments(args)}");
+            $"starting process, video={video.Describe()}@{_videoFps}, pixelFormat={video.PixelFormat}/{GetFFmpegPixelFormat(video.PixelFormat)}, audio={audio != null}, bitrate={_videoBitrate}, preset={_preset}, args={BuildDiagnosticArguments(args)}");
 
         // 启动 FFmpeg
         var psi = new ProcessStartInfo
@@ -212,11 +218,11 @@ internal sealed class FFmpegWriter : IOutputSink
         };
         _process.BeginErrorReadLine();
 
-        Plugin.Log!.Info($"[FFmpeg] Process started (PID={_process.Id}), codec={_videoCodec}, pix_fmt={GetFFmpegPixelFormat(video.PixelFormat)}, {video.Width}x{video.Height}@{_videoFps}fps");
+        Plugin.Log!.Info($"[FFmpeg] Process started (PID={_process.Id}), codec={_videoCodec}, pix_fmt={GetFFmpegPixelFormat(video.PixelFormat)}, {video.Describe()}@{_videoFps}fps");
         AmdRecordingDiagnosticLog.WriteForAmdCodec(
             _videoCodec,
             "FFmpeg",
-            $"process started, pid={_process.Id}, codec={_videoCodec}, pix_fmt={GetFFmpegPixelFormat(video.PixelFormat)}, size={video.Width}x{video.Height}, fps={_videoFps}");
+            $"process started, pid={_process.Id}, codec={_videoCodec}, pix_fmt={GetFFmpegPixelFormat(video.PixelFormat)}, size={video.Describe()}, fps={_videoFps}");
 
         // 启动异步写入线程
         Plugin.Log!.Info("[FFmpeg] Video timing: rawvideo VFR uses wall-clock timestamps; stale queued frames are dropped instead of synthesized.");

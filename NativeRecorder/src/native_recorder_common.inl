@@ -583,6 +583,26 @@ int align_to_even(int value)
     return (safe_value + 1) & ~1;
 }
 
+int video_output_width(const pr_video_config& video)
+{
+    return video.output_width > 0 ? video.output_width : video.width;
+}
+
+int video_output_height(const pr_video_config& video)
+{
+    return video.output_height > 0 ? video.output_height : video.height;
+}
+
+int video_encoded_width(const pr_video_config& video)
+{
+    return align_to_even(video_output_width(video));
+}
+
+int video_encoded_height(const pr_video_config& video)
+{
+    return align_to_even(video_output_height(video));
+}
+
 struct NativeRecorderBackend
 {
     virtual ~NativeRecorderBackend() = default;

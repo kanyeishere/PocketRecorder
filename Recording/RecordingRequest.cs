@@ -14,8 +14,21 @@ internal sealed record RecordingRequest(
     string EncoderPreset,
     bool UseHardwareEncoder,
     bool IncludeOverlay,
+    VideoOutputScaleMode VideoOutputScaleMode,
     bool ForceFFmpegFallbackForTesting)
 {
     public VideoFormat ToVideoFormat(VideoFrame frame)
-        => new(frame.Width, frame.Height, TargetFps, frame.PixelFormat);
+    {
+        VideoOutputDimensions output = GetOutputDimensions(frame.Width, frame.Height);
+        return new VideoFormat(
+            frame.Width,
+            frame.Height,
+            output.Width,
+            output.Height,
+            TargetFps,
+            frame.PixelFormat);
+    }
+
+    public VideoOutputDimensions GetOutputDimensions(int sourceWidth, int sourceHeight)
+        => VideoOutputScale.Resolve(sourceWidth, sourceHeight, VideoOutputScaleMode);
 }

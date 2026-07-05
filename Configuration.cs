@@ -8,7 +8,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 15;
+    public int Version { get; set; } = 16;
 
     /// <summary>录制文件输出目录，空则使用插件配置目录下的 Recordings 子目录。</summary>
     public string OutputDirectory { get; set; } = string.Empty;
@@ -18,6 +18,9 @@ public class Configuration : IPluginConfiguration
 
     /// <summary>目标帧率上限。</summary>
     public int TargetFps { get; set; } = 60;
+
+    /// <summary>输出分辨率缩放。NativeRecorder 会在 GPU 侧缩放，FFmpeg fallback 会使用 scale 滤镜。</summary>
+    public VideoOutputScaleMode VideoOutputScaleMode { get; set; } = VideoOutputScaleMode.Original;
 
     /// <summary>是否录制音频。</summary>
     public bool CaptureAudio { get; set; } = true;

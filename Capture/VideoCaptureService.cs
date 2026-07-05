@@ -72,6 +72,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private bool _disposed;
     private int _stopStarted;
     private int _targetFps = 60;
+    private int _captureFps = 60;
     private readonly VideoCaptureFramePacer _framePacer = new();
     private readonly Stopwatch _sw = new();
     private int _frameCount;
@@ -121,10 +122,11 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _shouldCaptureFrame = shouldCaptureFrame;
     }
 
-    public bool Start(int targetFps)
+    public bool Start(int targetFps, int? captureFps = null)
     {
         _targetFps = Math.Max(1, targetFps);
-        _framePacer.Reset(_targetFps);
+        _captureFps = Math.Max(1, captureFps ?? _targetFps);
+        _framePacer.Reset(_captureFps);
         _capturing = false;
         _frameCount = 0;
         _skipCount = 0;
@@ -158,7 +160,7 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         {
             _capturing = true;
             _captureMethod = "PresentHook";
-            Plugin.Log!.Info($"[Video] Capture started, targetFps={_targetFps}, method=PresentHook, includeOverlay={IncludeOverlay}");
+            Plugin.Log!.Info($"[Video] Capture started, targetFps={_targetFps}, captureFps={_captureFps}, method=PresentHook, includeOverlay={IncludeOverlay}");
             return true;
         }
 
@@ -201,6 +203,13 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     {
         _capturing = false;
         RequestNv12StopCleanup();
+    }
+
+    public void SetCaptureFps(int captureFps, string reason)
+    {
+        _captureFps = Math.Max(1, captureFps);
+        _framePacer.Reset(_captureFps);
+        Plugin.Log!.Info($"[Video] Capture pacing changed: captureFps={_captureFps}, reason={reason}");
     }
 
     // ──────────────────────────────────────────────────────────

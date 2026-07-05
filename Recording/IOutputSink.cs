@@ -37,6 +37,41 @@ internal interface IOutputSink : IDisposable
     void Stop(TimeSpan? finalVideoDuration = null);
 }
 
-internal sealed record VideoFormat(int Width, int Height, int Fps, VideoPixelFormat PixelFormat);
+internal sealed record VideoFormat
+{
+    public VideoFormat(int width, int height, int fps, VideoPixelFormat pixelFormat)
+        : this(width, height, width, height, fps, pixelFormat)
+    {
+    }
+
+    public VideoFormat(
+        int width,
+        int height,
+        int outputWidth,
+        int outputHeight,
+        int fps,
+        VideoPixelFormat pixelFormat)
+    {
+        Width = width;
+        Height = height;
+        OutputWidth = outputWidth;
+        OutputHeight = outputHeight;
+        Fps = fps;
+        PixelFormat = pixelFormat;
+    }
+
+    public int Width { get; init; }
+    public int Height { get; init; }
+    public int OutputWidth { get; init; }
+    public int OutputHeight { get; init; }
+    public int Fps { get; init; }
+    public VideoPixelFormat PixelFormat { get; init; }
+    public bool HasScaledOutput => OutputWidth != Width || OutputHeight != Height;
+
+    public string Describe()
+        => HasScaledOutput
+            ? $"{Width}x{Height}->{OutputWidth}x{OutputHeight}"
+            : $"{Width}x{Height}";
+}
 
 internal sealed record AudioFormat(int SampleRate, int Channels, int BitsPerSample, bool IsFloat);

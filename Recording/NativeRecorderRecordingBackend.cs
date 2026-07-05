@@ -87,9 +87,12 @@ internal sealed class NativeRecorderRecordingBackend : IRecordingBackend
             writer.FatalError += fatalErrorHandler;
             writer.SetOutputPath(request.OutputPath);
 
+            VideoOutputDimensions output = request.GetOutputDimensions(firstFrame.Width, firstFrame.Height);
             var videoFormat = new VideoFormat(
                 firstFrame.Width,
                 firstFrame.Height,
+                output.Width,
+                output.Height,
                 request.TargetFps,
                 VideoPixelFormat.D3D11Texture);
             writer.Start(videoFormat, audioFormat);

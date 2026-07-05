@@ -140,6 +140,7 @@ internal sealed class RecordingService : IDisposable
                 config.EncoderPreset,
                 config.UseHardwareEncoder,
                 config.IncludeOverlay,
+                config.VideoOutputScaleMode,
                 config.EffectiveForceFFmpegFallbackForTesting);
             RecordingDiagnosticLog.StartSession(
                 request.SessionId,
@@ -150,6 +151,7 @@ internal sealed class RecordingService : IDisposable
                 request.UseHardwareEncoder,
                 request.AudioCaptureMode,
                 request.IncludeOverlay,
+                request.VideoOutputScaleMode,
                 request.ForceFFmpegFallbackForTesting,
                 !request.ForceFFmpegFallbackForTesting && request.UseHardwareEncoder);
             backendPlan = _backendSelector.SelectInitial(request);
@@ -179,6 +181,7 @@ internal sealed class RecordingService : IDisposable
             request.UseHardwareEncoder,
             request.AudioCaptureMode,
             request.IncludeOverlay,
+            request.VideoOutputScaleMode,
             request.ForceFFmpegFallbackForTesting,
             backendPlan.PrefersD3D11TextureFrames,
             backendPlan.Reason,
@@ -217,7 +220,8 @@ internal sealed class RecordingService : IDisposable
             _videoCapture = videoCapture;
         }
 
-        if (!videoCapture.Start(request.TargetFps))
+        int captureFps = GetInitialCaptureFps(request, backendPlan);
+        if (!videoCapture.Start(request.TargetFps, captureFps))
         {
             lock (_sync)
             {
@@ -239,7 +243,7 @@ internal sealed class RecordingService : IDisposable
         }
 
         _environment.Log.Info($"[Record] Preparation started -> {request.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
-        _environment.Log.Info($"[Record] Config: fps={request.TargetFps}, bitrate={request.VideoBitrate}, codec={request.VideoCodec}, preset={request.EncoderPreset}, audio={request.AudioCaptureMode}, hw={request.UseHardwareEncoder}, overlay={request.IncludeOverlay}, backend={backendPlan.Backend.DisplayName} ({backendPlan.Reason})");
+        _environment.Log.Info($"[Record] Config: fps={request.TargetFps}, captureFps={captureFps}, bitrate={request.VideoBitrate}, codec={request.VideoCodec}, preset={request.EncoderPreset}, audio={request.AudioCaptureMode}, hw={request.UseHardwareEncoder}, overlay={request.IncludeOverlay}, outputScale={request.VideoOutputScaleMode}, backend={backendPlan.Backend.DisplayName} ({backendPlan.Reason})");
         AmdRecordingDiagnosticLog.Write("Record", $"preparation started, startSyncMs={startSw.ElapsedMilliseconds}");
         RecordingStateChanged?.Invoke(true);
         return true;
@@ -388,7 +392,7 @@ internal sealed class RecordingService : IDisposable
             if (startResult.CountFirstVideoFrame)
                 Interlocked.Increment(ref _frameCount);
 
-            _environment.Log.Info($"[Record] Recording started: {startResult.VideoFormat.Width}x{startResult.VideoFormat.Height}@{request.TargetFps}fps, audio={audioFormat != null}, backend={startResult.BackendLabel}, asyncStart={startSw.ElapsedMilliseconds}ms");
+            _environment.Log.Info($"[Record] Recording started: {startResult.VideoFormat.Describe()}@{request.TargetFps}fps, audio={audioFormat != null}, backend={startResult.BackendLabel}, asyncStart={startSw.ElapsedMilliseconds}ms");
             AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
                 "Record",
                 $"recording started, asyncStartMs={startSw.ElapsedMilliseconds}, backend={startResult.BackendLabel}");
@@ -532,16 +536,23 @@ internal sealed class RecordingService : IDisposable
 
     private void SwitchToFFmpegFallback(int sessionId, string reason)
     {
+        int targetFps = _videoFps;
         lock (_sync)
         {
             if (!IsCurrentSessionNoLock(sessionId))
                 return;
 
             if (_request != null)
+                targetFps = _request.TargetFps;
+
+            if (_request != null)
                 _backendPlan = _backendSelector.SelectFFmpeg(_request, reason);
 
             if (_videoCapture != null)
+            {
                 _videoCapture.PreferD3D11TextureFrames = false;
+                _videoCapture.SetCaptureFps(targetFps, "FFmpeg fallback");
+            }
 
             _writer = null;
             _videoWidth = 0;
@@ -555,6 +566,11 @@ internal sealed class RecordingService : IDisposable
         AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", "switched capture to FFmpeg fallback; D3D11 texture preference disabled");
         RecordingDiagnosticLog.WriteIfEnabled("Record", "switched capture to FFmpeg fallback; D3D11 texture preference disabled");
     }
+
+    private static int GetInitialCaptureFps(RecordingRequest request, RecordingBackendPlan backendPlan)
+        => backendPlan.PrefersD3D11TextureFrames
+            ? Math.Max(1, request.TargetFps * 2)
+            : request.TargetFps;
 
     private void NotifyUserForActionableNativeFailure(Exception ex)
     {

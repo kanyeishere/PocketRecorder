@@ -185,6 +185,23 @@ internal sealed class ConfigWindow : Window
         }
         SaveConfigAfterItemEdit(config);
 
+        string[] outputScales = { "原始尺寸", "1/4 输出" };
+        VideoOutputScaleMode[] outputScaleValues =
+        [
+            VideoOutputScaleMode.Original,
+            VideoOutputScaleMode.QuarterPixels,
+        ];
+        int outputScaleIdx = Array.IndexOf(outputScaleValues, config.VideoOutputScaleMode);
+        if (outputScaleIdx < 0)
+            outputScaleIdx = 0;
+
+        if (ImGui.Combo("输出分辨率", ref outputScaleIdx, outputScales, outputScales.Length))
+        {
+            config.VideoOutputScaleMode = outputScaleValues[outputScaleIdx];
+            SaveConfig(config);
+        }
+        ImGui.TextDisabled("1/4 输出会保持画面比例，宽高各缩到 1/2。");
+
         bool includeOverlay = config.IncludeOverlay;
         if (ImGui.Checkbox("录制卫月界面", ref includeOverlay))
         {

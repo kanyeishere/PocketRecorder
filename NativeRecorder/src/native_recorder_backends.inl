@@ -468,7 +468,7 @@ struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             return E_POINTER;
         if (output_path.empty())
             return E_INVALIDARG;
-        if (video.width <= 0 || video.height <= 0 || video.fps <= 0)
+        if (video.width <= 0 || video.height <= 0 || video_output_width(video) <= 0 || video_output_height(video) <= 0 || video.fps <= 0)
             return E_INVALIDARG;
         if (!is_supported_recording_codec(video.codec))
             return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
@@ -572,9 +572,11 @@ struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         std::string message = "NativeRecorder initialized: source NVIDIA adapter=" + converter.adapter_name +
             ", luid=" + std::to_string(static_cast<uint32_t>(converter.adapter_luid.HighPart)) + ":" +
             std::to_string(converter.adapter_luid.LowPart) +
+            ", source=" + std::to_string(video.width) + "x" + std::to_string(video.height) +
+            ", output=" + std::to_string(video_output_width(video)) + "x" + std::to_string(video_output_height(video)) +
             ", sourceFormat=" + dxgi_format_to_string(source_format) +
             ", encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height) +
-            ", pad=" + std::to_string(encoded_width - video.width) + "x" + std::to_string(encoded_height - video.height) +
+            ", pad=" + std::to_string(encoded_width - video_output_width(video)) + "x" + std::to_string(encoded_height - video_output_height(video)) +
             ", nvencBuffers=" + std::to_string(encoder ? encoder->GetEncoderBufferCount() : 0) +
             ", vpSourceSupport=" + hex_uint32(converter.source_format_support) +
             ", vpNv12Support=" + hex_uint32(converter.nv12_format_support) +
@@ -745,7 +747,7 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             return E_POINTER;
         if (output_path.empty())
             return E_INVALIDARG;
-        if (video.width <= 0 || video.height <= 0 || video.fps <= 0)
+        if (video.width <= 0 || video.height <= 0 || video_output_width(video) <= 0 || video_output_height(video) <= 0 || video.fps <= 0)
             return E_INVALIDARG;
         if (!is_supported_recording_codec(video.codec))
             return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
@@ -812,9 +814,11 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         std::string message = "NativeRecorder initialized: source AMD adapter=" + converter.adapter_name +
             ", luid=" + std::to_string(static_cast<uint32_t>(converter.adapter_luid.HighPart)) + ":" +
             std::to_string(converter.adapter_luid.LowPart) +
+            ", source=" + std::to_string(video.width) + "x" + std::to_string(video.height) +
+            ", output=" + std::to_string(video_output_width(video)) + "x" + std::to_string(video_output_height(video)) +
             ", sourceFormat=" + dxgi_format_to_string(source_format) +
             ", encoded=" + std::to_string(encoded_width) + "x" + std::to_string(encoded_height) +
-            ", pad=" + std::to_string(encoded_width - video.width) + "x" + std::to_string(encoded_height - video.height) +
+            ", pad=" + std::to_string(encoded_width - video_output_width(video)) + "x" + std::to_string(encoded_height - video_output_height(video)) +
             ", vpSourceSupport=" + hex_uint32(converter.source_format_support) +
             ", vpNv12Support=" + hex_uint32(converter.nv12_format_support) +
             ", amfInput=shared conversion pool -> AMF-owned DX11 NV12 surfaces";

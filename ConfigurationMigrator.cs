@@ -130,6 +130,12 @@ internal static class ConfigurationMigrator
             SaveVersion(config, pi, 15);
         }
 
+        if (config.Version < 16)
+        {
+            config.VideoOutputScaleMode = VideoOutputScaleMode.Original;
+            SaveVersion(config, pi, 16);
+        }
+
         config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
 
         if (!config.EnableNativeRecorderExperimental)

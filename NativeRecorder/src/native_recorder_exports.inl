@@ -248,7 +248,12 @@ PR_API int32_t PR_CALL pr_create(const pr_video_config* video, const pr_audio_co
             return PR_E_INVALID_ARGUMENT;
 
         *recorder = nullptr;
-        if (video->output_path == nullptr || video->width <= 0 || video->height <= 0 || video->fps <= 0)
+        if (video->output_path == nullptr ||
+            video->width <= 0 ||
+            video->height <= 0 ||
+            video_output_width(*video) <= 0 ||
+            video_output_height(*video) <= 0 ||
+            video->fps <= 0)
         {
             set_last_error("Invalid NativeRecorder video configuration.");
             return PR_E_INVALID_ARGUMENT;

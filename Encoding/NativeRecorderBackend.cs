@@ -9,9 +9,9 @@ namespace Recorder.Encoding;
 
 internal static unsafe class NativeRecorderBackend
 {
-    private const int ExpectedAbiVersion = 12;
+    private const int ExpectedAbiVersion = 13;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
-    private static readonly string[] NativeDllFileNames = ["NativeRecorder.abi12.dll", "NativeRecorder.abi11.dll", "NativeRecorder.abi10.dll", "NativeRecorder.abi9.dll", "NativeRecorder.abi8.dll", "NativeRecorder.abi7.dll", "NativeRecorder.abi6.dll", "NativeRecorder.abi5.dll", "NativeRecorder.abi4.dll", "NativeRecorder.abi3.dll", "NativeRecorder.abi2.dll", "NativeRecorder.dll"];
+    private static readonly string[] NativeDllFileNames = ["NativeRecorder.abi13.dll", "NativeRecorder.abi12.dll", "NativeRecorder.abi11.dll", "NativeRecorder.abi10.dll", "NativeRecorder.abi9.dll", "NativeRecorder.abi8.dll", "NativeRecorder.abi7.dll", "NativeRecorder.abi6.dll", "NativeRecorder.abi5.dll", "NativeRecorder.abi4.dll", "NativeRecorder.abi3.dll", "NativeRecorder.abi2.dll", "NativeRecorder.dll"];
     private static readonly object Sync = new();
     private static readonly NativeRecorderDllResolver DllResolver = new(NativeDllFileNames);
     private static bool _loaded;
@@ -120,6 +120,8 @@ internal static unsafe class NativeRecorderBackend
                 BitrateBps = bitrateBps,
                 Codec = codec,
                 PixelFormat = ToNativePixelFormat(video.PixelFormat),
+                OutputWidth = Math.Max(1, video.OutputWidth),
+                OutputHeight = Math.Max(1, video.OutputHeight),
                 OutputPath = outputPathPtr,
             };
 
