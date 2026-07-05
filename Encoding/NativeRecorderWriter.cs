@@ -371,7 +371,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
             int dropped = Interlocked.Add(ref _droppedFrameCount, staleDropped);
             int capturedDrops = Interlocked.Add(ref _capturedFrameDropCount, staleDropped);
             if (dropped <= 5 || dropped % 60 == 0)
-                Plugin.Log!.Warning($"[NativeRecorder] Dropped stale captured texture frames while sampling latest. staleDrops={staleDropped}, dropped={dropped}, capturedDrops={capturedDrops}");
+                Plugin.Log!.Info($"[NativeRecorder] Dropped stale captured texture frames while sampling latest. staleDrops={staleDropped}, dropped={dropped}, capturedDrops={capturedDrops}");
         }
 
         queueWaitTicks = Math.Max(0, Stopwatch.GetTimestamp() - latestQueuedFrame.EnqueueTicks);

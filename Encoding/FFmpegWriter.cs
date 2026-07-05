@@ -499,7 +499,7 @@ internal sealed class FFmpegWriter : IOutputSink
             int dropped = Interlocked.Add(ref _droppedFrameCount, staleDropped);
             int stale = Interlocked.Add(ref _staleFrameDropCount, staleDropped);
             if (stale <= 5 || stale % 60 == 0)
-                Plugin.Log!.Warning($"[FFmpeg] Dropped stale queued video frames to catch up. staleDrops={stale}, dropped={dropped}");
+                Plugin.Log!.Info($"[FFmpeg] Dropped stale queued video frames to catch up. staleDrops={stale}, dropped={dropped}");
         }
 
         return currentFrame;
