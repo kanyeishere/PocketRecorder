@@ -152,7 +152,7 @@ jobs:
             ApplicableVersion      = "any"
             Tags                   = @("recording", "capture", "video", "audio", "ffmpeg", "ffxiv")
             DalamudApiLevel        = 15
-            IconUrl                = "https://raw.githubusercontent.com/kanyeishere/PocketRecorder/master/images/icon.png"
+            IconUrl                = "https://cdn.jsdelivr.net/gh/kanyeishere/PocketRecorder@master/images/icon.png"
             RepoUrl                = $repoUrl
             DownloadLinkInstall    = $downloadUrl
             DownloadLinkTesting    = $downloadUrl

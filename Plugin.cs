@@ -3,6 +3,7 @@ using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using OmenTools;
+using Recorder.Capture;
 using Recorder.Encoding;
 using Recorder.Recording;
 using Recorder.Telemetry;
@@ -28,6 +29,7 @@ public sealed class Plugin : IDalamudPlugin
 
     internal Configuration Config { get; }
     internal IRecorderEnvironment Environment { get; }
+    internal GameGraphicsDeviceProbeCache GameGraphicsDeviceProbeCache { get; }
     internal RecordingService RecordingService { get; }
     internal RecordingRetentionCleanupService RetentionCleanupService { get; }
     internal AutoDutyRecordingService AutoDutyRecordingService { get; }
@@ -47,6 +49,7 @@ public sealed class Plugin : IDalamudPlugin
         Config = Configuration.Load(pluginInterface);
         PocketBackendClient.Configure(Config);
 
+        GameGraphicsDeviceProbeCache = new GameGraphicsDeviceProbeCache(Framework, Environment.Log);
         RecordingService = new RecordingService(this, GameInterop, Environment);
         RetentionCleanupService = new RecordingRetentionCleanupService(this, Environment);
         AutoDutyRecordingService = new AutoDutyRecordingService(this, ClientState, DutyState, Framework);
@@ -64,6 +67,7 @@ public sealed class Plugin : IDalamudPlugin
         AddCommandHandler(ShortCommandName);
 
         StartBackgroundWarmup();
+        GameGraphicsDeviceProbeCache.StartWarmup();
         PocketBackendClient.QueueHeartbeat("startup", new
         {
             targetFps = Config.TargetFps,
@@ -460,6 +464,7 @@ public sealed class Plugin : IDalamudPlugin
         RetentionCleanupService.Dispose();
         AutoDutyRecordingService.Dispose();
         RecordingService.Dispose();
+        GameGraphicsDeviceProbeCache.Dispose();
         CommandManager.RemoveHandler(CommandName);
         CommandManager.RemoveHandler(ShortCommandName);
         PluginInterface.UiBuilder.Draw -= OnUiBuilderDraw;
