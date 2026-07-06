@@ -2,6 +2,8 @@ using Dalamud.Plugin.Services;
 using OmenTools.OmenService;
 using Recorder.Capture;
 using Recorder.Diagnostics;
+using Recorder.Encoding;
+using Recorder.Telemetry;
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -36,6 +38,7 @@ internal sealed class RecordingService : IDisposable
     private int _frameCount;
     private string? _currentFilePath;
     private string _currentBackend = string.Empty;
+    private RecordingTelemetryContext? _telemetryContext;
     private Action<RecordingFinishedEventArgs>? _finishedCallback;
 
     // 配置缓存（录制开始时快照）
@@ -123,6 +126,7 @@ internal sealed class RecordingService : IDisposable
             var config = _plugin.Config;
             int sessionId = ++_sessionId;
             _videoFps = Math.Max(1, config.TargetFps);
+            int dalamudApiLevel = RecordingTelemetry.GetDalamudApiLevel();
 
             string dir = config.GetEffectiveOutputDirectory(Plugin.PluginInterface);
             _currentFilePath = string.IsNullOrWhiteSpace(outputPath)
@@ -157,6 +161,22 @@ internal sealed class RecordingService : IDisposable
                 !request.ForceFFmpegFallbackForTesting && request.UseHardwareEncoder);
             backendPlan = _backendSelector.SelectInitial(request);
             RecordingDiagnosticLog.UpdateBackendSelection(backendPlan.Reason, backendPlan.NativeRecorderProbeReason);
+            RecordingGpuInfo gpu = RecordingTelemetry.DetectGpu(
+                backendPlan.NativeRecorderProbeReason,
+                backendPlan.Reason,
+                backendPlan.Backend.DisplayName,
+                request.VideoCodec);
+            _telemetryContext = new RecordingTelemetryContext(
+                request.SessionId,
+                dalamudApiLevel,
+                gpu.Vendor,
+                gpu.AdapterName,
+                RecordingTelemetry.BackendMode(backendPlan.Backend.Id, backendPlan.Backend.DisplayName),
+                backendPlan.Backend.DisplayName,
+                request.VideoCodec,
+                backendPlan.Reason,
+                backendPlan.NativeRecorderProbeReason);
+            RecordingDiagnosticLog.UpdateRecordingContext(_telemetryContext);
 
             _request = request;
             _backendPlan = backendPlan;
@@ -225,10 +245,12 @@ internal sealed class RecordingService : IDisposable
         int captureFps = GetInitialCaptureFps(request, backendPlan);
         if (!videoCapture.Start(request.TargetFps, captureFps))
         {
+            RecordingTelemetryContext? telemetryContext = null;
             lock (_sync)
             {
                 if (IsCurrentSessionNoLock(request.SessionId))
                 {
+                    telemetryContext = _telemetryContext;
                     _sessionId++;
                     ClearSessionNoLock(RecordingLifecycle.Idle);
                 }
@@ -240,6 +262,8 @@ internal sealed class RecordingService : IDisposable
             _environment.Log.Warning("[Record] Video capture could not start; recording aborted.");
             AmdRecordingDiagnosticLog.FinishSession("video capture could not start; recording aborted");
             RecordingDiagnosticLog.FinishSession("video capture could not start; recording aborted");
+            if (telemetryContext != null)
+                PocketBackendClient.QueueRecordingFinished(telemetryContext, TimeSpan.Zero, saved: false, "video capture could not start");
             RecordingStateChanged?.Invoke(false);
             return false;
         }
@@ -422,6 +446,15 @@ internal sealed class RecordingService : IDisposable
                 return;
             }
 
+            string? nativeRuntimeReason = string.Equals(backendPlan.Backend.Id, "native-recorder", StringComparison.OrdinalIgnoreCase)
+                ? NativeRecorderBackend.GetLastStatus()
+                : null;
+            RecordingGpuInfo startedGpu = RecordingTelemetry.DetectGpu(
+                string.IsNullOrWhiteSpace(nativeRuntimeReason) ? backendPlan.NativeRecorderProbeReason : nativeRuntimeReason,
+                backendPlan.Reason,
+                startResult.BackendLabel,
+                request.VideoCodec);
+
             lock (_sync)
             {
                 if (!IsCurrentSessionNoLock(request.SessionId) ||
@@ -435,10 +468,23 @@ internal sealed class RecordingService : IDisposable
                 _videoHeight = startResult.VideoFormat.Height;
                 _videoPixelFormat = startResult.VideoFormat.PixelFormat;
                 _currentBackend = startResult.BackendLabel;
+                if (_telemetryContext != null)
+                    _telemetryContext = _telemetryContext with
+                    {
+                        BackendMode = RecordingTelemetry.BackendMode(backendPlan.Backend.Id, startResult.BackendLabel),
+                        BackendLabel = startResult.BackendLabel,
+                        GpuVendor = startedGpu.Vendor,
+                        GpuAdapter = startedGpu.AdapterName,
+                        SelectedBackendReason = string.IsNullOrWhiteSpace(nativeRuntimeReason) ? backendPlan.Reason : nativeRuntimeReason,
+                        NativeProbeReason = backendPlan.NativeRecorderProbeReason,
+                    };
                 writerPublished = true;
                 _lifecycle = RecordingLifecycle.Recording;
                 _recordStart = DateTime.Now;
             }
+
+            if (_telemetryContext != null)
+                RecordingDiagnosticLog.UpdateRecordingContext(_telemetryContext);
 
             if (startResult.CountFirstVideoFrame)
                 Interlocked.Increment(ref _frameCount);
@@ -601,6 +647,23 @@ internal sealed class RecordingService : IDisposable
 
             if (_request != null)
                 _backendPlan = _backendSelector.SelectFFmpeg(_request, reason);
+            if (_telemetryContext != null && _backendPlan != null)
+            {
+                RecordingGpuInfo gpu = RecordingTelemetry.DetectGpu(
+                    _backendPlan.NativeRecorderProbeReason,
+                    _backendPlan.Reason,
+                    _backendPlan.Backend.DisplayName,
+                    _request?.VideoCodec);
+                _telemetryContext = _telemetryContext with
+                {
+                    GpuVendor = gpu.Vendor,
+                    GpuAdapter = gpu.AdapterName,
+                    BackendMode = "ffmpeg",
+                    BackendLabel = _backendPlan.Backend.DisplayName,
+                    SelectedBackendReason = _backendPlan.Reason,
+                    NativeProbeReason = _backendPlan.NativeRecorderProbeReason,
+                };
+            }
 
             if (_videoCapture != null)
             {
@@ -617,6 +680,9 @@ internal sealed class RecordingService : IDisposable
             _lifecycle = RecordingLifecycle.Preparing;
             _softFps.Reset(log: false);
         }
+
+        if (_telemetryContext != null)
+            RecordingDiagnosticLog.UpdateRecordingContext(_telemetryContext);
 
         AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText("Record", "switched capture to FFmpeg fallback; D3D11 texture preference disabled");
         RecordingDiagnosticLog.WriteIfEnabled("Record", "switched capture to FFmpeg fallback; D3D11 texture preference disabled");
@@ -687,6 +753,7 @@ internal sealed class RecordingService : IDisposable
         AudioCaptureService? audioCapture;
         IOutputSink? writer;
         string? outputPath;
+        RecordingTelemetryContext? telemetryContext;
         Action<RecordingFinishedEventArgs>? finishedCallback;
         TimeSpan finalDuration;
         Stopwatch stopSw = Stopwatch.StartNew();
@@ -702,6 +769,7 @@ internal sealed class RecordingService : IDisposable
             videoCapture = _videoCapture;
             audioCapture = _audioCapture;
             writer = _writer;
+            telemetryContext = _telemetryContext;
 
             _sessionId++;
             _request = null;
@@ -709,6 +777,7 @@ internal sealed class RecordingService : IDisposable
             _videoCapture = null;
             _audioCapture = null;
             _writer = null;
+            _telemetryContext = null;
             _nativeStartupGate.Reset();
             _lifecycle = writer != null || audioCapture != null || videoCapture != null
                 ? RecordingLifecycle.Finalizing
@@ -726,6 +795,7 @@ internal sealed class RecordingService : IDisposable
             outputPath,
             finishedCallback,
             finalDuration,
+            telemetryContext,
             stopSw,
             MarkFinalized);
         _finalizer.Finalize(job, waitForFinalize);
@@ -748,6 +818,7 @@ internal sealed class RecordingService : IDisposable
         AudioCaptureService? audioCapture = null;
         Action<RecordingFinishedEventArgs>? finishedCallback = null;
         string? outputPath = null;
+        RecordingTelemetryContext? telemetryContext = null;
 
         lock (_sync)
         {
@@ -758,6 +829,7 @@ internal sealed class RecordingService : IDisposable
             audioCapture = _audioCapture;
             finishedCallback = _finishedCallback;
             outputPath = _currentFilePath;
+            telemetryContext = _telemetryContext;
 
             _sessionId++;
             ClearSessionNoLock(RecordingLifecycle.Idle);
@@ -768,6 +840,8 @@ internal sealed class RecordingService : IDisposable
         StopAndDisposeAudioCapture(audioCapture);
         AmdRecordingDiagnosticLog.FinishSession("start aborted");
         RecordingDiagnosticLog.FinishSession("start aborted");
+        if (telemetryContext != null)
+            PocketBackendClient.QueueRecordingFinished(telemetryContext, TimeSpan.Zero, saved: false, "start aborted");
 
         RecordingStateChanged?.Invoke(false);
 
@@ -823,6 +897,7 @@ internal sealed class RecordingService : IDisposable
         _videoCapture = null;
         _audioCapture = null;
         _writer = null;
+        _telemetryContext = null;
         _lifecycle = nextLifecycle;
         _currentBackend = string.Empty;
         _finishedCallback = null;
