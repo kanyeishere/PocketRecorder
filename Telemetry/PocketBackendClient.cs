@@ -9,7 +9,7 @@ namespace Recorder.Telemetry;
 
 internal static class PocketBackendClient
 {
-    private const string BackendBaseUrl = "http://203.132.80.202:9898";
+    private const string BackendBaseUrl = "http://129.226.146.196:9898";
 
     private static readonly HttpClient HttpClient = new()
     {
@@ -50,7 +50,7 @@ internal static class PocketBackendClient
         });
     }
 
-    public static void QueueDiagnostics(string kind, string fileName, string report, string message)
+    public static void QueueDiagnostics(string kind, string fileName, string report, string message, object? metadata = null)
     {
         Configuration? configuration = _configuration;
         if (!CanSend(configuration))
@@ -69,6 +69,47 @@ internal static class PocketBackendClient
                     fileName,
                     message,
                     report,
+                    metadata,
+                }).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                SuppressTelemetryFailure(ex);
+            }
+        });
+    }
+
+    public static void QueueRecordingFinished(
+        RecordingTelemetryContext context,
+        TimeSpan duration,
+        bool saved,
+        string finalFrameDiagnostics)
+    {
+        Configuration? configuration = _configuration;
+        if (!CanSend(configuration))
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await PostJsonAsync(configuration!, "/api/recordings", new
+                {
+                    app = "recorder",
+                    installId = configuration!.InstallId,
+                    version = GetVersion(),
+                    context.SessionId,
+                    context.DalamudApiLevel,
+                    context.GpuVendor,
+                    context.GpuAdapter,
+                    context.BackendMode,
+                    context.BackendLabel,
+                    context.RequestedCodec,
+                    context.SelectedBackendReason,
+                    context.NativeProbeReason,
+                    saved,
+                    durationMs = (long)Math.Max(0, duration.TotalMilliseconds),
+                    finalFrameDiagnostics,
                 }).ConfigureAwait(false);
             }
             catch (Exception ex)
