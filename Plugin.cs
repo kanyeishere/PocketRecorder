@@ -29,6 +29,7 @@ public sealed class Plugin : IDalamudPlugin
     internal Configuration Config { get; }
     internal IRecorderEnvironment Environment { get; }
     internal RecordingService RecordingService { get; }
+    internal RecordingRetentionCleanupService RetentionCleanupService { get; }
     internal AutoDutyRecordingService AutoDutyRecordingService { get; }
     internal ConfigWindow ConfigWindow { get; }
     internal FloatingRecordWindow FloatingRecordWindow { get; }
@@ -47,6 +48,7 @@ public sealed class Plugin : IDalamudPlugin
         PocketBackendClient.Configure(Config);
 
         RecordingService = new RecordingService(this, GameInterop, Environment);
+        RetentionCleanupService = new RecordingRetentionCleanupService(this, Environment);
         AutoDutyRecordingService = new AutoDutyRecordingService(this, ClientState, DutyState, Framework);
         ConfigWindow = new ConfigWindow(this);
         FloatingRecordWindow = new FloatingRecordWindow(this);
@@ -455,6 +457,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        RetentionCleanupService.Dispose();
         AutoDutyRecordingService.Dispose();
         RecordingService.Dispose();
         CommandManager.RemoveHandler(CommandName);
