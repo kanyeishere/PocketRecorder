@@ -456,6 +456,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnUiBuilderDraw()
     {
+        FloatingRecordWindow.SyncOpenState();
         WindowSystem.Draw();
     }
 
