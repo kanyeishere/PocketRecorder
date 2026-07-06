@@ -1,8 +1,8 @@
 using Dalamud.Game.DutyState;
 using Dalamud.Plugin.Services;
-using OmenTools.Info.Game.Data;
+using FFXIVClientStructs.FFXIV.Client.System.Framework;
+using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using OmenTools.OmenService;
-using Recorder.Recording;
 using System;
 using System.IO;
 using System.Text.RegularExpressions;
@@ -22,7 +22,7 @@ internal sealed class AutoDutyRecordingService : IDisposable
     private readonly IFramework _framework;
     private readonly object _sync = new();
 
-    private bool _wasCountdownVisible;
+    private bool _wasCountdownActive;
     private bool _autoRecordingActive;
     private DateTime _recordStartTime;
     private DateTime _recordEndTime;
@@ -70,17 +70,17 @@ internal sealed class AutoDutyRecordingService : IDisposable
         if (!_plugin.Config.AutoRecordEightPlayerDuty)
             return;
 
-        bool countdownVisible = IsCountdownVisible();
-        bool countdownStarted = countdownVisible && !_wasCountdownVisible;
-        _wasCountdownVisible = countdownVisible;
+        CountdownState countdown = GetCountdownState();
+        bool countdownStarted = countdown.Active && !_wasCountdownActive;
+        _wasCountdownActive = countdown.Active;
 
         if (!countdownStarted)
             return;
 
-        TryStartAutoRecording();
+        TryStartAutoRecording(countdown.RemainingSeconds);
     }
 
-    private bool TryStartAutoRecording()
+    private bool TryStartAutoRecording(float countdownRemainingSeconds)
     {
         lock (_sync)
         {
@@ -99,7 +99,7 @@ internal sealed class AutoDutyRecordingService : IDisposable
             }
 
             _autoRecordingActive = true;
-            Plugin.Log.Info($"[AutoDuty] Started: duty={_recordDutyName}, path={_pendingTemporaryPath}");
+            Plugin.Log.Info($"[AutoDuty] Started from countdown agent: duty={_recordDutyName}, remaining={countdownRemainingSeconds:0.0}s, path={_pendingTemporaryPath}");
             return true;
         }
     }
@@ -112,13 +112,13 @@ internal sealed class AutoDutyRecordingService : IDisposable
 
     private void OnTerritoryChanged(uint territoryType)
     {
-        _wasCountdownVisible = false;
+        _wasCountdownActive = false;
         StopAutoRecording("territory changed");
     }
 
     private void OnLogout(int type, int code)
     {
-        _wasCountdownVisible = false;
+        _wasCountdownActive = false;
         StopAutoRecording("logout");
     }
 
@@ -180,10 +180,36 @@ internal sealed class AutoDutyRecordingService : IDisposable
         }
     }
 
-    private static unsafe bool IsCountdownVisible()
+    private static unsafe CountdownState GetCountdownState()
     {
-        var addon = Addons.ScreenInfoCountDown;
-        return addon != null && addon->IsVisible && addon->IsFullyLoaded();
+        try
+        {
+            var framework = Framework.Instance();
+            if (framework == null)
+                return default;
+
+            var uiModule = framework->GetUIModule();
+            if (uiModule == null)
+                return default;
+
+            var agentModule = uiModule->GetAgentModule();
+            if (agentModule == null)
+                return default;
+
+            var countdownAgent = agentModule->GetAgentByInternalId(AgentId.CountDownSettingDialog);
+            if (countdownAgent == null)
+                return default;
+
+            float timer = *(float*)((byte*)countdownAgent + 0x28);
+            bool isActive = *(bool*)((byte*)countdownAgent + 0x38);
+            return isActive && timer > 0f
+                ? new CountdownState(true, timer)
+                : default;
+        }
+        catch
+        {
+            return default;
+        }
     }
 
     private static string GetDutyName()
@@ -238,4 +264,6 @@ internal sealed class AutoDutyRecordingService : IDisposable
         _clientState.Logout -= OnLogout;
         _dutyState.DutyWiped -= OnDutyWiped;
     }
+
+    private readonly record struct CountdownState(bool Active, float RemainingSeconds);
 }
