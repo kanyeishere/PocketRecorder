@@ -223,7 +223,7 @@ internal sealed class RecordingService : IDisposable
                 config.UseHardwareEncoder,
                 config.IncludeOverlay,
                 config.VideoOutputScaleMode,
-                config.EffectiveForceFFmpegFallbackForTesting,
+                config.ForceFFmpegRecording,
                 gameGraphicsDevice);
             RecordingDiagnosticLog.StartSession(
                 request.SessionId,
@@ -235,8 +235,8 @@ internal sealed class RecordingService : IDisposable
                 request.AudioCaptureMode,
                 request.IncludeOverlay,
                 request.VideoOutputScaleMode,
-                request.ForceFFmpegFallbackForTesting,
-                !request.ForceFFmpegFallbackForTesting && request.UseHardwareEncoder,
+                request.ForceFFmpegRecording,
+                !request.ForceFFmpegRecording && request.UseHardwareEncoder,
                 gameGraphicsDevice.DiagnosticSummary);
             backendPlan = _backendSelector.SelectInitial(request);
             RecordingDiagnosticLog.UpdateBackendSelection(backendPlan.Reason, backendPlan.NativeRecorderProbeReason);
@@ -286,7 +286,7 @@ internal sealed class RecordingService : IDisposable
             request.AudioCaptureMode,
             request.IncludeOverlay,
             request.VideoOutputScaleMode,
-            request.ForceFFmpegFallbackForTesting,
+            request.ForceFFmpegRecording,
             backendPlan.PrefersD3D11TextureFrames,
             backendPlan.Reason,
             backendPlan.NativeRecorderProbeReason);
@@ -348,7 +348,7 @@ internal sealed class RecordingService : IDisposable
         }
 
         _environment.Log.Info($"[Record] Preparation started -> {request.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
-        _environment.Log.Info($"[Record] Config: fps={request.TargetFps}, captureFps={captureFps}, bitrate={request.VideoBitrate}, codec={request.VideoCodec}, preset={request.EncoderPreset}, audio={request.AudioCaptureMode}, hw={request.UseHardwareEncoder}, overlay={request.IncludeOverlay}, outputScale={request.VideoOutputScaleMode}, backend={backendPlan.Backend.DisplayName} ({backendPlan.Reason})");
+        _environment.Log.Info($"[Record] Config: fps={request.TargetFps}, captureFps={captureFps}, bitrate={request.VideoBitrate}, codec={request.VideoCodec}, preset={request.EncoderPreset}, audio={request.AudioCaptureMode}, hw={request.UseHardwareEncoder}, overlay={request.IncludeOverlay}, outputScale={request.VideoOutputScaleMode}, forceFFmpeg={request.ForceFFmpegRecording}, backend={backendPlan.Backend.DisplayName} ({backendPlan.Reason})");
         AmdRecordingDiagnosticLog.Write("Record", $"preparation started, startSyncMs={startSw.ElapsedMilliseconds}");
         RecordingStateChanged?.Invoke(true);
         return true;
