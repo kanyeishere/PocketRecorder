@@ -35,6 +35,7 @@ public sealed class Plugin : IDalamudPlugin
     internal AutoDutyRecordingService AutoDutyRecordingService { get; }
     internal ConfigWindow ConfigWindow { get; }
     internal FloatingRecordWindow FloatingRecordWindow { get; }
+    internal RecordingListWindow RecordingListWindow { get; }
 
     internal Dalamud.Interface.Windowing.WindowSystem WindowSystem { get; }
     internal volatile bool IsFFmpegBootstrapRunning;
@@ -55,10 +56,12 @@ public sealed class Plugin : IDalamudPlugin
         AutoDutyRecordingService = new AutoDutyRecordingService(this, ClientState, DutyState, Framework);
         ConfigWindow = new ConfigWindow(this);
         FloatingRecordWindow = new FloatingRecordWindow(this);
+        RecordingListWindow = new RecordingListWindow(this);
 
         WindowSystem = new Dalamud.Interface.Windowing.WindowSystem("Pocket Recorder");
         WindowSystem.AddWindow(ConfigWindow);
         WindowSystem.AddWindow(FloatingRecordWindow);
+        WindowSystem.AddWindow(RecordingListWindow);
 
         PluginInterface.UiBuilder.Draw += OnUiBuilderDraw;
         PluginInterface.UiBuilder.OpenConfigUi += () => ConfigWindow.IsOpen = true;
@@ -131,7 +134,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         CommandManager.AddHandler(commandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Pocket Recorder: start, end, toggle, status, autorecord on/off/toggle, floating on/off/toggle, fps, bitrate, audio, overlay, output, config, help。",
+            HelpMessage = "Pocket Recorder: start, end, toggle, status, list, autorecord on/off/toggle, floating on/off/toggle, fps, bitrate, audio, overlay, output, config, help。",
         });
     }
 
@@ -203,6 +206,13 @@ public sealed class Plugin : IDalamudPlugin
             case "folder":
             case "dir":
                 OpenOutputDirectory();
+                break;
+
+            case "list":
+            case "recordings":
+            case "videos":
+                RecordingListWindow.IsOpen = true;
+                Print("已打开录像列表。");
                 break;
 
             case "config":
@@ -448,6 +458,7 @@ public sealed class Plugin : IDalamudPlugin
     private static void PrintHelp()
     {
         Print("命令: start, end, toggle, status, config, output");
+        Print("录像列表: list");
         Print("自动录制: autorecord on/off/toggle/status");
         Print("悬浮按钮: floating on/off/toggle/status");
         Print("参数: fps 60, bitrate 32, audio game/system/off/status, overlay on/off/status");
@@ -471,6 +482,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw -= OnUiBuilderDraw;
         WindowSystem.RemoveWindow(FloatingRecordWindow);
         WindowSystem.RemoveWindow(ConfigWindow);
+        WindowSystem.RemoveWindow(RecordingListWindow);
         DService.Uninit();
     }
 }
