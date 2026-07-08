@@ -170,6 +170,12 @@ internal static class ConfigurationMigrator
             SaveVersion(config, pi, 21);
         }
 
+        if (config.Version < 22)
+        {
+            // Language defaults to Auto; no explicit assignment needed.
+            SaveVersion(config, pi, 22);
+        }
+
         config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
 
         if (!Enum.IsDefined(typeof(RecordingBackendMode), config.RecordingBackendMode))

@@ -11,9 +11,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.5.7</Version>
-    <AssemblyVersion>1.0.5.7</AssemblyVersion>
-    <FileVersion>1.0.5.7</FileVersion>
+    <Version>1.0.5.8</Version>
+    <AssemblyVersion>1.0.5.8</AssemblyVersion>
+    <FileVersion>1.0.5.8</FileVersion>
     <AssemblyName>PocketRecorder</AssemblyName>
     <RootNamespace>Recorder</RootNamespace>
     <DalamudLibPath>$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
@@ -42,6 +42,10 @@
     <None Remove="PocketRecorder.json" />
     <None Remove="images\icon.png" />
     <EmbeddedResource Include="PocketRecorder.json" />
+    <EmbeddedResource Include="Localization\locales\en.json" />
+    <EmbeddedResource Include="Localization\locales\ja.json" />
+    <EmbeddedResource Include="Localization\locales\zh-CN.json" />
+    <EmbeddedResource Include="Localization\locales\zh-TW.json" />
     <Content Include="PocketRecorder.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="images\star-*.png" CopyToOutputDirectory="PreserveNewest" />
