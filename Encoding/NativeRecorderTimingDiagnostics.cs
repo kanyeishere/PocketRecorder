@@ -7,12 +7,12 @@ namespace Recorder.Encoding;
 
 internal sealed class NativeRecorderTimingDiagnostics
 {
-    private readonly List<long> _captureDeltaHns = [];
-    private readonly List<long> _captureJitterHns = [];
-    private readonly List<long> _sampleAgeTicks = [];
-    private readonly List<long> _submitAttemptTicks = [];
-    private readonly List<long> _acceptedSubmitTicks = [];
-    private readonly List<long> _rejectedSubmitTicks = [];
+    private readonly RollingSamples _captureDeltaHns = new();
+    private readonly RollingSamples _captureJitterHns = new();
+    private readonly RollingSamples _sampleAgeTicks = new();
+    private readonly RollingSamples _submitAttemptTicks = new();
+    private readonly RollingSamples _acceptedSubmitTicks = new();
+    private readonly RollingSamples _rejectedSubmitTicks = new();
 
     private long _expectedFrameHns;
     private long _frameBudgetTicks;
@@ -121,25 +121,26 @@ internal sealed class NativeRecorderTimingDiagnostics
                ", thresholds=early<75%,late>125%,longGap>200%";
     }
 
-    private static string FormatHnsSummary(List<long> values)
+    private static string FormatHnsSummary(RollingSamples values)
     {
-        if (values.Count == 0)
+        long[] snapshot = values.Snapshot();
+        if (snapshot.Length == 0)
             return "count=0";
 
-        return FormatSummary(values, value => value / 10_000.0);
+        return FormatSummary(snapshot, values.TotalCount, value => value / 10_000.0);
     }
 
-    private static string FormatTicksSummary(List<long> values)
+    private static string FormatTicksSummary(RollingSamples values)
     {
-        if (values.Count == 0)
+        long[] snapshot = values.Snapshot();
+        if (snapshot.Length == 0)
             return "count=0";
 
-        return FormatSummary(values, value => value * 1_000.0 / Stopwatch.Frequency);
+        return FormatSummary(snapshot, values.TotalCount, value => value * 1_000.0 / Stopwatch.Frequency);
     }
 
-    private static string FormatSummary(List<long> values, Func<long, double> toMilliseconds)
+    private static string FormatSummary(long[] sorted, long totalCount, Func<long, double> toMilliseconds)
     {
-        long[] sorted = values.ToArray();
         Array.Sort(sorted);
 
         double p50 = toMilliseconds(Percentile(sorted, 0.50));
@@ -151,7 +152,8 @@ internal sealed class NativeRecorderTimingDiagnostics
             avg += toMilliseconds(sorted[i]);
         avg /= sorted.Length;
 
-        return "count=" + sorted.Length.ToString(CultureInfo.InvariantCulture) +
+        return "count=" + totalCount.ToString(CultureInfo.InvariantCulture) +
+               ",sampled=" + sorted.Length.ToString(CultureInfo.InvariantCulture) +
                ",avg=" + FormatMs(avg) +
                ",p50=" + FormatMs(p50) +
                ",p95=" + FormatMs(p95) +
@@ -171,4 +173,36 @@ internal sealed class NativeRecorderTimingDiagnostics
 
     private static string FormatMs(double value)
         => value.ToString("0.###", CultureInfo.InvariantCulture);
+
+    private sealed class RollingSamples
+    {
+        private const int Capacity = 65_536;
+        private readonly List<long> _values = new(Capacity);
+        private int _nextIndex;
+
+        public long TotalCount { get; private set; }
+
+        public void Add(long value)
+        {
+            TotalCount++;
+            if (_values.Count < Capacity)
+            {
+                _values.Add(value);
+                return;
+            }
+
+            _values[_nextIndex] = value;
+            _nextIndex = (_nextIndex + 1) % Capacity;
+        }
+
+        public void Clear()
+        {
+            _values.Clear();
+            _nextIndex = 0;
+            TotalCount = 0;
+        }
+
+        public long[] Snapshot()
+            => _values.ToArray();
+    }
 }

@@ -329,6 +329,7 @@ struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             nvenc_encode_frame(*encoder, video.codec, packets, &picture_params);
             for (const PrNvencOutputPacket& packet : packets)
             {
+                bitstream_diagnostics.record(packet.frame, packet.key_frame, video.codec);
                 if (packet.frame.empty())
                     continue;
 
@@ -368,6 +369,7 @@ struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
                 nvenc_end_encode(*encoder, video.codec, packets);
                 for (const PrNvencOutputPacket& packet : packets)
                 {
+                    bitstream_diagnostics.record(packet.frame, packet.key_frame, video.codec);
                     if (packet.frame.empty())
                         continue;
 
@@ -396,12 +398,12 @@ struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
 
         encoder.reset();
         clear_common_video_state();
-        converter.reset();
 
         if (initialized && SUCCEEDED(result))
         {
             set_last_error("NativeRecorder finalized via NvEncoderD3D11 + libavformat. " + finalize_stats());
         }
+        converter.reset();
 
         return result;
     }

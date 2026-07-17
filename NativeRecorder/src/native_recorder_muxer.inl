@@ -22,6 +22,22 @@ struct LibavMp4Muxer
     int audio_encoder_frame_size = 0;
     int encoded_width = 0;
     int encoded_height = 0;
+    uint64_t video_extradata_bytes = 0;
+    uint64_t actual_video_packets_written = 0;
+    uint64_t actual_audio_packets_written = 0;
+    uint64_t actual_video_bytes_written = 0;
+    uint64_t actual_audio_bytes_written = 0;
+    uint64_t video_monotonic_corrections = 0;
+    uint64_t audio_input_packets = 0;
+    uint64_t audio_timestamp_discontinuities = 0;
+    uint64_t final_file_bytes = 0;
+    int64_t first_audio_input_timestamp_hns = -1;
+    int64_t last_audio_input_timestamp_hns = -1;
+    int64_t last_audio_input_end_hns = -1;
+    int64_t max_audio_timestamp_gap_hns = 0;
+    int64_t video_end_hns = 0;
+    int64_t audio_end_hns = 0;
+    bool trailer_succeeded = false;
 
     ~LibavMp4Muxer()
     {
@@ -39,6 +55,7 @@ struct LibavMp4Muxer
         encoded_width = video_encoded_width(video);
         encoded_height = video_encoded_height(video);
         output_path_utf8 = wide_to_utf8(output_path.c_str());
+        video_extradata_bytes = static_cast<uint64_t>(video_extradata.size());
         if (output_path_utf8.empty())
             return E_INVALIDARG;
 
@@ -290,11 +307,16 @@ struct LibavMp4Muxer
         int64_t relative_hns = std::max<int64_t>(0, timestamp_hns - first_video_timestamp_hns);
         int64_t pts = hns_to_stream_ticks(relative_hns, video_stream->time_base);
         if (last_video_pts >= 0 && pts <= last_video_pts)
+        {
             pts = last_video_pts + std::max<int64_t>(1, hns_to_stream_ticks(static_cast<int64_t>(duration_hns), video_stream->time_base));
+            ++video_monotonic_corrections;
+        }
 
         packet->pts = pts;
         packet->dts = pts;
         packet->duration = std::max<int64_t>(1, hns_to_stream_ticks(static_cast<int64_t>(duration_hns), video_stream->time_base));
+        const int64_t written_pts = packet->pts;
+        const int64_t written_duration = packet->duration;
 
         ret = av_interleaved_write_frame(format_context, packet);
         if (ret < 0)
@@ -304,6 +326,12 @@ struct LibavMp4Muxer
         }
 
         last_video_pts = pts;
+        ++actual_video_packets_written;
+        actual_video_bytes_written += static_cast<uint64_t>(data.size());
+        video_end_hns = av_rescale_q(
+            written_pts + written_duration,
+            video_stream->time_base,
+            AVRational{1, 10'000'000});
         return S_OK;
     }
 
@@ -317,6 +345,22 @@ struct LibavMp4Muxer
             first_audio_timestamp_hns = timestamp_hns;
             next_audio_pts = 0;
         }
+
+        ++audio_input_packets;
+        if (first_audio_input_timestamp_hns < 0)
+            first_audio_input_timestamp_hns = timestamp_hns;
+        const int bytes_per_frame = std::max(1, audio.channels * bytes_per_audio_sample(audio));
+        const int64_t packet_samples = byte_count / bytes_per_frame;
+        const int64_t packet_duration_hns = packet_samples * 10'000'000ll / std::max(1, audio.sample_rate);
+        if (last_audio_input_end_hns >= 0)
+        {
+            const int64_t gap_hns = timestamp_hns - last_audio_input_end_hns;
+            max_audio_timestamp_gap_hns = std::max(max_audio_timestamp_gap_hns, std::llabs(gap_hns));
+            if (std::llabs(gap_hns) > 20'000)
+                ++audio_timestamp_discontinuities;
+        }
+        last_audio_input_timestamp_hns = timestamp_hns;
+        last_audio_input_end_hns = timestamp_hns + packet_duration_hns;
 
         const auto* bytes = static_cast<const uint8_t*>(data);
         pending_audio.insert(pending_audio.end(), bytes, bytes + byte_count);
@@ -400,9 +444,20 @@ struct LibavMp4Muxer
 
             av_packet_rescale_ts(holder.get(), audio_encoder->time_base, audio_stream->time_base);
             holder.get()->stream_index = audio_stream->index;
+            const int packet_size = holder.get()->size;
+            const int64_t packet_pts = holder.get()->pts;
+            const int64_t packet_duration = holder.get()->duration > 0
+                ? holder.get()->duration
+                : std::max<int64_t>(1, audio_encoder_frame_size);
             ret = av_interleaved_write_frame(format_context, holder.get());
             if (ret < 0)
                 return fail_ffmpeg("av_interleaved_write_frame(audio)", ret);
+            ++actual_audio_packets_written;
+            actual_audio_bytes_written += static_cast<uint64_t>(std::max(0, packet_size));
+            audio_end_hns = av_rescale_q(
+                packet_pts + packet_duration,
+                audio_stream->time_base,
+                AVRational{1, 10'000'000});
             av_packet_unref(holder.get());
         }
     }
@@ -422,11 +477,22 @@ struct LibavMp4Muxer
             int ret = av_write_trailer(format_context);
             if (ret < 0 && SUCCEEDED(result))
                 result = fail_ffmpeg("av_write_trailer", ret);
+            trailer_succeeded = ret >= 0;
         }
         trailer_written = true;
 
         if (format_context != nullptr && (format_context->oformat->flags & AVFMT_NOFILE) == 0)
             avio_closep(&format_context->pb);
+
+        try
+        {
+            if (!output_path_utf8.empty() && std::filesystem::exists(output_path_utf8))
+                final_file_bytes = static_cast<uint64_t>(std::filesystem::file_size(output_path_utf8));
+        }
+        catch (...)
+        {
+            final_file_bytes = 0;
+        }
 
         if (audio_frame != nullptr)
             av_frame_free(&audio_frame);
@@ -441,6 +507,53 @@ struct LibavMp4Muxer
         av_channel_layout_uninit(&encoder_audio_layout);
         pending_audio.clear();
         return result;
+    }
+
+    std::string integrity_summary() const
+    {
+        const bool audio_ok = !audio.enabled || actual_audio_packets_written > 0;
+        const bool healthy = header_written && trailer_succeeded &&
+            actual_video_packets_written > 0 && audio_ok && final_file_bytes > 0;
+        const int64_t av_duration_delta_hns = audio.enabled
+            ? audio_end_hns - video_end_hns
+            : 0;
+        const uint64_t actual_video_bitrate_bps = video_end_hns > 0
+            ? static_cast<uint64_t>(
+                static_cast<long double>(actual_video_bytes_written) * 8.0L * 10'000'000.0L /
+                static_cast<long double>(video_end_hns))
+            : 0;
+        const uint64_t target_video_bitrate_bps = static_cast<uint64_t>(std::max(0, video.bitrate_bps));
+        const uint64_t bitrate_ratio_percent = target_video_bitrate_bps > 0
+            ? static_cast<uint64_t>(
+                static_cast<long double>(actual_video_bitrate_bps) * 100.0L /
+                static_cast<long double>(target_video_bitrate_bps))
+            : 0;
+        const uint64_t average_packet_bytes = actual_video_packets_written > 0
+            ? actual_video_bytes_written / actual_video_packets_written
+            : 0;
+        return "muxIntegrity=" + std::string(healthy ? "ok" : "incomplete") +
+            ",headerWritten=" + std::string(header_written ? "true" : "false") +
+            ",trailerSucceeded=" + std::string(trailer_succeeded ? "true" : "false") +
+            ",videoExtradataBytes=" + std::to_string(video_extradata_bytes) +
+            ",actualVideoPackets=" + std::to_string(actual_video_packets_written) +
+            ",actualAudioPackets=" + std::to_string(actual_audio_packets_written) +
+            ",actualVideoBytes=" + std::to_string(actual_video_bytes_written) +
+            ",actualAudioBytes=" + std::to_string(actual_audio_bytes_written) +
+            ",targetVideoBitrateBps=" + std::to_string(target_video_bitrate_bps) +
+            ",actualVideoBitrateBps=" + std::to_string(actual_video_bitrate_bps) +
+            ",videoBitrateRatioPercent=" + std::to_string(bitrate_ratio_percent) +
+            ",averageVideoPacketBytes=" + std::to_string(average_packet_bytes) +
+            ",videoMonotonicCorrections=" + std::to_string(video_monotonic_corrections) +
+            ",videoDurationHns=" + std::to_string(video_end_hns) +
+            ",audioDurationHns=" + std::to_string(audio_end_hns) +
+            ",audioMinusVideoDurationHns=" + std::to_string(av_duration_delta_hns) +
+            ",audioInputPackets=" + std::to_string(audio_input_packets) +
+            ",audioTimestampMode=continuous-samples(input timestamps diagnostics only)" +
+            ",audioTimestampDiscontinuities=" + std::to_string(audio_timestamp_discontinuities) +
+            ",maxAudioTimestampGapHns=" + std::to_string(max_audio_timestamp_gap_hns) +
+            ",firstAudioInputTimestampHns=" + std::to_string(first_audio_input_timestamp_hns) +
+            ",lastAudioInputTimestampHns=" + std::to_string(last_audio_input_timestamp_hns) +
+            ",outputFileBytes=" + std::to_string(final_file_bytes);
     }
 };
 
@@ -635,7 +748,8 @@ struct AsyncLibavMp4Muxer
             ", muxAudioWriteMs=" + audio_write_stats.summary_ms() +
             ", muxMaxQueue=" + std::to_string(max_queue_depth.load(std::memory_order_relaxed)) +
             ", muxVideoDrops=" + std::to_string(video_queue_drops.load(std::memory_order_relaxed)) +
-            ", muxAudioDrops=" + std::to_string(audio_queue_drops.load(std::memory_order_relaxed));
+            ", muxAudioDrops=" + std::to_string(audio_queue_drops.load(std::memory_order_relaxed)) +
+            ", " + muxer.integrity_summary();
     }
 
     void update_max_queue_depth(size_t depth)

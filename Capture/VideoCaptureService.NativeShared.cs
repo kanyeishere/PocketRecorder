@@ -61,10 +61,13 @@ internal sealed unsafe partial class VideoCaptureService
             return false;
         }
 
+        _nativeSharedAcquireAttempts++;
+        long acquireStartTicks = Stopwatch.GetTimestamp();
         int acquireHr = D3D11InteropHelpers.AcquireKeyedMutex(
             keyedMutex,
             NativeSharedGameWriteKey,
             NativeSharedAcquireTimeoutMs);
+        long acquireTicks = Math.Max(0, Stopwatch.GetTimestamp() - acquireStartTicks);
         if (acquireHr == WaitTimeout || acquireHr == DxgiErrorWaitTimeout)
         {
             SkipNativeSharedFrameForBusySlot();
@@ -75,6 +78,10 @@ internal sealed unsafe partial class VideoCaptureService
             DisableNativeSharedPath($"IDXGIKeyedMutex::AcquireSync(game-write) failed: 0x{acquireHr:X8}.");
             return false;
         }
+
+        _nativeSharedAcquireSuccesses++;
+        _nativeSharedAcquireTotalTicks += acquireTicks;
+        _nativeSharedAcquireMaxTicks = Math.Max(_nativeSharedAcquireMaxTicks, acquireTicks);
 
         ID3D11Texture2D* sharedTexture = (ID3D11Texture2D*)_nativeSharedTexture;
         if (_nativeSharedGameBridgeTexture != IntPtr.Zero)
@@ -95,10 +102,12 @@ internal sealed unsafe partial class VideoCaptureService
             ctx->Flush();
             helperContext->CopyResource((ID3D11Resource*)sharedTexture, (ID3D11Resource*)helperBridgeTexture);
             helperContext->Flush();
+            _nativeSharedBridgeCopies++;
         }
         else
         {
             ctx->CopyResource((ID3D11Resource*)sharedTexture, (ID3D11Resource*)srcTexture);
+            _nativeSharedDirectCopies++;
         }
 
         int releaseHr = D3D11InteropHelpers.ReleaseKeyedMutex(keyedMutex, NativeSharedEncoderReadKey);
@@ -107,9 +116,11 @@ internal sealed unsafe partial class VideoCaptureService
             DisableNativeSharedPath($"IDXGIKeyedMutex::ReleaseSync(encoder-read) failed: 0x{releaseHr:X8}.");
             return false;
         }
+        _nativeSharedReleaseSuccesses++;
 
         long timestampHns = timestampTicks * 10_000_000L / Stopwatch.Frequency;
         mailbox.Publish(timestampHns);
+        _nativeSharedPublishedFrames++;
 
         VideoFrame frame = new(mailbox, timestampHns);
         bool delivered = false;

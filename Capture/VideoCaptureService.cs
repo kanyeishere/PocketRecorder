@@ -51,6 +51,14 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private int _nativeSharedBusySkipCount;
     private int _nativeSharedBusySkipSuppressed;
     private long _lastNativeSharedBusyLogTicks;
+    private long _nativeSharedAcquireAttempts;
+    private long _nativeSharedAcquireSuccesses;
+    private long _nativeSharedReleaseSuccesses;
+    private long _nativeSharedPublishedFrames;
+    private long _nativeSharedBridgeCopies;
+    private long _nativeSharedDirectCopies;
+    private long _nativeSharedAcquireTotalTicks;
+    private long _nativeSharedAcquireMaxTicks;
     private bool _nativeSharedDisabled;
     private bool _nativeSharedFallbackLogged;
     private uint _nv12SourceWidth;
@@ -164,6 +172,14 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         _nativeSharedBusySkipCount = 0;
         _nativeSharedBusySkipSuppressed = 0;
         _lastNativeSharedBusyLogTicks = 0;
+        _nativeSharedAcquireAttempts = 0;
+        _nativeSharedAcquireSuccesses = 0;
+        _nativeSharedReleaseSuccesses = 0;
+        _nativeSharedPublishedFrames = 0;
+        _nativeSharedBridgeCopies = 0;
+        _nativeSharedDirectCopies = 0;
+        _nativeSharedAcquireTotalTicks = 0;
+        _nativeSharedAcquireMaxTicks = 0;
         _nativeSharedDisabled = false;
         _nativeSharedFallbackLogged = false;
         _lockedOutputPixelFormat = null;
@@ -203,7 +219,16 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
         WaitForPresentDetoursToDrain();
         _sw.Stop();
         _nv12PerfStats.FlushIfAny();
-        string stopSummary = $"Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, nonGameSwapChainSkips={_nonGameSwapChainSkipCount}, nativeBusySkips={_nativeSharedBusySkipCount}, nv12BusySkips={_nv12BusySkipCount}, errors={_errorCount}, method={_captureMethod}, {_framePacer.BuildSummary()}";
+        double acquireAvgUs = _nativeSharedAcquireSuccesses > 0
+            ? _nativeSharedAcquireTotalTicks * 1_000_000.0 / Stopwatch.Frequency / _nativeSharedAcquireSuccesses
+            : 0;
+        double acquireMaxUs = _nativeSharedAcquireMaxTicks * 1_000_000.0 / Stopwatch.Frequency;
+        string nativeHandshake =
+            $"nativeHandshake=attempts:{_nativeSharedAcquireAttempts},acquired:{_nativeSharedAcquireSuccesses}," +
+            $"released:{_nativeSharedReleaseSuccesses},published:{_nativeSharedPublishedFrames}," +
+            $"bridgeCopies:{_nativeSharedBridgeCopies},directCopies:{_nativeSharedDirectCopies}," +
+            $"acquireAvgUs:{acquireAvgUs:0.###},acquireMaxUs:{acquireMaxUs:0.###}";
+        string stopSummary = $"Capture stopped. frames={_frameCount}, skipped={_skipCount}, backpressureSkips={_backpressureSkipCount}, nonGameSwapChainSkips={_nonGameSwapChainSkipCount}, nativeBusySkips={_nativeSharedBusySkipCount}, nv12BusySkips={_nv12BusySkipCount}, errors={_errorCount}, method={_captureMethod}, {nativeHandshake}, {_framePacer.BuildSummary()}";
         Plugin.Log!.Info($"[Video] {stopSummary}");
         RecordingDiagnosticLog.WriteIfEnabled("Video", stopSummary);
         AmdRecordingDiagnosticLog.Write("Video", stopSummary);

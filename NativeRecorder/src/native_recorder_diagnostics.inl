@@ -1,12 +1,17 @@
 struct NativeTimingStats
 {
+    static constexpr size_t kMaxSamples = 65'536;
     mutable std::mutex mutex;
     std::vector<uint64_t> samples_us;
+    uint64_t total_samples = 0;
+    size_t next_sample_index = 0;
 
     void reset()
     {
         std::lock_guard lock(mutex);
         samples_us.clear();
+        total_samples = 0;
+        next_sample_index = 0;
     }
 
     void record_us(uint64_t value_us) noexcept
@@ -14,7 +19,16 @@ struct NativeTimingStats
         try
         {
             std::lock_guard lock(mutex);
-            samples_us.push_back(value_us);
+            ++total_samples;
+            if (samples_us.size() < kMaxSamples)
+            {
+                samples_us.push_back(value_us);
+            }
+            else
+            {
+                samples_us[next_sample_index] = value_us;
+                next_sample_index = (next_sample_index + 1) % kMaxSamples;
+            }
         }
         catch (...)
         {
@@ -35,9 +49,11 @@ struct NativeTimingStats
     std::string summary_ms() const
     {
         std::vector<uint64_t> values;
+        uint64_t sample_total = 0;
         {
             std::lock_guard lock(mutex);
             values = samples_us;
+            sample_total = total_samples;
         }
 
         if (values.empty())
@@ -45,12 +61,13 @@ struct NativeTimingStats
 
         std::sort(values.begin(), values.end());
 
-        uint64_t total = 0;
+        uint64_t sum_us = 0;
         for (uint64_t value : values)
-            total += value;
+            sum_us += value;
 
-        const uint64_t avg = total / static_cast<uint64_t>(values.size());
-        return "count=" + std::to_string(values.size()) +
+        const uint64_t avg = sum_us / static_cast<uint64_t>(values.size());
+        return "count=" + std::to_string(sample_total) +
+            ",sampled=" + std::to_string(values.size()) +
             ",avg=" + format_ms(avg) +
             ",p50=" + format_ms(percentile(values, 50)) +
             ",p95=" + format_ms(percentile(values, 95)) +

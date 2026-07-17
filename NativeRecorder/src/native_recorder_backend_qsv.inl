@@ -778,6 +778,7 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
         const bool key_frame =
             (task.bitstream.FrameType & MFX_FRAMETYPE_IDR) != 0 ||
             (task.bitstream.FrameType & MFX_FRAMETYPE_I) != 0;
+        bitstream_diagnostics.record(packet, key_frame, video.codec);
         const int64_t timestamp = take_output_timestamp(-1);
 
         HRESULT hr = muxer.enqueue_video_packet(packet, key_frame, timestamp, video_sample_duration_hns);
@@ -926,12 +927,12 @@ struct IntelVplLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
             result = mux_hr;
 
         clear_common_video_state();
-        converter.reset();
 
         if (initialized && SUCCEEDED(result))
         {
             set_last_error("NativeRecorder finalized via oneVPL QSV + libavformat. " + finalize_stats());
         }
+        converter.reset();
 
         return result;
     }

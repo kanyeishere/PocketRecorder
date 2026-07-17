@@ -15,6 +15,8 @@ internal static class RecordingDiagnosticLog
     private const int MaxLogFiles = 20;
     private const int MaxUploadChars = 120_000;
     private const int MaxPendingLines = 120;
+    private const int MaxInMemorySessionLines = 2_048;
+    private const int InMemoryHeadLines = 128;
 
     private static readonly Regex WindowsPathRegex = new(@"(?i)\b[a-z]:\\[^\r\n\t""'<>|]*", RegexOptions.Compiled);
     private static readonly Regex UncPathRegex = new(@"\\\\(?!\.\\pipe\\)[^\s""'<>|]+", RegexOptions.Compiled);
@@ -28,6 +30,7 @@ internal static class RecordingDiagnosticLog
     private static string[] _pendingHeaderLines = [];
     private static RecordingTelemetryContext? _context;
     private static string _finalFrameDiagnostics = string.Empty;
+    private static bool _hadFailure;
     private static bool _cleanupAttempted;
     private static int _writeFailureLogged;
 
@@ -75,8 +78,10 @@ internal static class RecordingDiagnosticLog
                 _pendingHeaderLines = headerLines.ToArray();
                 _context = null;
                 _finalFrameDiagnostics = string.Empty;
+                _hadFailure = false;
                 PendingLines.Clear();
                 SessionLines.Clear();
+                StartLogNoLock(sessionId, "recording session");
             }
         }
         catch (Exception ex)
@@ -131,6 +136,7 @@ internal static class RecordingDiagnosticLog
         {
             lock (Sync)
             {
+                _hadFailure = true;
                 string line = $"{component} | {Normalize(message)}";
                 if (!string.IsNullOrWhiteSpace(_logPath))
                 {
@@ -210,10 +216,13 @@ internal static class RecordingDiagnosticLog
                         AppendLineNoLock($"FinalFrames | {_finalFrameDiagnostics}");
                     AppendLineNoLock($"Session | {Normalize(message)}");
                     AppendLineNoLock("=== Native recorder diagnostics ended ===");
-                    uploadFileName = Path.GetFileName(_logPath);
-                    uploadText = BuildUploadTextNoLock();
-                    uploadContext = _context;
-                    uploadFinalFrameDiagnostics = _finalFrameDiagnostics;
+                    if (_hadFailure)
+                    {
+                        uploadFileName = Path.GetFileName(_logPath);
+                        uploadText = BuildUploadTextNoLock();
+                        uploadContext = _context;
+                        uploadFinalFrameDiagnostics = _finalFrameDiagnostics;
+                    }
                 }
 
                 _logPath = null;
@@ -221,6 +230,7 @@ internal static class RecordingDiagnosticLog
                 _pendingHeaderLines = [];
                 _context = null;
                 _finalFrameDiagnostics = string.Empty;
+                _hadFailure = false;
                 PendingLines.Clear();
                 SessionLines.Clear();
             }
@@ -285,6 +295,12 @@ internal static class RecordingDiagnosticLog
     {
         string line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff zzz} | {Sanitize(message)}{Environment.NewLine}";
         SessionLines.Add(line);
+        if (SessionLines.Count > MaxInMemorySessionLines)
+        {
+            SessionLines.RemoveRange(
+                InMemoryHeadLines,
+                SessionLines.Count - MaxInMemorySessionLines);
+        }
         File.AppendAllText(_logPath!, line, System.Text.Encoding.UTF8);
     }
 

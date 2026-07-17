@@ -667,6 +667,8 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
                     output_type == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_I;
             }
 
+            bitstream_diagnostics.record(packet, key_frame, video.codec);
+
             int64_t encoder_timestamp_hns = static_cast<int64_t>(data->GetPts());
             amf_int64 tagged_timestamp_hns = -1;
             if (amf_result_success(data->GetProperty(L"PTS", &tagged_timestamp_hns)))
@@ -750,12 +752,12 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
 
         context.Release();
         clear_common_video_state();
-        converter.reset();
 
         if (initialized && SUCCEEDED(result))
         {
             set_last_error("NativeRecorder finalized via AMF + libavformat. " + finalize_stats());
         }
+        converter.reset();
 
         return result;
     }

@@ -34,6 +34,171 @@ struct NativeEncoderCounters
     NativeTimingStats output_delay_wait_stats;
 };
 
+struct EncodedBitstreamDiagnostics
+{
+    uint64_t packet_count = 0;
+    uint64_t empty_packets = 0;
+    uint64_t total_bytes = 0;
+    uint64_t min_packet_bytes = 0;
+    uint64_t max_packet_bytes = 0;
+    uint64_t key_packets = 0;
+    uint64_t no_start_code_packets = 0;
+    uint64_t parameter_set_packets = 0;
+    uint64_t vps_nals = 0;
+    uint64_t sps_nals = 0;
+    uint64_t pps_nals = 0;
+    uint64_t idr_nals = 0;
+    uint64_t first_key_packet_index = 0;
+    uint64_t last_key_packet_index = 0;
+    uint64_t max_key_interval = 0;
+    uint64_t payload_hash = 1469598103934665603ull;
+    bool first_packet_was_key = false;
+    bool first_packet_had_parameter_set = false;
+
+    void record(const std::vector<uint8_t>& packet, bool key_frame, int32_t codec)
+    {
+        if (packet.empty())
+        {
+            ++empty_packets;
+            return;
+        }
+
+        ++packet_count;
+        const uint64_t packet_bytes = static_cast<uint64_t>(packet.size());
+        total_bytes += packet_bytes;
+        min_packet_bytes = min_packet_bytes == 0 ? packet_bytes : std::min(min_packet_bytes, packet_bytes);
+        max_packet_bytes = std::max(max_packet_bytes, packet_bytes);
+        for (uint8_t value : packet)
+        {
+            payload_hash ^= value;
+            payload_hash *= 1099511628211ull;
+        }
+
+        bool found_start_code = false;
+        bool found_parameter_set = false;
+        bool found_idr = false;
+        for (size_t offset = 0; offset + 3 <= packet.size();)
+        {
+            size_t start_code_length = 0;
+            if (offset + 4 <= packet.size() &&
+                packet[offset] == 0 && packet[offset + 1] == 0 &&
+                packet[offset + 2] == 0 && packet[offset + 3] == 1)
+            {
+                start_code_length = 4;
+            }
+            else if (packet[offset] == 0 && packet[offset + 1] == 0 && packet[offset + 2] == 1)
+            {
+                start_code_length = 3;
+            }
+
+            if (start_code_length == 0)
+            {
+                ++offset;
+                continue;
+            }
+
+            found_start_code = true;
+            const size_t nal_start = offset + start_code_length;
+            if (nal_start >= packet.size())
+                break;
+
+            if (codec == PR_CODEC_H264)
+            {
+                const uint8_t type = packet[nal_start] & 0x1F;
+                if (type == 7)
+                {
+                    ++sps_nals;
+                    found_parameter_set = true;
+                }
+                else if (type == 8)
+                {
+                    ++pps_nals;
+                    found_parameter_set = true;
+                }
+                else if (type == 5)
+                {
+                    ++idr_nals;
+                    found_idr = true;
+                }
+            }
+            else if (nal_start + 1 < packet.size())
+            {
+                const uint8_t type = (packet[nal_start] >> 1) & 0x3F;
+                if (type == 32)
+                {
+                    ++vps_nals;
+                    found_parameter_set = true;
+                }
+                else if (type == 33)
+                {
+                    ++sps_nals;
+                    found_parameter_set = true;
+                }
+                else if (type == 34)
+                {
+                    ++pps_nals;
+                    found_parameter_set = true;
+                }
+                else if (type >= 16 && type <= 21)
+                {
+                    ++idr_nals;
+                    found_idr = true;
+                }
+            }
+
+            offset = nal_start + 1;
+        }
+
+        if (!found_start_code)
+            ++no_start_code_packets;
+        if (found_parameter_set)
+            ++parameter_set_packets;
+
+        const bool effective_key = key_frame || found_idr;
+        if (packet_count == 1)
+        {
+            first_packet_was_key = effective_key;
+            first_packet_had_parameter_set = found_parameter_set;
+        }
+        if (effective_key)
+        {
+            ++key_packets;
+            if (first_key_packet_index == 0)
+                first_key_packet_index = packet_count;
+            if (last_key_packet_index > 0)
+                max_key_interval = std::max(max_key_interval, packet_count - last_key_packet_index);
+            last_key_packet_index = packet_count;
+        }
+    }
+
+    std::string summary() const
+    {
+        const char* health = packet_count == 0
+            ? "no-packets"
+            : key_packets == 0 ? "no-keyframe" : "structure-present";
+        char hash_buffer[32]{};
+        sprintf_s(hash_buffer, "0x%016llX", static_cast<unsigned long long>(payload_hash));
+        return "bitstreamHealth=" + std::string(health) +
+            ",bitstreamPackets=" + std::to_string(packet_count) +
+            ",emptyPackets=" + std::to_string(empty_packets) +
+            ",encodedBytes=" + std::to_string(total_bytes) +
+            ",packetBytesMin=" + std::to_string(min_packet_bytes) +
+            ",packetBytesMax=" + std::to_string(max_packet_bytes) +
+            ",keyPackets=" + std::to_string(key_packets) +
+            ",firstKeyPacket=" + std::to_string(first_key_packet_index) +
+            ",maxKeyInterval=" + std::to_string(max_key_interval) +
+            ",parameterSetPackets=" + std::to_string(parameter_set_packets) +
+            ",vps=" + std::to_string(vps_nals) +
+            ",sps=" + std::to_string(sps_nals) +
+            ",pps=" + std::to_string(pps_nals) +
+            ",idr=" + std::to_string(idr_nals) +
+            ",noStartCodePackets=" + std::to_string(no_start_code_packets) +
+            ",firstPacketKey=" + std::string(first_packet_was_key ? "true" : "false") +
+            ",firstPacketParameterSet=" + std::string(first_packet_had_parameter_set ? "true" : "false") +
+            ",payloadHash=" + hash_buffer;
+    }
+};
+
 struct NativePendingVideoFrame
 {
     size_t slot_index = 0;
@@ -433,6 +598,7 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
     bool initialized = false;
     bool stopped = false;
     NativeEncoderCounters counters{};
+    EncodedBitstreamDiagnostics bitstream_diagnostics{};
     int64_t video_sample_duration_hns = 0;
     NativeD3D11TexturePool conversion_nv12_pool;
     NativeVideoFrameQueue video_queue;
@@ -512,6 +678,13 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
         }
 
         ++counters.submitted_frames;
+        if (counters.submitted_frames % 300 == 0)
+        {
+            set_last_error("NativeRecorder live layered diagnostics: submitted=" +
+                std::to_string(counters.submitted_frames) +
+                ", " + converter.synchronization_diagnostics() +
+                ", " + converter.content_diagnostics());
+        }
         record_submit();
         return S_OK;
     }
@@ -672,7 +845,8 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
 
     std::string finalize_stats() const
     {
-        return "submitted=" + std::to_string(counters.submitted_frames) +
+        return layer_diagnosis() +
+            ", submitted=" + std::to_string(counters.submitted_frames) +
             ", encoderInput=" + std::to_string(counters.encoder_input_frames) +
             ", packets=" + std::to_string(counters.written_packets) +
             ", inputFullDrops=" + std::to_string(counters.encoder_input_full_drops) +
@@ -700,8 +874,85 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
             ", timestampPtsMatches=" + std::to_string(counters.timestamp_pts_matches) +
             ", timestampFifoFallbacks=" + std::to_string(counters.timestamp_fifo_fallbacks) +
             ", timestampMissingEntries=" + std::to_string(counters.timestamp_missing_entries) +
+            ", " + converter.synchronization_diagnostics() +
+            ", " + converter.content_diagnostics() +
+            ", " + bitstream_diagnostics.summary() +
             ", " + muxer.stats_summary() +
             ", audioPackets=" + std::to_string(counters.audio_packets);
+    }
+
+    std::string layer_diagnosis() const
+    {
+        const uint64_t keyed_acquires = converter.keyed_acquire_successes.load(std::memory_order_relaxed);
+        const uint64_t keyed_releases = converter.keyed_release_successes.load(std::memory_order_relaxed);
+        const uint64_t shared_copies = converter.fresh_shared_copies.load(std::memory_order_relaxed);
+        const bool sync_ok = keyed_acquires > 0 &&
+            keyed_acquires == keyed_releases &&
+            keyed_acquires == shared_copies;
+        const bool source_probe_available = converter.source_content_probe.completed > 0;
+        const bool source_ok = source_probe_available &&
+            converter.source_content_probe.all_black_frames == 0;
+        const bool nv12_probe_available = converter.nv12_content_probe.completed > 0;
+        const bool color_probe_matched = converter.has_matched_color_probe;
+        const bool conversion_tracks_source_changes =
+            !color_probe_matched ||
+            converter.matched_source_hash_changes == 0 ||
+            converter.matched_nv12_hash_changes > 0;
+        const bool nv12_ok = nv12_probe_available &&
+            converter.nv12_content_probe.all_black_frames == 0 &&
+            color_probe_matched &&
+            conversion_tracks_source_changes &&
+            converter.color_conversion_plausible();
+        const bool annex_b_headers_present = bitstream_diagnostics.sps_nals > 0 &&
+            bitstream_diagnostics.pps_nals > 0 &&
+            (video.codec != PR_CODEC_HEVC || bitstream_diagnostics.vps_nals > 0);
+        const bool codec_headers_present = muxer.muxer.video_extradata_bytes > 0 || annex_b_headers_present;
+        const bool encoder_ok = bitstream_diagnostics.packet_count > 0 &&
+            bitstream_diagnostics.empty_packets == 0 &&
+            bitstream_diagnostics.key_packets > 0 &&
+            bitstream_diagnostics.first_key_packet_index == 1 &&
+            codec_headers_present;
+        const bool mux_ok = muxer.muxer.header_written &&
+            muxer.muxer.trailer_succeeded &&
+            muxer.muxer.actual_video_packets_written > 0 &&
+            muxer.muxer.actual_video_packets_written == bitstream_diagnostics.packet_count &&
+            muxer.muxer.final_file_bytes > 0 &&
+            muxer.muxer.video_monotonic_corrections == 0 &&
+            muxer.video_queue_drops.load(std::memory_order_relaxed) == 0;
+        const bool audio_ok = !audio.enabled ||
+            (muxer.muxer.actual_audio_packets_written > 0 &&
+                muxer.audio_queue_drops.load(std::memory_order_relaxed) == 0 &&
+                muxer.muxer.audio_timestamp_discontinuities == 0);
+
+        const bool core_ok = sync_ok && source_ok && nv12_ok && encoder_ok && mux_ok && audio_ok;
+        const bool probes_missing = !source_probe_available || !nv12_probe_available || !color_probe_matched;
+        const bool observed_non_probe_layers_ok = sync_ok && encoder_ok && mux_ok && audio_ok;
+        const char* overall = core_ok
+            ? "ok"
+            : probes_missing && observed_non_probe_layers_ok ? "incomplete-observation" : "fault";
+        const char* source_layer = !source_probe_available
+            ? "no-probe"
+            : converter.source_content_probe.all_black_frames == converter.source_content_probe.completed
+                ? "all-black"
+                : converter.source_content_probe.all_black_frames > 0 ? "intermittent-black" : "content-present";
+        const char* conversion_layer = !nv12_probe_available
+            ? "no-probe"
+            : !color_probe_matched ? "no-matched-color-probe"
+            : nv12_ok ? "content-present"
+                : converter.nv12_content_probe.all_black_frames == converter.nv12_content_probe.completed
+                    ? (source_ok ? "nv12-black-source-valid" : "upstream-black")
+                : converter.nv12_content_probe.all_black_frames > 0 ? "intermittent-black"
+                : !conversion_tracks_source_changes ? "nv12-static-while-source-changed"
+                : !converter.color_conversion_plausible() ? "color-transform-mismatch"
+                : "content-observation-failed";
+
+        return "layerDiagnosis=overall:" + std::string(overall) +
+            ",sync:" + (sync_ok ? "ok" : "keyed-mismatch") +
+            ",source:" + source_layer +
+            ",conversion:" + conversion_layer +
+            ",encoder:" + (encoder_ok ? "headers-keyframe-packets-ok" : "missing-header-first-key-or-packets") +
+            ",mux:" + (mux_ok ? "file-and-trailer-ok" : "incomplete") +
+            ",audio:" + (audio_ok ? "ok" : "missing-or-dropped");
     }
 
     std::string conversion_pool_timeout_message() const

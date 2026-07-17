@@ -55,6 +55,7 @@ internal sealed class FFmpegWriter : IOutputSink
     private readonly string _preset;
     private readonly VideoPipelinePerfStats _stdinWritePerfStats = new("FFmpeg stdin.Write", "write");
     private readonly VideoPipelinePerfStats _nativeSnapshotPerfStats = new("FFmpeg native frame snapshot", "copy");
+    private readonly RawVideoContentDiagnostics _rawInputDiagnostics = new();
     private readonly ManualResetEventSlim _firstVideoFrameWritten = new(false);
 
     public bool SupportsAudio => _hasAudio;
@@ -91,6 +92,7 @@ internal sealed class FFmpegWriter : IOutputSink
         _processExitCode = "not-started";
         _stdinWritePerfStats.Reset();
         _nativeSnapshotPerfStats.Reset();
+        _rawInputDiagnostics.Reset();
         _firstVideoFrameWritten.Reset();
 
         // 确保输出目录
@@ -433,13 +435,20 @@ internal sealed class FFmpegWriter : IOutputSink
         {
             unsafe
             {
-                _stdin!.Write(new ReadOnlySpan<byte>(frame.DataPtr, frame.DataLength));
+                ReadOnlySpan<byte> data = new(frame.DataPtr, frame.DataLength);
+                _stdin!.Write(data);
             }
             long writeTicks = Stopwatch.GetTimestamp() - writeStartTicks;
             MarkWritePressureIfSlow(writeTicks);
             ReadOnlySpan<long> perfTicks = stackalloc long[] { writeTicks };
             _stdinWritePerfStats.Record(frame.Width, frame.Height, frame.DataLength, frame.PixelFormat, perfTicks);
             RecordWrittenVideoFrame(duplicate);
+            unsafe
+            {
+                ReadOnlySpan<byte> data = new(frame.DataPtr, frame.DataLength);
+                LogRawInputProbeIfUpdated(
+                    _rawInputDiagnostics.Observe(data, frame.Width, frame.Height, frame.PixelFormat, _frameCount));
+            }
             return;
         }
 
@@ -456,6 +465,8 @@ internal sealed class FFmpegWriter : IOutputSink
         _stdinWritePerfStats.Record(width, height, data.Length, pixelFormat, perfTicks);
 
         RecordWrittenVideoFrame(duplicate);
+        LogRawInputProbeIfUpdated(
+            _rawInputDiagnostics.Observe(data, width, height, pixelFormat, _frameCount));
     }
 
     private void RecordWrittenVideoFrame(bool duplicate)
@@ -735,20 +746,69 @@ internal sealed class FFmpegWriter : IOutputSink
 
         Plugin.Log.Info("[FFmpeg] Process exited.");
         _processExitCode = _process is { HasExited: true } ? _process.ExitCode.ToString() : "unknown";
+        if (!string.Equals(_processExitCode, "0", StringComparison.Ordinal))
+            RecordingDiagnosticLog.WriteNativeFailure("FFmpeg", $"process exited abnormally, exitCode={_processExitCode}");
         AmdRecordingDiagnosticLog.WriteForAmdCodec(_videoCodec, "FFmpeg", $"process exited, exitCode={_processExitCode}");
     }
 
     private string BuildFinalVideoDiagnostics()
     {
+        int outputFrames = Volatile.Read(ref _frameCount);
+        int droppedFrames = Volatile.Read(ref _droppedFrameCount);
+        int staleDrops = Volatile.Read(ref _staleFrameDropCount);
+        int audioPackets = Volatile.Read(ref _audioPackets);
+        int droppedAudio = Volatile.Read(ref _droppedAudioPacketCount);
+        bool rawInputOk = _rawInputDiagnostics.HasCompletedProbe && !_rawInputDiagnostics.HasBlackProbe;
+        bool deliveryOk = outputFrames > 0 && droppedFrames == 0 && staleDrops == 0;
+        bool processOk = string.Equals(_processExitCode, "0", StringComparison.Ordinal);
+        bool audioOk = !_hasAudio || (audioPackets > 0 && droppedAudio == 0);
+        string overall = !_rawInputDiagnostics.HasCompletedProbe
+            ? "incomplete-observation"
+            : rawInputOk && deliveryOk && processOk && audioOk ? "ok" : "fault";
+        long outputFileBytes = TryGetOutputFileBytes();
+        long containerBitrateBps = _finalVideoDuration is { TotalSeconds: > 0 } duration
+            ? (long)(outputFileBytes * 8.0 / duration.TotalSeconds)
+            : 0;
+
         return $"input={Volatile.Read(ref _inputFrameCount)}, " +
-               $"output={Volatile.Read(ref _frameCount)}, " +
+               $"output={outputFrames}, " +
                $"tailDuplicates={Volatile.Read(ref _tailDuplicateFrameCount)}, " +
-               $"dropped={Volatile.Read(ref _droppedFrameCount)}, " +
-               $"staleDrops={Volatile.Read(ref _staleFrameDropCount)}, " +
+               $"dropped={droppedFrames}, " +
+               $"staleDrops={staleDrops}, " +
                $"nativeCopies={Volatile.Read(ref _nativeManagedCopyFrameCount)}, " +
-               $"audioPackets={Volatile.Read(ref _audioPackets)}, " +
-               $"droppedAudio={Volatile.Read(ref _droppedAudioPacketCount)}, " +
-               $"exitCode={_processExitCode}";
+               $"audioPackets={audioPackets}, " +
+               $"droppedAudio={droppedAudio}, " +
+               $"exitCode={_processExitCode}, " +
+               $"ffmpegLayerDiagnosis=overall:{overall},rawInput:{_rawInputDiagnostics.Health}," +
+               $"delivery:{(deliveryOk ? "no-drops" : "missing-or-dropped")}," +
+               $"process:{(processOk ? "exit-0" : "nonzero-or-missing-exit")}," +
+               $"audio:{(audioOk ? "ok" : "missing-or-dropped")}, " +
+               $"{_rawInputDiagnostics.BuildSummary()}, " +
+               $"outputFileBytes={outputFileBytes},approxContainerBitrateBps={containerBitrateBps}";
+    }
+
+    private void LogRawInputProbeIfUpdated(bool updated)
+    {
+        if (!updated)
+            return;
+
+        string summary = _rawInputDiagnostics.BuildSummary();
+        Plugin.Log!.Info($"[FFmpeg] Raw encoder-input diagnostics: {summary}");
+        RecordingDiagnosticLog.WriteIfEnabled("FFmpeg", $"raw encoder-input diagnostics: {summary}");
+    }
+
+    private long TryGetOutputFileBytes()
+    {
+        try
+        {
+            return !string.IsNullOrWhiteSpace(_outputPath) && File.Exists(_outputPath)
+                ? new FileInfo(_outputPath).Length
+                : 0;
+        }
+        catch
+        {
+            return 0;
+        }
     }
 
     private void CloseStandardInput()

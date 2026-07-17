@@ -39,9 +39,12 @@ internal sealed class RecordingFinalizer
     private void FinalizeRecording(RecordingFinalizationJob job)
     {
         Stopwatch finalizeSw = Stopwatch.StartNew();
+        bool writerStopSucceeded = job.Writer != null;
+        string writerStopError = string.Empty;
         _log.Info($"[Record] Capture input paused after {job.Stopwatch.ElapsedMilliseconds}ms; finalizing writer.");
 
         StopAndDisposeAudioCapture(job.AudioCapture);
+        string audioCaptureDiagnostics = job.AudioCapture?.DiagnosticSummary ?? "audio-disabled-or-unavailable";
 
         try
         {
@@ -49,6 +52,8 @@ internal sealed class RecordingFinalizer
         }
         catch (Exception ex)
         {
+            writerStopSucceeded = false;
+            writerStopError = ex.Message;
             _log.Warning($"[Record] Writer stop failed: {ex.Message}");
         }
 
@@ -72,8 +77,41 @@ internal sealed class RecordingFinalizer
 
         job.MarkFinalized();
 
-        string finalFrameDiagnostics = job.Writer?.FinalVideoDiagnostics ?? "writer=null";
-        bool saved = job.Writer != null;
+        string finalFrameDiagnostics =
+            $"{job.Writer?.FinalVideoDiagnostics ?? "writer=null"}, " +
+            $"audioCaptureDiagnostics=[{audioCaptureDiagnostics}]";
+        bool outputExists = false;
+        long outputBytes = 0;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(job.OutputPath))
+            {
+                var outputInfo = new FileInfo(job.OutputPath);
+                outputExists = outputInfo.Exists;
+                outputBytes = outputInfo.Exists ? outputInfo.Length : 0;
+            }
+        }
+        catch (Exception ex)
+        {
+            writerStopSucceeded = false;
+            writerStopError = string.IsNullOrWhiteSpace(writerStopError)
+                ? $"output validation failed: {ex.Message}"
+                : $"{writerStopError}; output validation failed: {ex.Message}";
+        }
+
+        bool saved = job.Writer != null && writerStopSucceeded && outputExists && outputBytes > 0;
+        string outputValidation =
+            $"writerCreated={job.Writer != null}, writerStopSucceeded={writerStopSucceeded}, " +
+            $"outputExists={outputExists}, outputBytes={outputBytes}, " +
+            $"writerStopError={ValueOrNone(writerStopError)}";
+        finalFrameDiagnostics = $"{finalFrameDiagnostics}, outputValidation=[{outputValidation}]";
+        _log.Info($"[Record] Output validation: {outputValidation}");
+        _log.Info($"[Record] Layered quality diagnostics: {finalFrameDiagnostics}");
+        if (saved)
+            RecordingDiagnosticLog.WriteIfEnabled("Record", $"output validation: {outputValidation}");
+        else
+            RecordingDiagnosticLog.WriteNativeFailure("Record", $"output validation failed: {outputValidation}");
+        RecordingDiagnosticLog.WriteIfEnabled("Record", $"layered quality diagnostics: {finalFrameDiagnostics}");
         string? finishedOutputPath = job.OutputPath;
         if (saved && job.Starred && !string.IsNullOrWhiteSpace(job.OutputPath) && File.Exists(job.OutputPath))
         {
@@ -87,7 +125,10 @@ internal sealed class RecordingFinalizer
             }
         }
 
-        _log.Info($"[Record] Saved: {finishedOutputPath}, starred={job.Starred}, finalize={finalizeSw.ElapsedMilliseconds}ms");
+        if (saved)
+            _log.Info($"[Record] Saved: {finishedOutputPath}, starred={job.Starred}, bytes={outputBytes}, finalize={finalizeSw.ElapsedMilliseconds}ms");
+        else
+            _log.Warning($"[Record] Output was not validated as saved: {finishedOutputPath}, bytes={outputBytes}, finalize={finalizeSw.ElapsedMilliseconds}ms");
         AmdRecordingDiagnosticLog.FinishSession($"saved={saved}, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}");
         RecordingDiagnosticLog.FinishSession(
             $"saved={saved}, duration={job.FinalDuration}, finalizeMs={finalizeSw.ElapsedMilliseconds}, writerCreated={job.Writer != null}",
@@ -98,7 +139,7 @@ internal sealed class RecordingFinalizer
         {
             try
             {
-                job.FinishedCallback?.Invoke(new RecordingFinishedEventArgs(finishedOutputPath, job.FinalDuration, job.Writer != null, job.Starred));
+                job.FinishedCallback?.Invoke(new RecordingFinishedEventArgs(finishedOutputPath, job.FinalDuration, saved, job.Starred));
             }
             catch (Exception ex)
             {
@@ -106,6 +147,9 @@ internal sealed class RecordingFinalizer
             }
         }
     }
+
+    private static string ValueOrNone(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "<none>" : value;
 
     private static void DisposeVideoCapture(VideoCaptureService? videoCapture)
     {

@@ -4,6 +4,7 @@ using NAudio.Wasapi.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 using Recorder;
 using System;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -29,6 +30,7 @@ internal sealed class AudioCaptureService : IDisposable
     private WasapiLoopbackCapture? _capture;
     private AudioClient? _processAudioClient;
     private bool _running;
+    private bool _isFloat;
 
     public int SampleRate { get; private set; }
     public int Channels { get; private set; }
@@ -39,6 +41,20 @@ internal sealed class AudioCaptureService : IDisposable
 
     // 累计已采集的样本数，用于计算时间戳
     private long _totalSamples;
+    private long _diagnosticPackets;
+    private long _diagnosticSampleValues;
+    private long _diagnosticSilentPackets;
+    private long _diagnosticClippedValues;
+    private long _diagnosticInvalidValues;
+    private long _wasapiSilentBuffers;
+    private long _wasapiDiscontinuities;
+    private long _wasapiTimestampErrors;
+    private double _diagnosticSumSquares;
+    private double _diagnosticPeak;
+    private int _diagnosticsLogged;
+    private string _diagnosticSummary = "not-finalized";
+
+    public string DiagnosticSummary => _diagnosticSummary;
 
     public AudioCaptureService(AudioCaptureMode mode, int targetProcessId, Action<AudioPacket> onAudio)
     {
@@ -49,6 +65,7 @@ internal sealed class AudioCaptureService : IDisposable
 
     public void Start()
     {
+        ResetDiagnostics();
         _cts = new CancellationTokenSource();
         _running = true;
         _captureThread = new Thread(() => CaptureLoop(_cts.Token))
@@ -67,6 +84,7 @@ internal sealed class AudioCaptureService : IDisposable
         try { _capture?.StopRecording(); } catch { }
 
         _captureThread?.Join(3000);
+        LogDiagnosticsOnce();
         _cts?.Dispose();
         _cts = null;
         _captureThread = null;
@@ -120,7 +138,8 @@ internal sealed class AudioCaptureService : IDisposable
         SampleRate = wf.SampleRate;
         Channels = wf.Channels;
         BitsPerSample = wf.BitsPerSample;
-        bool isFloat = wf.Encoding == WaveFormatEncoding.IeeeFloat;
+        bool isFloat = wf.AsStandardWaveFormat().Encoding == WaveFormatEncoding.IeeeFloat;
+        _isFloat = isFloat;
 
         Plugin.Log!.Info($"[Audio] System WaveFormat: {SampleRate}Hz, {Channels}ch, {BitsPerSample}bit, encoding={wf.Encoding}, float={isFloat}");
         Plugin.Log.Info($"[Audio] BlockAlign={wf.BlockAlign}, AvgBytesPerSec={wf.AverageBytesPerSecond}");
@@ -154,6 +173,7 @@ internal sealed class AudioCaptureService : IDisposable
         SampleRate = wf.SampleRate;
         Channels = wf.Channels;
         BitsPerSample = wf.BitsPerSample;
+        _isFloat = true;
 
         _processAudioClient.Initialize(
             AudioClientShareMode.Shared,
@@ -193,6 +213,13 @@ internal sealed class AudioCaptureService : IDisposable
             IntPtr buffer = capture.GetBuffer(out int framesAvailable, out AudioClientBufferFlags flags);
             int bytesAvailable = framesAvailable * bytesPerFrame;
 
+            if ((flags & (AudioClientBufferFlags)0x1) != 0)
+                _wasapiDiscontinuities++;
+            if ((flags & (AudioClientBufferFlags)0x2) != 0)
+                _wasapiSilentBuffers++;
+            if ((flags & (AudioClientBufferFlags)0x4) != 0)
+                _wasapiTimestampErrors++;
+
             if (recordBuffer.Length - recordBufferOffset < bytesAvailable && recordBufferOffset > 0)
             {
                 EmitAudio(recordBuffer, recordBufferOffset);
@@ -228,6 +255,7 @@ internal sealed class AudioCaptureService : IDisposable
 
     private void EmitAudio(byte[] sourceBuffer, int bytesRecorded)
     {
+        long captureTicks = Stopwatch.GetTimestamp();
         // 计算时间戳（基于已采集样本数）
         int blockAlign = Channels * BitsPerSample / 8;
         if (blockAlign <= 0) return;
@@ -235,11 +263,140 @@ internal sealed class AudioCaptureService : IDisposable
         byte[] buffer = new byte[bytesRecorded];
         Array.Copy(sourceBuffer, buffer, bytesRecorded);
 
+        AnalyzeAudio(sourceBuffer, bytesRecorded);
+
         long samplesInPacket = bytesRecorded / blockAlign;
         long timestampHns = _totalSamples * 10_000_000L / SampleRate;
         _totalSamples += samplesInPacket;
 
-        _onAudio(new AudioPacket(buffer, SampleRate, Channels, BitsPerSample, timestampHns));
+        _onAudio(new AudioPacket(
+            buffer,
+            SampleRate,
+            Channels,
+            BitsPerSample,
+            timestampHns,
+            captureTicks));
+    }
+
+    private void ResetDiagnostics()
+    {
+        _diagnosticPackets = 0;
+        _diagnosticSampleValues = 0;
+        _diagnosticSilentPackets = 0;
+        _diagnosticClippedValues = 0;
+        _diagnosticInvalidValues = 0;
+        _wasapiSilentBuffers = 0;
+        _wasapiDiscontinuities = 0;
+        _wasapiTimestampErrors = 0;
+        _diagnosticSumSquares = 0;
+        _diagnosticPeak = 0;
+        _diagnosticsLogged = 0;
+        _diagnosticSummary = "not-finalized";
+    }
+
+    private void AnalyzeAudio(byte[] buffer, int byteCount)
+    {
+        if (byteCount <= 0)
+            return;
+
+        double packetPeak = 0;
+        double packetSumSquares = 0;
+        long packetValues = 0;
+        long packetClipped = 0;
+        long packetInvalid = 0;
+        ReadOnlySpan<byte> bytes = buffer.AsSpan(0, Math.Min(byteCount, buffer.Length));
+
+        if (_isFloat && BitsPerSample == 32)
+        {
+            foreach (float sample in MemoryMarshal.Cast<byte, float>(bytes))
+            {
+                bool valid = float.IsFinite(sample);
+                double value = valid ? Math.Abs((double)sample) : 1.0;
+                if (!valid)
+                    packetInvalid++;
+                packetPeak = Math.Max(packetPeak, value);
+                packetSumSquares += value * value;
+                packetValues++;
+                if (value >= 0.999)
+                    packetClipped++;
+            }
+        }
+        else if (BitsPerSample == 16)
+        {
+            foreach (short sample in MemoryMarshal.Cast<byte, short>(bytes))
+            {
+                double value = Math.Abs(sample / 32768.0);
+                packetPeak = Math.Max(packetPeak, value);
+                packetSumSquares += value * value;
+                packetValues++;
+                if (value >= 0.999)
+                    packetClipped++;
+            }
+        }
+        else if (BitsPerSample == 32)
+        {
+            foreach (int sample in MemoryMarshal.Cast<byte, int>(bytes))
+            {
+                double value = Math.Abs(sample / 2147483648.0);
+                packetPeak = Math.Max(packetPeak, value);
+                packetSumSquares += value * value;
+                packetValues++;
+                if (value >= 0.999)
+                    packetClipped++;
+            }
+        }
+        else if (BitsPerSample == 24)
+        {
+            for (int offset = 0; offset + 2 < bytes.Length; offset += 3)
+            {
+                int sample = bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16);
+                if ((sample & 0x800000) != 0)
+                    sample |= unchecked((int)0xFF000000);
+                double value = Math.Abs(sample / 8388608.0);
+                packetPeak = Math.Max(packetPeak, value);
+                packetSumSquares += value * value;
+                packetValues++;
+                if (value >= 0.999)
+                    packetClipped++;
+            }
+        }
+
+        _diagnosticPackets++;
+        _diagnosticSampleValues += packetValues;
+        _diagnosticSumSquares += packetSumSquares;
+        _diagnosticPeak = Math.Max(_diagnosticPeak, packetPeak);
+        _diagnosticClippedValues += packetClipped;
+        _diagnosticInvalidValues += packetInvalid;
+        if (packetPeak < 0.0001)
+            _diagnosticSilentPackets++;
+    }
+
+    private void LogDiagnosticsOnce()
+    {
+        if (Interlocked.Exchange(ref _diagnosticsLogged, 1) != 0)
+            return;
+
+        double rms = _diagnosticSampleValues > 0
+            ? Math.Sqrt(_diagnosticSumSquares / _diagnosticSampleValues)
+            : 0;
+        string health = _diagnosticPackets == 0
+            ? "no-audio-packets"
+            : _diagnosticInvalidValues > 0
+                ? "invalid-samples"
+            : _diagnosticSilentPackets == _diagnosticPackets
+                ? "all-silent"
+                : _wasapiDiscontinuities > 0 || _wasapiTimestampErrors > 0
+                    ? "discontinuity"
+                    : "ok";
+        string summary =
+            $"signalHealth={health}, packets={_diagnosticPackets}, sampleValues={_diagnosticSampleValues}, " +
+            $"rms={rms:0.000000}, peak={_diagnosticPeak:0.000000}, silentPackets={_diagnosticSilentPackets}, " +
+            $"clippedValues={_diagnosticClippedValues}, invalidValues={_diagnosticInvalidValues}, " +
+            $"wasapiSilentBuffers={_wasapiSilentBuffers}, " +
+            $"wasapiDiscontinuities={_wasapiDiscontinuities}, wasapiTimestampErrors={_wasapiTimestampErrors}";
+        _diagnosticSummary = summary;
+        Plugin.Log!.Info($"[Audio] Signal diagnostics: {summary}");
+        Diagnostics.RecordingDiagnosticLog.WriteIfEnabled("Audio", $"signal diagnostics: {summary}");
     }
 
     private void OnRecordingStopped(object? sender, StoppedEventArgs e)
@@ -404,4 +561,10 @@ internal sealed class AudioCaptureService : IDisposable
 }
 
 /// <summary>一包音频数据。</summary>
-internal sealed record AudioPacket(byte[] Data, int SampleRate, int Channels, int BitsPerSample, long TimestampHns);
+internal sealed record AudioPacket(
+    byte[] Data,
+    int SampleRate,
+    int Channels,
+    int BitsPerSample,
+    long TimestampHns,
+    long CaptureTicks);

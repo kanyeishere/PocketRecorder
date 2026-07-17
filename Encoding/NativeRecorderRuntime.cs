@@ -320,7 +320,8 @@ internal sealed unsafe class NativeRecorderRuntime
         if (_getLastError == null)
             return string.Empty;
 
-        byte[] buffer = new byte[8192];
+        // Final status includes capture, conversion, encoder and mux ledgers.
+        byte[] buffer = new byte[65_536];
         fixed (byte* bufferPtr = buffer)
         {
             if (_getLastError(bufferPtr, buffer.Length) != 0)
@@ -331,7 +332,10 @@ internal sealed unsafe class NativeRecorderRuntime
         if (length < 0)
             length = buffer.Length;
 
-        return System.Text.Encoding.UTF8.GetString(buffer, 0, length);
+        string status = System.Text.Encoding.UTF8.GetString(buffer, 0, length);
+        return length >= buffer.Length - 1
+            ? $"{status} [native status reached the {buffer.Length}-byte managed buffer and may be truncated]"
+            : status;
     }
 
     private bool EnsureLoadedNoLock()

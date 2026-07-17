@@ -41,6 +41,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private int _realOutputTickDropCount;
     private int _duplicateOutputTickDropCount;
     private int _audioPackets;
+    private long _audioInputPackets;
+    private long _audioQueueDroppedPackets;
     private long _lastSubmittedSourceFrameId;
     private long _maxSubmittedSourceFrameId;
     private long _sourceFrameRepeatCount;
@@ -49,6 +51,12 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private long _videoFrameDurationHns;
     private long _videoFrameDurationTicks;
     private long _finalVideoDurationHns;
+    private long _firstVideoPublishTicks;
+    private long _lastVideoPublishTicks;
+    private long _firstAudioStartTicks;
+    private long _lastAudioEndTicks;
+    private long _acceptedAudioSamples;
+    private string _finalNativeStatus = string.Empty;
 
     public NativeRecorderWriter(NativeRecorderRuntime runtime, int videoBitrate, string videoCodec)
     {
@@ -82,6 +90,8 @@ internal sealed class NativeRecorderWriter : IOutputSink
         _realOutputTickDropCount = 0;
         _duplicateOutputTickDropCount = 0;
         _audioPackets = 0;
+        _audioInputPackets = 0;
+        _audioQueueDroppedPackets = 0;
         _lastSubmittedSourceFrameId = 0;
         _maxSubmittedSourceFrameId = 0;
         _sourceFrameRepeatCount = 0;
@@ -90,6 +100,12 @@ internal sealed class NativeRecorderWriter : IOutputSink
         _videoFrameDurationHns = Math.Max(1, 10_000_000L / _videoFps);
         _videoFrameDurationTicks = Math.Max(1, Stopwatch.Frequency / _videoFps);
         _finalVideoDurationHns = -1;
+        _firstVideoPublishTicks = 0;
+        _lastVideoPublishTicks = 0;
+        _firstAudioStartTicks = 0;
+        _lastAudioEndTicks = 0;
+        _acceptedAudioSamples = 0;
+        _finalNativeStatus = string.Empty;
         _firstVideoFrameException = null;
         _firstVideoFrameSubmitted.Reset();
         _timingDiagnostics.Reset(_videoFps);
@@ -171,8 +187,14 @@ internal sealed class NativeRecorderWriter : IOutputSink
         if (_stopped || _audioQueue == null)
             return;
 
+        Interlocked.Increment(ref _audioInputPackets);
         if (!_audioQueue.TryEnqueueDropIncoming(packet))
+        {
+            Interlocked.Increment(ref _audioQueueDroppedPackets);
             Plugin.Log!.Warning("[NativeRecorder] Audio queue full, dropped a packet.");
+        }
+        else
+            RecordAcceptedAudioClock(packet);
     }
 
     public void WaitForFirstVideoFrameSubmitted(int timeoutMs)
@@ -410,13 +432,22 @@ internal sealed class NativeRecorderWriter : IOutputSink
         }
 
         if (recordCaptureTiming)
+        {
             _timingDiagnostics.RecordSubmittedFrame(snapshot.SourceTimestampHns, sampleAgeTicks);
+            RecordVideoPublishClock(snapshot.PublishTicks);
+        }
 
         RecordSubmittedSourceFrame(snapshot.SourceFrameId, timestampHns, duplicate);
 
         int submitted = Volatile.Read(ref _submittedFrameCount);
         if (submitted % 300 == 0)
-            Plugin.Log!.Info($"[NativeRecorder] Submitted {submitted} texture frames (input={_inputFrameCount}, duplicates={_duplicateFrameCount}, {BuildDropSummary()}), audioPackets={_audioPackets}");
+        {
+            string nativeStatus = _session?.GetLastStatus() ?? string.Empty;
+            string statusSuffix = string.IsNullOrWhiteSpace(nativeStatus) ? string.Empty : $", nativeStatus=[{nativeStatus}]";
+            string progress = $"Submitted {submitted} texture frames (input={_inputFrameCount}, duplicates={_duplicateFrameCount}, {BuildDropSummary()}), audioPackets={_audioPackets}, audioInput={Volatile.Read(ref _audioInputPackets)}, audioQueueDrops={Volatile.Read(ref _audioQueueDroppedPackets)}{statusSuffix}";
+            Plugin.Log!.Info($"[NativeRecorder] {progress}");
+            RecordingDiagnosticLog.WriteIfEnabled("NativeRecorder", progress);
+        }
 
         return true;
     }
@@ -588,6 +619,7 @@ internal sealed class NativeRecorderWriter : IOutputSink
         }
 
         _session?.Stop();
+        _finalNativeStatus = _session?.GetLastStatus() ?? string.Empty;
         LogNativeStatus("Native writer finalized");
         LogNativeStatusToDiagnostics("Native writer finalized");
     }
@@ -639,7 +671,90 @@ internal sealed class NativeRecorderWriter : IOutputSink
                $"{BuildDropSummary()}, " +
                $"{BuildSourceFrameSummary()}, " +
                $"audioPackets={Volatile.Read(ref _audioPackets)}, " +
+               $"audioInputPackets={Volatile.Read(ref _audioInputPackets)}, " +
+               $"audioQueueDroppedPackets={Volatile.Read(ref _audioQueueDroppedPackets)}, " +
+               $"managedLayerDiagnosis=[{BuildManagedLayerDiagnosis()}], " +
+               $"avClock={BuildAvClockSummary()}, " +
+               $"nativeStatusChars={_finalNativeStatus.Length}, " +
+               $"nativeStatus=[{ValueOrNone(_finalNativeStatus)}], " +
                $"timing={_timingDiagnostics.BuildSummary()}";
+    }
+
+    private static string ValueOrNone(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "<none>" : value;
+
+    private void RecordVideoPublishClock(long publishTicks)
+    {
+        if (publishTicks <= 0)
+            return;
+
+        Interlocked.CompareExchange(ref _firstVideoPublishTicks, publishTicks, 0);
+        Volatile.Write(ref _lastVideoPublishTicks, publishTicks);
+    }
+
+    private void RecordAcceptedAudioClock(AudioPacket packet)
+    {
+        int bytesPerFrame = packet.Channels * Math.Max(1, packet.BitsPerSample / 8);
+        long samples = bytesPerFrame > 0 ? packet.Data.Length / bytesPerFrame : 0;
+        long durationTicks = packet.SampleRate > 0
+            ? samples * Stopwatch.Frequency / packet.SampleRate
+            : 0;
+        long startTicks = Math.Max(0, packet.CaptureTicks - durationTicks);
+        Interlocked.CompareExchange(ref _firstAudioStartTicks, startTicks, 0);
+        Volatile.Write(ref _lastAudioEndTicks, packet.CaptureTicks);
+        Interlocked.Add(ref _acceptedAudioSamples, samples);
+    }
+
+    private string BuildAvClockSummary()
+    {
+        long firstVideo = Volatile.Read(ref _firstVideoPublishTicks);
+        long lastVideo = Volatile.Read(ref _lastVideoPublishTicks);
+        long firstAudio = Volatile.Read(ref _firstAudioStartTicks);
+        long lastAudio = Volatile.Read(ref _lastAudioEndTicks);
+        if (!_hasAudio)
+            return "audio-disabled";
+        if (firstVideo <= 0 || firstAudio <= 0)
+            return $"insufficient-clock-data(firstVideo={firstVideo},firstAudio={firstAudio})";
+
+        double startOffsetMs = (firstAudio - firstVideo) * 1_000.0 / Stopwatch.Frequency;
+        double endOffsetMs = lastVideo > 0 && lastAudio > 0
+            ? (lastAudio - lastVideo) * 1_000.0 / Stopwatch.Frequency
+            : 0;
+        double videoSpanMs = lastVideo > firstVideo
+            ? (lastVideo - firstVideo) * 1_000.0 / Stopwatch.Frequency
+            : 0;
+        double audioSpanMs = lastAudio > firstAudio
+            ? (lastAudio - firstAudio) * 1_000.0 / Stopwatch.Frequency
+            : 0;
+        return $"startAudioMinusVideoMs:{startOffsetMs:0.###},endAudioMinusVideoMs:{endOffsetMs:0.###}," +
+               $"videoSourceSpanMs:{videoSpanMs:0.###},audioCaptureSpanMs:{audioSpanMs:0.###}," +
+               $"acceptedAudioSamples:{Volatile.Read(ref _acceptedAudioSamples)}";
+    }
+
+    private string BuildManagedLayerDiagnosis()
+    {
+        bool videoTimingOk = Volatile.Read(ref _droppedFrameCount) == 0 &&
+                             Volatile.Read(ref _sourceFrameRegressionCount) == 0;
+        if (!_hasAudio)
+            return $"videoTiming:{(videoTimingOk ? "ok" : "drops-or-regression")},audioClock:disabled";
+
+        long firstVideo = Volatile.Read(ref _firstVideoPublishTicks);
+        long lastVideo = Volatile.Read(ref _lastVideoPublishTicks);
+        long firstAudio = Volatile.Read(ref _firstAudioStartTicks);
+        long lastAudio = Volatile.Read(ref _lastAudioEndTicks);
+        bool clockAvailable = firstVideo > 0 && firstAudio > 0 && lastVideo > 0 && lastAudio > 0;
+        double startOffsetMs = clockAvailable
+            ? Math.Abs((firstAudio - firstVideo) * 1_000.0 / Stopwatch.Frequency)
+            : double.MaxValue;
+        double endOffsetMs = clockAvailable
+            ? Math.Abs((lastAudio - lastVideo) * 1_000.0 / Stopwatch.Frequency)
+            : double.MaxValue;
+        bool audioClockOk = clockAvailable &&
+                            startOffsetMs <= 100 &&
+                            endOffsetMs <= 100 &&
+                            Volatile.Read(ref _audioQueueDroppedPackets) == 0;
+        return $"videoTiming:{(videoTimingOk ? "ok" : "drops-or-regression")}," +
+               $"audioClock:{(audioClockOk ? "ok" : clockAvailable ? "offset-or-drop" : "no-clock-data")}";
     }
 
     private void LogNativeStatus(string prefix)
@@ -654,12 +769,16 @@ internal sealed class NativeRecorderWriter : IOutputSink
     private void LogNativeStatusToDiagnostics(string prefix)
     {
         string status = _session?.GetLastStatus() ?? string.Empty;
-        RecordingDiagnosticLog.WriteNativeEvent(
-            "NativeRecorder",
-            string.IsNullOrWhiteSpace(status) ? prefix : $"{prefix}: {status}");
+        string message = string.IsNullOrWhiteSpace(status) ? prefix : $"{prefix}: {status}";
+        bool diagnosedFault = prefix.Contains("finalized", StringComparison.OrdinalIgnoreCase) &&
+                              status.Contains("layerDiagnosis=overall:fault", StringComparison.Ordinal);
+        if (diagnosedFault)
+            RecordingDiagnosticLog.WriteNativeFailure("NativeRecorder", message);
+        else
+            RecordingDiagnosticLog.WriteNativeEvent("NativeRecorder", message);
         AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
             "NativeRecorder",
-            string.IsNullOrWhiteSpace(status) ? prefix : $"{prefix}: {status}");
+            message);
     }
 
     private void NotifyFatalError(string message)

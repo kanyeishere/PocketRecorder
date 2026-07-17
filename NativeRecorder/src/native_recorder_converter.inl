@@ -1,3 +1,362 @@
+struct NativeTextureContentProbe
+{
+    static constexpr uint64_t kProbeIntervalFrames = 300;
+    static constexpr UINT kGridColumns = 64;
+    static constexpr UINT kGridRows = 36;
+
+    ComPtr<ID3D11Texture2D> staging;
+    ComPtr<ID3D11Query> completion_query;
+    D3D11_TEXTURE2D_DESC staging_desc{};
+    bool pending = false;
+    uint64_t scheduled = 0;
+    uint64_t completed = 0;
+    uint64_t not_ready_polls = 0;
+    uint64_t create_failures = 0;
+    uint64_t query_failures = 0;
+    uint64_t map_failures = 0;
+    uint64_t analysis_failures = 0;
+    uint64_t all_black_frames = 0;
+    uint64_t hash_changes = 0;
+    uint64_t current_same_hash_streak = 0;
+    uint64_t max_same_hash_streak = 0;
+    uint64_t last_hash = 0;
+    uint64_t pending_frame_index = 0;
+    uint64_t last_frame_index = 0;
+    UINT last_avg0 = 0;
+    UINT last_avg1 = 0;
+    UINT last_avg2 = 0;
+    UINT last_avg3 = 0;
+    bool has_hash = false;
+    std::string last_sample = "none";
+
+    void tick(
+        ID3D11Device* device,
+        ID3D11DeviceContext* context,
+        ID3D11Texture2D* texture,
+        uint64_t frame_index) noexcept
+    {
+        try
+        {
+            poll(context);
+            if (pending || device == nullptr || context == nullptr || texture == nullptr)
+                return;
+            if (frame_index != 0 && frame_index % kProbeIntervalFrames != 0)
+                return;
+
+            D3D11_TEXTURE2D_DESC desc{};
+            texture->GetDesc(&desc);
+            if (!ensure_resources(device, desc))
+                return;
+
+            context->CopyResource(staging.Get(), texture);
+            context->End(completion_query.Get());
+            pending = true;
+            pending_frame_index = frame_index;
+            ++scheduled;
+        }
+        catch (...)
+        {
+            ++analysis_failures;
+            pending = false;
+        }
+    }
+
+    std::string summary(const char* label) const
+    {
+        std::string health = "no-probe";
+        if (completed > 0)
+        {
+            health = all_black_frames == completed
+                ? "all-black"
+                : all_black_frames > 0 ? "intermittent-black" : "content-present";
+        }
+
+        return std::string(label != nullptr ? label : "texture") +
+            "Health=" + health +
+            ",scheduled=" + std::to_string(scheduled) +
+            ",completed=" + std::to_string(completed) +
+            ",notReadyPolls=" + std::to_string(not_ready_polls) +
+            ",createFailures=" + std::to_string(create_failures) +
+            ",queryFailures=" + std::to_string(query_failures) +
+            ",mapFailures=" + std::to_string(map_failures) +
+            ",analysisFailures=" + std::to_string(analysis_failures) +
+            ",blackProbes=" + std::to_string(all_black_frames) +
+            ",hashChanges=" + std::to_string(hash_changes) +
+            ",maxSameHashStreak=" + std::to_string(max_same_hash_streak) +
+            ",lastHash=" + hex_uint64(last_hash) +
+            ",lastFrameIndex=" + std::to_string(last_frame_index) +
+            ",lastSample=[" + last_sample + "]";
+    }
+
+    void reset()
+    {
+        staging.Reset();
+        completion_query.Reset();
+        staging_desc = {};
+        pending = false;
+        scheduled = 0;
+        completed = 0;
+        not_ready_polls = 0;
+        create_failures = 0;
+        query_failures = 0;
+        map_failures = 0;
+        analysis_failures = 0;
+        all_black_frames = 0;
+        hash_changes = 0;
+        current_same_hash_streak = 0;
+        max_same_hash_streak = 0;
+        last_hash = 0;
+        pending_frame_index = 0;
+        last_frame_index = 0;
+        last_avg0 = 0;
+        last_avg1 = 0;
+        last_avg2 = 0;
+        last_avg3 = 0;
+        has_hash = false;
+        last_sample = "none";
+    }
+
+private:
+    static std::string hex_uint64(uint64_t value)
+    {
+        char buffer[32]{};
+        sprintf_s(buffer, "0x%016llX", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+
+    bool ensure_resources(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& desc)
+    {
+        if (staging && completion_query &&
+            staging_desc.Width == desc.Width &&
+            staging_desc.Height == desc.Height &&
+            staging_desc.Format == desc.Format)
+        {
+            return true;
+        }
+
+        staging.Reset();
+        completion_query.Reset();
+        pending = false;
+
+        D3D11_TEXTURE2D_DESC staging_candidate = desc;
+        staging_candidate.MipLevels = 1;
+        staging_candidate.ArraySize = 1;
+        staging_candidate.SampleDesc.Count = 1;
+        staging_candidate.SampleDesc.Quality = 0;
+        staging_candidate.Usage = D3D11_USAGE_STAGING;
+        staging_candidate.BindFlags = 0;
+        staging_candidate.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_candidate.MiscFlags = 0;
+        HRESULT hr = device->CreateTexture2D(&staging_candidate, nullptr, &staging);
+        if (FAILED(hr) || !staging)
+        {
+            ++create_failures;
+            return false;
+        }
+
+        D3D11_QUERY_DESC query_desc{};
+        query_desc.Query = D3D11_QUERY_EVENT;
+        hr = device->CreateQuery(&query_desc, &completion_query);
+        if (FAILED(hr) || !completion_query)
+        {
+            staging.Reset();
+            ++create_failures;
+            return false;
+        }
+
+        staging_desc = staging_candidate;
+        return true;
+    }
+
+    void poll(ID3D11DeviceContext* context)
+    {
+        if (!pending || context == nullptr || !completion_query || !staging)
+            return;
+
+        HRESULT hr = context->GetData(
+            completion_query.Get(),
+            nullptr,
+            0,
+            D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_FALSE)
+        {
+            ++not_ready_polls;
+            return;
+        }
+        if (FAILED(hr))
+        {
+            ++query_failures;
+            pending = false;
+            return;
+        }
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hr = context->Map(
+            staging.Get(),
+            0,
+            D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT,
+            &mapped);
+        if (FAILED(hr) || mapped.pData == nullptr)
+        {
+            ++map_failures;
+            pending = false;
+            return;
+        }
+
+        analyze(mapped);
+        context->Unmap(staging.Get(), 0);
+        pending = false;
+    }
+
+    void analyze(const D3D11_MAPPED_SUBRESOURCE& mapped)
+    {
+        const auto* base = static_cast<const uint8_t*>(mapped.pData);
+        if (base == nullptr || mapped.RowPitch == 0 || staging_desc.Width == 0 || staging_desc.Height == 0)
+        {
+            ++analysis_failures;
+            return;
+        }
+
+        uint64_t hash = 1469598103934665603ull;
+        auto hash_byte = [&hash](uint8_t value)
+        {
+            hash ^= value;
+            hash *= 1099511628211ull;
+        };
+
+        uint64_t sum0 = 0;
+        uint64_t sum1 = 0;
+        uint64_t sum2 = 0;
+        uint64_t sum3 = 0;
+        UINT min0 = 255;
+        UINT min1 = 255;
+        UINT min2 = 255;
+        UINT min3 = 255;
+        UINT max0 = 0;
+        UINT max1 = 0;
+        UINT max2 = 0;
+        UINT max3 = 0;
+        UINT sample_count = 0;
+        UINT max_luma = 0;
+
+        const bool is_nv12 = staging_desc.Format == DXGI_FORMAT_NV12;
+        const bool is_bgra = staging_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+            staging_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+            staging_desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+
+        for (UINT row = 0; row < kGridRows; ++row)
+        {
+            const UINT y = std::min(
+                staging_desc.Height - 1,
+                static_cast<UINT>((static_cast<uint64_t>(row) * staging_desc.Height + staging_desc.Height / 2) / kGridRows));
+            for (UINT column = 0; column < kGridColumns; ++column)
+            {
+                const UINT x = std::min(
+                    staging_desc.Width - 1,
+                    static_cast<UINT>((static_cast<uint64_t>(column) * staging_desc.Width + staging_desc.Width / 2) / kGridColumns));
+
+                UINT value0 = 0;
+                UINT value1 = 0;
+                UINT value2 = 0;
+                UINT value3 = 255;
+                if (is_nv12)
+                {
+                    const auto* y_row = base + static_cast<size_t>(mapped.RowPitch) * y;
+                    const auto* uv_base = base + static_cast<size_t>(mapped.RowPitch) * staging_desc.Height;
+                    const auto* uv_row = uv_base + static_cast<size_t>(mapped.RowPitch) * (y / 2);
+                    const UINT uv_x = std::min(staging_desc.Width - 2, x & ~1u);
+                    value0 = y_row[x];
+                    value1 = uv_row[uv_x];
+                    value2 = uv_row[uv_x + 1];
+                    value3 = 255;
+                    max_luma = std::max(max_luma, value0);
+                }
+                else
+                {
+                    const auto* pixel = base + static_cast<size_t>(mapped.RowPitch) * y + static_cast<size_t>(x) * 4;
+                    const UINT first = pixel[0];
+                    const UINT second = pixel[1];
+                    const UINT third = pixel[2];
+                    value0 = is_bgra ? third : first;
+                    value1 = second;
+                    value2 = is_bgra ? first : third;
+                    value3 = pixel[3];
+                    const UINT luma = (54 * value0 + 183 * value1 + 19 * value2) >> 8;
+                    max_luma = std::max(max_luma, luma);
+                }
+
+                const UINT values[4] = {value0, value1, value2, value3};
+                sum0 += value0;
+                sum1 += value1;
+                sum2 += value2;
+                sum3 += value3;
+                min0 = std::min(min0, value0);
+                min1 = std::min(min1, value1);
+                min2 = std::min(min2, value2);
+                min3 = std::min(min3, value3);
+                max0 = std::max(max0, value0);
+                max1 = std::max(max1, value1);
+                max2 = std::max(max2, value2);
+                max3 = std::max(max3, value3);
+                for (UINT value : values)
+                    hash_byte(static_cast<uint8_t>(value));
+                ++sample_count;
+            }
+        }
+
+        if (sample_count == 0)
+        {
+            ++analysis_failures;
+            return;
+        }
+
+        const UINT avg0 = static_cast<UINT>(sum0 / sample_count);
+        const UINT avg1 = static_cast<UINT>(sum1 / sample_count);
+        const UINT avg2 = static_cast<UINT>(sum2 / sample_count);
+        const UINT avg3 = static_cast<UINT>(sum3 / sample_count);
+        last_avg0 = avg0;
+        last_avg1 = avg1;
+        last_avg2 = avg2;
+        last_avg3 = avg3;
+        last_frame_index = pending_frame_index;
+        const bool black = is_nv12 ? max_luma <= 20 : max_luma <= 8;
+        if (black)
+            ++all_black_frames;
+
+        if (has_hash && hash == last_hash)
+        {
+            ++current_same_hash_streak;
+        }
+        else
+        {
+            if (has_hash)
+                ++hash_changes;
+            current_same_hash_streak = 1;
+        }
+        max_same_hash_streak = std::max(max_same_hash_streak, current_same_hash_streak);
+        has_hash = true;
+        last_hash = hash;
+        ++completed;
+
+        if (is_nv12)
+        {
+            last_sample = "Y(avg/min/max)=" + std::to_string(avg0) + "/" + std::to_string(min0) + "/" + std::to_string(max0) +
+                ",U=" + std::to_string(avg1) + "/" + std::to_string(min1) + "/" + std::to_string(max1) +
+                ",V=" + std::to_string(avg2) + "/" + std::to_string(min2) + "/" + std::to_string(max2) +
+                ",rowPitch=" + std::to_string(mapped.RowPitch);
+        }
+        else
+        {
+            last_sample = "R(avg/min/max)=" + std::to_string(avg0) + "/" + std::to_string(min0) + "/" + std::to_string(max0) +
+                ",G=" + std::to_string(avg1) + "/" + std::to_string(min1) + "/" + std::to_string(max1) +
+                ",B=" + std::to_string(avg2) + "/" + std::to_string(min2) + "/" + std::to_string(max2) +
+                ",A=" + std::to_string(avg3) + "/" + std::to_string(min3) + "/" + std::to_string(max3) +
+                ",rowPitch=" + std::to_string(mapped.RowPitch);
+        }
+    }
+};
+
 struct SharedTextureNv12Converter
 {
     pr_video_config video{};
@@ -26,6 +385,32 @@ struct SharedTextureNv12Converter
     UINT source_format_support = 0;
     UINT nv12_format_support = 0;
     uint64_t frame_index = 0;
+    std::atomic<uint64_t> keyed_acquire_successes{0};
+    std::atomic<uint64_t> keyed_acquire_timeouts{0};
+    std::atomic<uint64_t> keyed_release_successes{0};
+    std::atomic<uint64_t> fresh_shared_copies{0};
+    std::atomic<uint64_t> reused_private_copies{0};
+    mutable std::mutex content_probe_mutex;
+    NativeTextureContentProbe source_content_probe;
+    NativeTextureContentProbe nv12_content_probe;
+    uint64_t matched_color_probes = 0;
+    uint64_t mismatched_color_probes = 0;
+    uint64_t matched_source_hash_changes = 0;
+    uint64_t matched_nv12_hash_changes = 0;
+    uint64_t last_matched_color_frame = 0;
+    uint64_t last_matched_source_hash = 0;
+    uint64_t last_matched_nv12_hash = 0;
+    int last_expected_y = 0;
+    int last_expected_u = 0;
+    int last_expected_v = 0;
+    int last_actual_y = 0;
+    int last_actual_u = 0;
+    int last_actual_v = 0;
+    int last_delta_y = 0;
+    int last_delta_u = 0;
+    int last_delta_v = 0;
+    bool has_matched_color_probe = false;
+    bool last_color_probe_plausible = false;
     bool initialized = false;
 
     int source_width() const { return video.width; }
@@ -389,6 +774,7 @@ struct SharedTextureNv12Converter
             hr = cached_keyed_mutex->AcquireSync(kEncoderReadKey, kSharedTextureAcquireTimeoutMs);
             if (hr == WAIT_TIMEOUT || hr == DXGI_ERROR_WAIT_TIMEOUT)
             {
+                ++keyed_acquire_timeouts;
                 if (!source_copy_ready)
                 {
                     set_last_error("NativeRecorder shared texture was not ready; dropping one frame.");
@@ -398,22 +784,32 @@ struct SharedTextureNv12Converter
                 // CFR output can intentionally sample the same source frame more than once.
                 // Reuse the private synchronized copy until the producer publishes key 1 again.
                 copy_shared_source = false;
+                ++reused_private_copies;
             }
             else if (FAILED(hr))
                 return fail_step("IDXGIKeyedMutex::AcquireSync", hr, "source=" + texture_desc_to_string(source_desc));
+            else
+                ++keyed_acquire_successes;
         }
 
         if (copy_shared_source)
         {
             device_context->CopyResource(source_copy_texture.Get(), cached_source_texture.Get());
+            ++fresh_shared_copies;
             if (cached_keyed_mutex)
             {
                 HRESULT release_hr = cached_keyed_mutex->ReleaseSync(kGameWriteKey);
                 if (FAILED(release_hr))
                     return fail_step("IDXGIKeyedMutex::ReleaseSync", release_hr, "source=" + texture_desc_to_string(source_desc));
+                ++keyed_release_successes;
             }
 
             source_copy_ready = true;
+        }
+
+        {
+            std::lock_guard lock(content_probe_mutex);
+            source_content_probe.tick(device.Get(), device_context.Get(), source_copy_texture.Get(), frame_index);
         }
 
         ID3D11VideoProcessorOutputView* output_view = nullptr;
@@ -438,8 +834,119 @@ struct SharedTextureNv12Converter
         if (FAILED(hr))
             return fail_step("VideoProcessorBlt", hr, "source=" + texture_desc_to_string(source_desc));
 
+        {
+            std::lock_guard lock(content_probe_mutex);
+            nv12_content_probe.tick(device.Get(), device_context.Get(), output_texture, frame_index);
+            update_color_probe_match();
+        }
+
         ++frame_index;
         return S_OK;
+    }
+
+    std::string synchronization_diagnostics() const
+    {
+        const uint64_t acquire_successes = keyed_acquire_successes.load(std::memory_order_relaxed);
+        const uint64_t acquire_timeouts = keyed_acquire_timeouts.load(std::memory_order_relaxed);
+        const uint64_t release_successes = keyed_release_successes.load(std::memory_order_relaxed);
+        const uint64_t shared_copies = fresh_shared_copies.load(std::memory_order_relaxed);
+        const uint64_t private_copies = reused_private_copies.load(std::memory_order_relaxed);
+        const bool balanced = acquire_successes == release_successes &&
+            acquire_successes == shared_copies;
+        return "keyedHealth=" + std::string(balanced ? "balanced" : "mismatch") +
+            ",acquireSuccess=" + std::to_string(acquire_successes) +
+            ",acquireTimeout=" + std::to_string(acquire_timeouts) +
+            ",releaseSuccess=" + std::to_string(release_successes) +
+            ",freshCopies=" + std::to_string(shared_copies) +
+            ",privateReuses=" + std::to_string(private_copies);
+    }
+
+    std::string content_diagnostics() const
+    {
+        std::lock_guard lock(content_probe_mutex);
+        return source_content_probe.summary("sourceBgra") + ", " +
+            nv12_content_probe.summary("encoderNv12") + ", " +
+            color_conversion_diagnostics();
+    }
+
+    std::string color_conversion_diagnostics() const
+    {
+        if (!has_matched_color_probe)
+        {
+            return "colorTransformHealth=no-matched-probe,matchedProbes=0";
+        }
+
+        return "colorTransformHealth=" + std::string(mismatched_color_probes == 0 ? "plausible" : "mismatch-observed") +
+            ",matchedProbes=" + std::to_string(matched_color_probes) +
+            ",mismatchedProbes=" + std::to_string(mismatched_color_probes) +
+            ",lastProbePlausible=" + std::string(last_color_probe_plausible ? "true" : "false") +
+            ",matchedSourceHashChanges=" + std::to_string(matched_source_hash_changes) +
+            ",matchedNv12HashChanges=" + std::to_string(matched_nv12_hash_changes) +
+            ",probeFrame=" + std::to_string(last_matched_color_frame) +
+            ",expectedYuv=" + std::to_string(last_expected_y) + "/" +
+                std::to_string(last_expected_u) + "/" + std::to_string(last_expected_v) +
+            ",actualYuv=" + std::to_string(last_actual_y) + "/" +
+                std::to_string(last_actual_u) + "/" + std::to_string(last_actual_v) +
+            ",deltaYuv=" + std::to_string(last_delta_y) + "/" +
+                std::to_string(last_delta_u) + "/" + std::to_string(last_delta_v);
+    }
+
+    bool color_conversion_plausible() const
+    {
+        return has_matched_color_probe && mismatched_color_probes == 0;
+    }
+
+    void update_color_probe_match()
+    {
+        if (source_content_probe.completed == 0 || nv12_content_probe.completed == 0 ||
+            source_content_probe.last_frame_index != nv12_content_probe.last_frame_index)
+        {
+            return;
+        }
+
+        const uint64_t probe_frame = source_content_probe.last_frame_index;
+        if (has_matched_color_probe && probe_frame == last_matched_color_frame)
+            return;
+
+        const int r = static_cast<int>(source_content_probe.last_avg0);
+        const int g = static_cast<int>(source_content_probe.last_avg1);
+        const int b = static_cast<int>(source_content_probe.last_avg2);
+        const int expected_y = std::clamp(16 + ((47 * r + 157 * g + 16 * b) >> 8), 0, 255);
+        const int expected_u = std::clamp(128 + ((-26 * r - 87 * g + 112 * b) >> 8), 0, 255);
+        const int expected_v = std::clamp(128 + ((112 * r - 102 * g - 10 * b) >> 8), 0, 255);
+        const int actual_y = static_cast<int>(nv12_content_probe.last_avg0);
+        const int actual_u = static_cast<int>(nv12_content_probe.last_avg1);
+        const int actual_v = static_cast<int>(nv12_content_probe.last_avg2);
+        const int delta_y = std::abs(actual_y - expected_y);
+        const int delta_u = std::abs(actual_u - expected_u);
+        const int delta_v = std::abs(actual_v - expected_v);
+        const bool plausible = delta_y <= 24 && delta_u <= 40 && delta_v <= 40;
+
+        if (has_matched_color_probe)
+        {
+            if (source_content_probe.last_hash != last_matched_source_hash)
+                ++matched_source_hash_changes;
+            if (nv12_content_probe.last_hash != last_matched_nv12_hash)
+                ++matched_nv12_hash_changes;
+        }
+
+        ++matched_color_probes;
+        if (!plausible)
+            ++mismatched_color_probes;
+        last_matched_color_frame = probe_frame;
+        last_matched_source_hash = source_content_probe.last_hash;
+        last_matched_nv12_hash = nv12_content_probe.last_hash;
+        last_expected_y = expected_y;
+        last_expected_u = expected_u;
+        last_expected_v = expected_v;
+        last_actual_y = actual_y;
+        last_actual_u = actual_u;
+        last_actual_v = actual_v;
+        last_delta_y = delta_y;
+        last_delta_u = delta_u;
+        last_delta_v = delta_v;
+        last_color_probe_plausible = plausible;
+        has_matched_color_probe = true;
     }
 
     void reset()
@@ -457,8 +964,33 @@ struct SharedTextureNv12Converter
         video_device.Reset();
         device_context.Reset();
         device.Reset();
+        source_content_probe.reset();
+        nv12_content_probe.reset();
+        matched_color_probes = 0;
+        mismatched_color_probes = 0;
+        matched_source_hash_changes = 0;
+        matched_nv12_hash_changes = 0;
+        last_matched_color_frame = 0;
+        last_matched_source_hash = 0;
+        last_matched_nv12_hash = 0;
+        last_expected_y = 0;
+        last_expected_u = 0;
+        last_expected_v = 0;
+        last_actual_y = 0;
+        last_actual_u = 0;
+        last_actual_v = 0;
+        last_delta_y = 0;
+        last_delta_u = 0;
+        last_delta_v = 0;
+        has_matched_color_probe = false;
+        last_color_probe_plausible = false;
         initialized = false;
         frame_index = 0;
+        keyed_acquire_successes = 0;
+        keyed_acquire_timeouts = 0;
+        keyed_release_successes = 0;
+        fresh_shared_copies = 0;
+        reused_private_copies = 0;
     }
 };
 

@@ -39,6 +39,7 @@ internal sealed class RecordingService : IDisposable
     private RecordingLifecycle _lifecycle = RecordingLifecycle.Idle;
     private DateTime _recordStart;
     private int _frameCount;
+    private long _audioPacketsBeforeWriter;
     private string? _currentFilePath;
     private string _currentBackend = string.Empty;
     private bool _currentRecordingStarred;
@@ -283,6 +284,7 @@ internal sealed class RecordingService : IDisposable
             _finishedCallback = finishedCallback;
             _currentRecordingStarred = false;
             _frameCount = 0;
+            _audioPacketsBeforeWriter = 0;
             _currentBackend = backendPlan.PreparingText;
             _videoWidth = 0;
             _videoHeight = 0;
@@ -575,6 +577,14 @@ internal sealed class RecordingService : IDisposable
             if (startResult.CountFirstVideoFrame)
                 Interlocked.Increment(ref _frameCount);
 
+            long audioPacketsBeforeWriter = Volatile.Read(ref _audioPacketsBeforeWriter);
+            if (audioPacketsBeforeWriter > 0)
+            {
+                string audioStartupMessage = $"audio packets observed before writer publication={audioPacketsBeforeWriter}; these startup packets were not submitted";
+                _environment.Log.Info($"[Record] {audioStartupMessage}");
+                RecordingDiagnosticLog.WriteIfEnabled("Record", audioStartupMessage);
+            }
+
             _environment.Log.Info($"[Record] Recording started: {startResult.VideoFormat.Describe()}@{request.TargetFps}fps, audio={audioFormat != null}, backend={startResult.BackendLabel}, asyncStart={startSw.ElapsedMilliseconds}ms");
             AmdRecordingDiagnosticLog.WriteIfEnabledOrAmdText(
                 "Record",
@@ -763,7 +773,13 @@ internal sealed class RecordingService : IDisposable
             writer = _writer;
         }
 
-        writer?.WriteAudioPacket(packet);
+        if (writer == null)
+        {
+            Interlocked.Increment(ref _audioPacketsBeforeWriter);
+            return;
+        }
+
+        writer.WriteAudioPacket(packet);
     }
 
     private bool ShouldCaptureVideoFrame()
