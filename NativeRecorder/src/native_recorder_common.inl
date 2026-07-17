@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <d3d10_1.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
@@ -65,6 +66,30 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
+decltype(&D3D11CreateDevice) get_system_d3d11_create_device()
+{
+    static HMODULE d3d11_module = LoadLibraryExW(
+        L"d3d11.dll",
+        nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static auto create_device = d3d11_module != nullptr
+        ? reinterpret_cast<decltype(&D3D11CreateDevice)>(GetProcAddress(d3d11_module, "D3D11CreateDevice"))
+        : nullptr;
+    return create_device;
+}
+
+decltype(&CreateDXGIFactory1) get_system_create_dxgi_factory1()
+{
+    static HMODULE dxgi_module = LoadLibraryExW(
+        L"dxgi.dll",
+        nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static auto create_factory = dxgi_module != nullptr
+        ? reinterpret_cast<decltype(&CreateDXGIFactory1)>(GetProcAddress(dxgi_module, "CreateDXGIFactory1"))
+        : nullptr;
+    return create_factory;
+}
+
 constexpr UINT kNvidiaVendorId = 0x10DE;
 constexpr UINT kAmdVendorId = 0x1002;
 constexpr UINT kIntelVendorId = 0x8086;
@@ -579,6 +604,81 @@ HRESULT find_amd_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_out 
 HRESULT find_intel_adapter(std::string* adapter_name, IDXGIAdapter1** adapter_out = nullptr)
 {
     return find_adapter_by_vendor(kIntelVendorId, adapter_name, adapter_out);
+}
+
+std::string adapter_luid_to_string(const LUID& luid)
+{
+    return std::to_string(static_cast<uint32_t>(luid.HighPart)) + ":" + std::to_string(luid.LowPart);
+}
+
+HRESULT find_system_adapter_by_luid(
+    const LUID& target_luid,
+    std::string* adapter_name,
+    IDXGIAdapter** adapter_out,
+    std::string* adapter_report = nullptr)
+{
+    if (adapter_name != nullptr)
+        adapter_name->clear();
+    if (adapter_out == nullptr)
+        return E_POINTER;
+    *adapter_out = nullptr;
+    if (adapter_report != nullptr)
+        adapter_report->clear();
+
+    auto create_factory = get_system_create_dxgi_factory1();
+    if (create_factory == nullptr)
+        return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+
+    ComPtr<IDXGIFactory1> factory;
+    HRESULT hr = create_factory(
+        __uuidof(IDXGIFactory1),
+        reinterpret_cast<void**>(factory.GetAddressOf()));
+    if (FAILED(hr))
+        return hr;
+
+    for (UINT index = 0;; ++index)
+    {
+        ComPtr<IDXGIAdapter1> adapter;
+        hr = factory->EnumAdapters1(index, &adapter);
+        if (hr == DXGI_ERROR_NOT_FOUND)
+            break;
+        if (FAILED(hr))
+            return hr;
+
+        DXGI_ADAPTER_DESC1 desc{};
+        hr = adapter->GetDesc1(&desc);
+        if (FAILED(hr))
+            return hr;
+
+        if (adapter_report != nullptr)
+        {
+            if (!adapter_report->empty())
+                *adapter_report += " | ";
+            *adapter_report += "#" + std::to_string(index) +
+                " name=" + wide_to_utf8(desc.Description) +
+                ", vendor=" + hex_uint32(desc.VendorId) +
+                ", device=" + hex_uint32(desc.DeviceId) +
+                ", luid=" + adapter_luid_to_string(desc.AdapterLuid);
+        }
+
+        if (desc.AdapterLuid.HighPart != target_luid.HighPart ||
+            desc.AdapterLuid.LowPart != target_luid.LowPart)
+        {
+            continue;
+        }
+
+        ComPtr<IDXGIAdapter> base_adapter;
+        hr = adapter.As(&base_adapter);
+        if (FAILED(hr))
+            return hr;
+
+        if (adapter_name != nullptr)
+            *adapter_name = wide_to_utf8(desc.Description);
+        *adapter_out = base_adapter.Detach();
+        return S_OK;
+    }
+
+    return DXGI_ERROR_NOT_FOUND;
 }
 
 HRESULT get_device_adapter_info(

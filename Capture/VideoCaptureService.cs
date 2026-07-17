@@ -37,6 +37,12 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private readonly int[] _nv12ReadbackSlotStates = new int[StagingTextureCount];
     private IntPtr _nativeSharedTexture;
     private IntPtr _nativeSharedHandle;
+    private bool _nativeSharedHandleIsNt;
+    private IntPtr _nativeSharedKeyedMutex;
+    private IntPtr _nativeSharedOwnerDevice;
+    private IntPtr _nativeSharedOwnerContext;
+    private IntPtr _nativeSharedGameBridgeTexture;
+    private IntPtr _nativeSharedHelperBridgeTexture;
     private D3D11SharedTextureMailbox? _nativeSharedMailbox;
     private uint _nativeSharedWidth;
     private uint _nativeSharedHeight;
@@ -99,6 +105,13 @@ internal sealed unsafe partial class VideoCaptureService : IDisposable
     private const int Nv12SlotMapped = 2;
     private const int Nv12SlotPendingRelease = 3;
     private const uint D3D11ResourceMiscShared = 0x2;
+    private const uint D3D11ResourceMiscSharedKeyedMutex = 0x100;
+    private const uint D3D11ResourceMiscSharedNtHandle = 0x800;
+    private const ulong NativeSharedGameWriteKey = 0;
+    private const ulong NativeSharedEncoderReadKey = 1;
+    private const uint NativeSharedAcquireTimeoutMs = 0;
+    private const int WaitTimeout = 0x00000102;
+    private const int DxgiErrorWaitTimeout = unchecked((int)0x887A0027);
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int)0x887A000A);
     private const int GameSwapChainRefreshIntervalMs = 250;
     private static readonly Guid IID_ID3D11Texture2D = new(0x6F15AAF2, 0xD208, 0x4E89, 0x9A, 0xB4, 0x48, 0x95, 0x35, 0xD3, 0x4F, 0x9C);
