@@ -618,7 +618,11 @@ internal sealed class NativeRecorderWriter : IOutputSink
             AmdRecordingDiagnosticLog.Write("NativeRecorder", "audio writer did not finish in 5s");
         }
 
+        RecordingDiagnosticLog.WriteIfEnabled("NativeRecorder", "entering native session stop");
+        AmdRecordingDiagnosticLog.Write("NativeRecorder", "entering native session stop");
         _session?.Stop();
+        RecordingDiagnosticLog.WriteIfEnabled("NativeRecorder", "native session stop returned");
+        AmdRecordingDiagnosticLog.Write("NativeRecorder", "native session stop returned");
         _finalNativeStatus = _session?.GetLastStatus() ?? string.Empty;
         LogNativeStatus("Native writer finalized");
         LogNativeStatusToDiagnostics("Native writer finalized");

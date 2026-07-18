@@ -484,16 +484,6 @@ struct LibavMp4Muxer
         if (format_context != nullptr && (format_context->oformat->flags & AVFMT_NOFILE) == 0)
             avio_closep(&format_context->pb);
 
-        try
-        {
-            if (!output_path_utf8.empty() && std::filesystem::exists(output_path_utf8))
-                final_file_bytes = static_cast<uint64_t>(std::filesystem::file_size(output_path_utf8));
-        }
-        catch (...)
-        {
-            final_file_bytes = 0;
-        }
-
         if (audio_frame != nullptr)
             av_frame_free(&audio_frame);
         if (swr != nullptr)
@@ -748,8 +738,7 @@ struct AsyncLibavMp4Muxer
             ", muxAudioWriteMs=" + audio_write_stats.summary_ms() +
             ", muxMaxQueue=" + std::to_string(max_queue_depth.load(std::memory_order_relaxed)) +
             ", muxVideoDrops=" + std::to_string(video_queue_drops.load(std::memory_order_relaxed)) +
-            ", muxAudioDrops=" + std::to_string(audio_queue_drops.load(std::memory_order_relaxed)) +
-            ", " + muxer.integrity_summary();
+            ", muxAudioDrops=" + std::to_string(audio_queue_drops.load(std::memory_order_relaxed));
     }
 
     void update_max_queue_depth(size_t depth)

@@ -752,12 +752,12 @@ struct AmfLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
 
         context.Release();
         clear_common_video_state();
+        converter.reset();
 
         if (initialized && SUCCEEDED(result))
         {
             set_last_error("NativeRecorder finalized via AMF + libavformat. " + finalize_stats());
         }
-        converter.reset();
 
         return result;
     }

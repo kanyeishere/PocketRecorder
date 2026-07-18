@@ -845,8 +845,7 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
 
     std::string finalize_stats() const
     {
-        return layer_diagnosis() +
-            ", submitted=" + std::to_string(counters.submitted_frames) +
+        return "submitted=" + std::to_string(counters.submitted_frames) +
             ", encoderInput=" + std::to_string(counters.encoder_input_frames) +
             ", packets=" + std::to_string(counters.written_packets) +
             ", inputFullDrops=" + std::to_string(counters.encoder_input_full_drops) +
@@ -874,9 +873,6 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
             ", timestampPtsMatches=" + std::to_string(counters.timestamp_pts_matches) +
             ", timestampFifoFallbacks=" + std::to_string(counters.timestamp_fifo_fallbacks) +
             ", timestampMissingEntries=" + std::to_string(counters.timestamp_missing_entries) +
-            ", " + converter.synchronization_diagnostics() +
-            ", " + converter.content_diagnostics() +
-            ", " + bitstream_diagnostics.summary() +
             ", " + muxer.stats_summary() +
             ", audioPackets=" + std::to_string(counters.audio_packets);
     }

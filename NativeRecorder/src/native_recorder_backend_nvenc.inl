@@ -398,12 +398,12 @@ struct NvencLibavRecorderBackend final : NativeD3D11LibavRecorderBackend
 
         encoder.reset();
         clear_common_video_state();
+        converter.reset();
 
         if (initialized && SUCCEEDED(result))
         {
             set_last_error("NativeRecorder finalized via NvEncoderD3D11 + libavformat. " + finalize_stats());
         }
-        converter.reset();
 
         return result;
     }
