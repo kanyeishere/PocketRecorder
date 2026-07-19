@@ -683,7 +683,7 @@ struct NativeD3D11LibavRecorderBackend : NativeRecorderBackend
             set_last_error("NativeRecorder live layered diagnostics: submitted=" +
                 std::to_string(counters.submitted_frames) +
                 ", " + converter.synchronization_diagnostics() +
-                ", " + converter.content_diagnostics());
+                ", contentProbes=disabled");
         }
         record_submit();
         return S_OK;

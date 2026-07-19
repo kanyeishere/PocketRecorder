@@ -1,3 +1,7 @@
+// ReShade's DXGI proxy can fault while releasing probe staging textures during pr_stop.
+// Keep GPU readback probes disabled until they have a teardown path independent of the game process.
+static constexpr bool kEnableTextureContentProbes = false;
+
 struct NativeTextureContentProbe
 {
     static constexpr uint64_t kProbeIntervalFrames = 300;
@@ -807,6 +811,7 @@ struct SharedTextureNv12Converter
             source_copy_ready = true;
         }
 
+        if constexpr (kEnableTextureContentProbes)
         {
             std::lock_guard lock(content_probe_mutex);
             source_content_probe.tick(device.Get(), device_context.Get(), source_copy_texture.Get(), frame_index);
@@ -834,6 +839,7 @@ struct SharedTextureNv12Converter
         if (FAILED(hr))
             return fail_step("VideoProcessorBlt", hr, "source=" + texture_desc_to_string(source_desc));
 
+        if constexpr (kEnableTextureContentProbes)
         {
             std::lock_guard lock(content_probe_mutex);
             nv12_content_probe.tick(device.Get(), device_context.Get(), output_texture, frame_index);
