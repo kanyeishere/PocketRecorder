@@ -79,6 +79,7 @@ public sealed class Plugin : IDalamudPlugin
         {
             targetFps = Config.TargetFps,
             audio = Config.AudioCaptureMode.ToString(),
+            microphone = Config.CaptureMicrophone,
             autoRecord = Config.AutoRecordEightPlayerDuty,
         });
     }
@@ -138,7 +139,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         CommandManager.AddHandler(commandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Pocket Recorder: start, end, toggle, status, list, autorecord on/off/toggle, floating on/off/toggle, fps, bitrate, audio, overlay, output, config, help。",
+            HelpMessage = "Pocket Recorder: start, end, toggle, status, list, autorecord on/off/toggle, floating on/off/toggle, fps, bitrate, audio, mic, overlay, output, config, help。",
         });
     }
 
@@ -198,6 +199,11 @@ public sealed class Plugin : IDalamudPlugin
 
             case "audio":
                 HandleAudioCommand(parts);
+                break;
+
+            case "mic":
+            case "microphone":
+                HandleMicrophoneCommand(parts);
                 break;
 
             case "overlay":
@@ -339,7 +345,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
         {
-            Print(Loc.T("Cmd.AudioStatus", AudioModeText(Config.AudioCaptureMode)));
+            Print(Loc.T("Cmd.AudioStatus", AudioModeText(Config.AudioCaptureMode, Config.CaptureMicrophone)));
             return;
         }
 
@@ -351,9 +357,30 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         Config.AudioCaptureMode = mode.Value;
-        Config.CaptureAudio = mode.Value != AudioCaptureMode.Off;
+        Config.CaptureAudio = mode.Value != AudioCaptureMode.Off || Config.CaptureMicrophone;
         Config.Save(PluginInterface);
-        Print(Loc.T("Cmd.AudioSet", AudioModeText(mode.Value)));
+        Print(Loc.T("Cmd.AudioSet", AudioModeText(mode.Value, Config.CaptureMicrophone)));
+    }
+
+    private void HandleMicrophoneCommand(string[] parts)
+    {
+        if (parts.Length == 1 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            Print(Loc.T("Cmd.MicrophoneStatus", Loc.OnOff(Config.CaptureMicrophone)));
+            return;
+        }
+
+        bool? enabled = ParseSwitch(parts[1], Config.CaptureMicrophone);
+        if (enabled == null)
+        {
+            Print(Loc.T("Cmd.MicrophoneUsage"));
+            return;
+        }
+
+        Config.CaptureMicrophone = enabled.Value;
+        Config.CaptureAudio = Config.AudioCaptureMode != AudioCaptureMode.Off || enabled.Value;
+        Config.Save(PluginInterface);
+        Print(Loc.T(enabled.Value ? "Cmd.MicrophoneOn" : "Cmd.MicrophoneOff"));
     }
 
     private void OpenOutputDirectory()
@@ -379,7 +406,7 @@ public sealed class Plugin : IDalamudPlugin
 
         Print(Loc.T("Cmd.StatusLine", RecordingService.Phase.ToDisplayText(), elapsed));
         Print(Loc.T("Cmd.AutoRecordLine", Loc.OnOff(Config.AutoRecordEightPlayerDuty), AutoDutyRecordingService.StatusText));
-        Print(Loc.T("Cmd.ParamsLine", Config.TargetFps, Config.VideoBitrate / 1_000_000, AudioModeText(Config.AudioCaptureMode), Loc.OnOff(Config.IncludeOverlay)));
+        Print(Loc.T("Cmd.ParamsLine", Config.TargetFps, Config.VideoBitrate / 1_000_000, AudioModeText(Config.AudioCaptureMode, Config.CaptureMicrophone), Loc.OnOff(Config.IncludeOverlay)));
     }
 
     private void HandleOverlayCommand(string[] parts)
@@ -444,14 +471,21 @@ public sealed class Plugin : IDalamudPlugin
         };
     }
 
-    private static string AudioModeText(AudioCaptureMode mode)
+    private static string AudioModeText(AudioCaptureMode mode, bool captureMicrophone)
     {
-        return mode switch
+        string playback = mode switch
         {
             AudioCaptureMode.Game => Loc.T("Config.AudioGame"),
             AudioCaptureMode.System => Loc.T("Config.AudioSystem"),
             _ => Loc.T("Config.AudioOff"),
         };
+
+        if (!captureMicrophone)
+            return playback;
+
+        return mode == AudioCaptureMode.Off
+            ? Loc.T("Config.AudioMicrophone")
+            : Loc.T("Config.AudioWithMicrophone", playback);
     }
 
     private static void Print(string message)

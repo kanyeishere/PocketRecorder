@@ -343,11 +343,20 @@ internal sealed class ConfigWindow : Window
         if (ImGui.Combo(Loc.T("Config.AudioSource"), ref modeIdx, audioModes, audioModes.Length))
         {
             config.AudioCaptureMode = modeValues[modeIdx];
-            config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
+            config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off || config.CaptureMicrophone;
             SaveConfig(config);
         }
 
-        ImGui.TextDisabled(GetAudioModeDescription(config.AudioCaptureMode));
+        bool captureMicrophone = config.CaptureMicrophone;
+        if (ImGui.Checkbox(Loc.T("Config.CaptureMicrophone"), ref captureMicrophone))
+        {
+            config.CaptureMicrophone = captureMicrophone;
+            config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off || captureMicrophone;
+            SaveConfig(config);
+        }
+
+        ImGui.TextDisabled(GetAudioModeDescription(config.AudioCaptureMode, config.CaptureMicrophone));
+        ImGui.TextDisabled(Loc.T("Config.MicrophoneDesc"));
     }
 
     private void DrawFFmpegSettings(Configuration config)
@@ -481,8 +490,11 @@ internal sealed class ConfigWindow : Window
             : Loc.T("Config.EncodingModeCompatible");
     }
 
-    private static string GetAudioModeDescription(AudioCaptureMode mode)
+    private static string GetAudioModeDescription(AudioCaptureMode mode, bool captureMicrophone)
     {
+        if (mode == AudioCaptureMode.Off && captureMicrophone)
+            return Loc.T("Config.AudioMicrophoneOnlyDesc");
+
         return mode switch
         {
             AudioCaptureMode.Game => Loc.T("Config.AudioGameDesc"),

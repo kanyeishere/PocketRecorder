@@ -41,7 +41,7 @@ internal static class RecordingDiagnosticLog
         string requestedCodec,
         string encoderPreset,
         bool useHardwareEncoder,
-        AudioCaptureMode audioCaptureMode,
+        string audioCaptureMode,
         bool includeOverlay,
         VideoOutputScaleMode videoOutputScaleMode,
         bool forceFfmpegRecording,

@@ -3,9 +3,9 @@
 <img src="images/icon.png" width="96" alt="Pocket Recorder icon">
 </p>
 
-Pocket Recorder 是一个用于 FFXIV / Dalamud 的轻量录制插件。它提供悬浮录制按钮、自动倒计时录制、聊天命令和设置窗口，可以录制游戏画面，可选择录制游戏声音、系统声音或不录制声音，并输出为 MP4 文件。
+Pocket Recorder 是一个用于 FFXIV / Dalamud 的轻量录制插件。它提供悬浮录制按钮、自动倒计时录制、聊天命令和设置窗口，可以录制游戏画面，可选择录制游戏声音、系统声音或不录制回放声音，并可混入默认麦克风，输出为 MP4 文件。
 
-Pocket Recorder is a lightweight recording plugin for FFXIV / Dalamud. It provides a floating record button, automatic countdown-triggered recording, chat commands, and a settings window. It captures game video with optional game audio, system audio, or no audio, and outputs MP4 files.
+Pocket Recorder is a lightweight recording plugin for FFXIV / Dalamud. It provides a floating record button, automatic countdown-triggered recording, chat commands, and a settings window. It captures game video with optional game or system audio, can mix in the default microphone, and outputs MP4 files.
 
 ## 快速开始 / Qucik Start
 https://github.com/kanyeishere/PocketStation/releases/latest/download/pluginmaster.json
@@ -36,8 +36,8 @@ The plugin has "anonymous desensitized diagnostic reporting" enabled by default.
 
 - 一键开始/停止录制，可使用悬浮按钮、设置窗口或聊天命令控制。
   One-click start/stop recording via floating button, settings window, or chat commands.
-- 录制游戏画面，并可选择只录制游戏声音、录制系统声音或不录制声音。
-  Capture game video with optional game audio, system audio, or no audio.
+- 录制游戏画面，并可选择只录制游戏声音、录制系统声音或不录制回放声音；也可单独录制或混入默认麦克风。
+  Capture game video with optional game or system audio, plus optional default-microphone recording and mixing.
 - 默认使用 NVIDIA/AMD/Intel NativeRecorder GPU 原生录制；也可以在设置中固定使用 FFmpeg 录制。
   Defaults to GPU-native recording via NVIDIA/AMD/Intel NativeRecorder; can also force FFmpeg in settings.
 - NativeRecorder 不可用或失败时会自动回退 FFmpeg。
@@ -108,6 +108,7 @@ After installing and enabling the plugin, open the settings window with `/pocket
 /pktr fps 60                设置目标帧率 / Set target FPS
 /pktr bitrate 32            设置视频码率，单位 Mbps / Set video bitrate (Mbps)
 /pktr audio game/system/off 设置声音来源 / Set audio source
+/pktr mic on/off              录制默认麦克风 / Record default microphone
 ```
 
 ## 输出 / Output

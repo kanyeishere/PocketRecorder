@@ -189,7 +189,13 @@ internal static class ConfigurationMigrator
             SaveVersion(config, pi, 23);
         }
 
-        config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off;
+        if (config.Version < 24)
+        {
+            config.CaptureMicrophone = false;
+            SaveVersion(config, pi, 24);
+        }
+
+        config.CaptureAudio = config.AudioCaptureMode != AudioCaptureMode.Off || config.CaptureMicrophone;
 
         if (!Enum.IsDefined(typeof(RecordingBackendMode), config.RecordingBackendMode))
         {

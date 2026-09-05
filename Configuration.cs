@@ -9,7 +9,7 @@ namespace Recorder;
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 23;
+    public int Version { get; set; } = 24;
 
     /// <summary>匿名安装标识，仅用于 Pocket Backend 独立用户统计。</summary>
     public string InstallId { get; set; } = Guid.NewGuid().ToString("N");
@@ -40,6 +40,9 @@ public class Configuration : IPluginConfiguration
 
     /// <summary>音频录制来源。</summary>
     public AudioCaptureMode AudioCaptureMode { get; set; } = AudioCaptureMode.Game;
+
+    /// <summary>是否同时录制默认麦克风输入。</summary>
+    public bool CaptureMicrophone { get; set; } = false;
 
     /// <summary>是否优先使用硬件编码器。</summary>
     public bool UseHardwareEncoder { get; set; } = true;

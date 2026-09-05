@@ -220,6 +220,7 @@ internal sealed class RecordingService : IDisposable
                 config.VideoBitrate,
                 _videoFps,
                 config.AudioCaptureMode,
+                config.CaptureMicrophone,
                 config.VideoCodec,
                 config.EncoderPreset,
                 config.UseHardwareEncoder,
@@ -234,7 +235,7 @@ internal sealed class RecordingService : IDisposable
                 request.VideoCodec,
                 request.EncoderPreset,
                 request.UseHardwareEncoder,
-                request.AudioCaptureMode,
+                DescribeAudioMode(request),
                 request.IncludeOverlay,
                 request.VideoOutputScaleMode,
                 request.ForceFFmpegRecording,
@@ -272,7 +273,7 @@ internal sealed class RecordingService : IDisposable
                 request.IncludeOverlay,
                 request.UseHardwareEncoder,
                 request.EncoderPreset,
-                request.AudioCaptureMode.ToString().ToLowerInvariant());
+                DescribeAudioMode(request));
             RecordingDiagnosticLog.UpdateRecordingContext(_telemetryContext);
 
             _request = request;
@@ -300,7 +301,7 @@ internal sealed class RecordingService : IDisposable
             request.VideoCodec,
             request.EncoderPreset,
             request.UseHardwareEncoder,
-            request.AudioCaptureMode,
+            DescribeAudioMode(request),
             request.IncludeOverlay,
             request.VideoOutputScaleMode,
             request.ForceFFmpegRecording,
@@ -308,10 +309,14 @@ internal sealed class RecordingService : IDisposable
             backendPlan.Reason,
             backendPlan.NativeRecorderProbeReason);
 
-        if (request.AudioCaptureMode != AudioCaptureMode.Off)
+        if (request.HasAudio)
         {
-            _environment.Log.Info($"[Record] Starting audio capture mode={request.AudioCaptureMode}...");
-            audioCapture = new AudioCaptureService(request.AudioCaptureMode, Environment.ProcessId, OnAudioPacket);
+            _environment.Log.Info($"[Record] Starting audio capture mode={DescribeAudioMode(request)}...");
+            audioCapture = new AudioCaptureService(
+                request.AudioCaptureMode,
+                request.CaptureMicrophone,
+                Environment.ProcessId,
+                OnAudioPacket);
             lock (_sync)
             {
                 if (IsCurrentSessionNoLock(request.SessionId))
@@ -365,7 +370,7 @@ internal sealed class RecordingService : IDisposable
         }
 
         _environment.Log.Info($"[Record] Preparation started -> {request.OutputPath}, startSync={startSw.ElapsedMilliseconds}ms");
-        _environment.Log.Info($"[Record] Config: fps={request.TargetFps}, captureFps={captureFps}, bitrate={request.VideoBitrate}, codec={request.VideoCodec}, preset={request.EncoderPreset}, audio={request.AudioCaptureMode}, hw={request.UseHardwareEncoder}, overlay={request.IncludeOverlay}, outputScale={request.VideoOutputScaleMode}, forceFFmpeg={request.ForceFFmpegRecording}, backend={backendPlan.Backend.DisplayName} ({backendPlan.Reason})");
+        _environment.Log.Info($"[Record] Config: fps={request.TargetFps}, captureFps={captureFps}, bitrate={request.VideoBitrate}, codec={request.VideoCodec}, preset={request.EncoderPreset}, audio={DescribeAudioMode(request)}, hw={request.UseHardwareEncoder}, overlay={request.IncludeOverlay}, outputScale={request.VideoOutputScaleMode}, forceFFmpeg={request.ForceFFmpegRecording}, backend={backendPlan.Backend.DisplayName} ({backendPlan.Reason})");
         AmdRecordingDiagnosticLog.Write("Record", $"preparation started, startSyncMs={startSw.ElapsedMilliseconds}");
         RecordingStateChanged?.Invoke(true);
         return true;
@@ -704,7 +709,7 @@ internal sealed class RecordingService : IDisposable
 
     private AudioFormat? WaitForAudioFormat(RecordingRequest request)
     {
-        if (request.AudioCaptureMode == AudioCaptureMode.Off)
+        if (!request.HasAudio)
         {
             _environment.Log.Info("[Record] No audio (disabled), video-only recording.");
             return null;
@@ -727,7 +732,7 @@ internal sealed class RecordingService : IDisposable
 
             if (audioCapture.Initialized)
             {
-                _environment.Log.Info($"[Record] Audio initialized ({request.AudioCaptureMode}): {audioCapture.SampleRate}Hz, {audioCapture.Channels}ch, {audioCapture.BitsPerSample}bit");
+                _environment.Log.Info($"[Record] Audio initialized ({DescribeAudioMode(request)}): {audioCapture.SampleRate}Hz, {audioCapture.Channels}ch, {audioCapture.BitsPerSample}bit");
                 var audioFormat = new AudioFormat(
                     audioCapture.SampleRate,
                     audioCapture.Channels,
@@ -873,6 +878,14 @@ internal sealed class RecordingService : IDisposable
         => backendPlan.PrefersD3D11TextureFrames
             ? Math.Max(1, request.TargetFps * 2)
             : request.TargetFps;
+
+    private static string DescribeAudioMode(RecordingRequest request)
+    {
+        string playback = request.AudioCaptureMode.ToString().ToLowerInvariant();
+        return request.CaptureMicrophone
+            ? request.AudioCaptureMode == AudioCaptureMode.Off ? "microphone" : $"{playback}+microphone"
+            : playback;
+    }
 
     private static string GetNativeNvencSdkSummary(IRecordingBackend backend)
         => backend is NativeRecorderRecordingBackend nativeBackend

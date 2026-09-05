@@ -13,7 +13,8 @@ using System.Threading.Tasks;
 namespace Recorder.Capture;
 
 /// <summary>
-/// 捕获系统默认音频输出设备的回放流，或只捕获当前游戏进程树的回放流。
+/// 捕获系统默认音频输出设备、当前游戏进程树的回放流，以及默认麦克风输入。
+/// 同时录制回放和麦克风时，会在托管层混合为一条 48 kHz 立体声浮点音轨。
 /// NAudio 是成熟的 .NET 音频库，正确处理了 WASAPI COM 互操作的所有细节。
 /// </summary>
 internal sealed class AudioCaptureService : IDisposable
@@ -21,14 +22,28 @@ internal sealed class AudioCaptureService : IDisposable
     private const long ReftimesPerSecond = 10_000_000;
     private const long ReftimesPerMillisecond = 10_000;
     private const string ProcessLoopbackDevice = "VAD\\Process_Loopback";
+    private const int MixedSampleRate = 48_000;
+    private const int MixedChannels = 2;
+    private const int MixedBitsPerSample = 32;
+    private const int MixedPacketMilliseconds = 20;
+    private const int MixedRingBufferSeconds = 2;
 
     private readonly Action<AudioPacket> _onAudio;
     private readonly AudioCaptureMode _mode;
+    private readonly bool _captureMicrophone;
     private readonly int _targetProcessId;
     private Thread? _captureThread;
     private CancellationTokenSource? _cts;
     private WasapiLoopbackCapture? _capture;
+    private AutoConvertWasapiCapture? _mixedPlaybackCapture;
+    private AutoConvertWasapiCapture? _microphoneCapture;
+    private MMDevice? _mixedPlaybackDevice;
+    private MMDevice? _microphoneDevice;
     private AudioClient? _processAudioClient;
+    private FloatRingBuffer? _playbackMixBuffer;
+    private FloatRingBuffer? _microphoneMixBuffer;
+    private bool _mixedPlaybackActive;
+    private bool _mixedMicrophoneActive;
     private bool _running;
     private bool _isFloat;
 
@@ -49,6 +64,10 @@ internal sealed class AudioCaptureService : IDisposable
     private long _wasapiSilentBuffers;
     private long _wasapiDiscontinuities;
     private long _wasapiTimestampErrors;
+    private long _mixPlaybackDroppedValues;
+    private long _mixMicrophoneDroppedValues;
+    private long _mixPlaybackMissingValues;
+    private long _mixMicrophoneMissingValues;
     private double _diagnosticSumSquares;
     private double _diagnosticPeak;
     private int _diagnosticsLogged;
@@ -56,9 +75,14 @@ internal sealed class AudioCaptureService : IDisposable
 
     public string DiagnosticSummary => _diagnosticSummary;
 
-    public AudioCaptureService(AudioCaptureMode mode, int targetProcessId, Action<AudioPacket> onAudio)
+    public AudioCaptureService(
+        AudioCaptureMode mode,
+        bool captureMicrophone,
+        int targetProcessId,
+        Action<AudioPacket> onAudio)
     {
         _mode = mode;
+        _captureMicrophone = captureMicrophone;
         _targetProcessId = targetProcessId;
         _onAudio = onAudio;
     }
@@ -66,6 +90,8 @@ internal sealed class AudioCaptureService : IDisposable
     public void Start()
     {
         ResetDiagnostics();
+        LastError = null;
+        Initialized = false;
         _cts = new CancellationTokenSource();
         _running = true;
         _captureThread = new Thread(() => CaptureLoop(_cts.Token))
@@ -82,6 +108,9 @@ internal sealed class AudioCaptureService : IDisposable
         try { _cts?.Cancel(); } catch { }
 
         try { _capture?.StopRecording(); } catch { }
+        try { _mixedPlaybackCapture?.StopRecording(); } catch { }
+        try { _microphoneCapture?.StopRecording(); } catch { }
+        try { _processAudioClient?.Stop(); } catch { }
 
         _captureThread?.Join(3000);
         LogDiagnosticsOnce();
@@ -92,11 +121,15 @@ internal sealed class AudioCaptureService : IDisposable
 
     private void CaptureLoop(CancellationToken ct)
     {
-        Plugin.Log!.Info($"[Audio] Starting capture mode={_mode}, targetProcessId={_targetProcessId}...");
+        Plugin.Log!.Info($"[Audio] Starting capture mode={_mode}, microphone={_captureMicrophone}, targetProcessId={_targetProcessId}...");
 
         try
         {
-            if (_mode == AudioCaptureMode.Game)
+            if (_captureMicrophone)
+            {
+                CaptureWithMicrophone(ct);
+            }
+            else if (_mode == AudioCaptureMode.Game)
             {
                 CaptureProcessLoopback(ct);
             }
@@ -113,6 +146,9 @@ internal sealed class AudioCaptureService : IDisposable
         finally
         {
             try { _capture?.StopRecording(); } catch { }
+            try { _mixedPlaybackCapture?.StopRecording(); } catch { }
+            try { _microphoneCapture?.StopRecording(); } catch { }
+            try { _processAudioClient?.Stop(); } catch { }
 
             if (_capture != null)
             {
@@ -122,8 +158,30 @@ internal sealed class AudioCaptureService : IDisposable
                 _capture = null;
             }
 
+            if (_mixedPlaybackCapture != null)
+            {
+                _mixedPlaybackCapture.DataAvailable -= OnMixedPlaybackDataAvailable;
+                _mixedPlaybackCapture.RecordingStopped -= OnRecordingStopped;
+                _mixedPlaybackCapture.Dispose();
+                _mixedPlaybackCapture = null;
+            }
+
+            if (_microphoneCapture != null)
+            {
+                _microphoneCapture.DataAvailable -= OnMicrophoneDataAvailable;
+                _microphoneCapture.RecordingStopped -= OnRecordingStopped;
+                _microphoneCapture.Dispose();
+                _microphoneCapture = null;
+            }
+
             try { _processAudioClient?.Dispose(); } catch { }
             _processAudioClient = null;
+            try { _mixedPlaybackDevice?.Dispose(); } catch { }
+            _mixedPlaybackDevice = null;
+            try { _microphoneDevice?.Dispose(); } catch { }
+            _microphoneDevice = null;
+            _playbackMixBuffer = null;
+            _microphoneMixBuffer = null;
 
             Plugin.Log!.Info("[Audio] Capture thread exiting.");
         }
@@ -160,7 +218,251 @@ internal sealed class AudioCaptureService : IDisposable
         }
     }
 
+    private void CaptureWithMicrophone(CancellationToken ct)
+    {
+        WaveFormat waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(MixedSampleRate, MixedChannels);
+        SampleRate = MixedSampleRate;
+        Channels = MixedChannels;
+        BitsPerSample = MixedBitsPerSample;
+        _isFloat = true;
+        _totalSamples = 0;
+
+        int ringCapacity = MixedSampleRate * MixedChannels * MixedRingBufferSeconds;
+        _microphoneMixBuffer = new FloatRingBuffer(ringCapacity);
+        if (_mode != AudioCaptureMode.Off)
+            _playbackMixBuffer = new FloatRingBuffer(ringCapacity);
+
+        Exception? microphoneError = TryStartMicrophoneCapture(waveFormat);
+        ProcessLoopbackReader? processReader = null;
+        Exception? playbackError = null;
+        if (_mode == AudioCaptureMode.Game)
+        {
+            try
+            {
+                processReader = StartProcessLoopback(waveFormat);
+                _mixedPlaybackActive = true;
+                Plugin.Log!.Info($"[Audio] Game process loopback ready for microphone mix: pid={_targetProcessId}, {MixedSampleRate}Hz, {MixedChannels}ch float.");
+            }
+            catch (Exception ex)
+            {
+                playbackError = ex;
+                Plugin.Log!.Warning($"[Audio] Game audio could not start: {ex.Message}");
+            }
+        }
+        else if (_mode == AudioCaptureMode.System)
+        {
+            playbackError = TryStartSystemMixCapture(waveFormat);
+        }
+
+        if (!_mixedMicrophoneActive && !_mixedPlaybackActive)
+        {
+            string message = BuildSourceStartFailure(microphoneError, playbackError);
+            throw new InvalidOperationException(message, microphoneError ?? playbackError);
+        }
+
+        Initialized = true;
+        Plugin.Log!.Info(
+            $"[Audio] Mixed capture initialized: playback={_mixedPlaybackActive}, microphone={_mixedMicrophoneActive}, " +
+            $"format={SampleRate}Hz {Channels}ch {BitsPerSample}bit float.");
+
+        int packetFrames = MixedSampleRate * MixedPacketMilliseconds / 1_000;
+        int packetValues = packetFrames * MixedChannels;
+        float[] playbackSamples = new float[packetValues];
+        float[] microphoneSamples = new float[packetValues];
+        long packetTicks = Math.Max(1, Stopwatch.Frequency * MixedPacketMilliseconds / 1_000);
+        long nextPacketTicks = Stopwatch.GetTimestamp() + packetTicks;
+
+        while (_running && !ct.IsCancellationRequested)
+        {
+            if (processReader != null)
+            {
+                ReadProcessLoopbackPackets(
+                    processReader.Value.Capture,
+                    processReader.Value.Buffer,
+                    processReader.Value.BytesPerFrame,
+                    QueuePlaybackMixAudio);
+            }
+
+            long now = Stopwatch.GetTimestamp();
+            if (now < nextPacketTicks)
+            {
+                int sleepMs = (int)Math.Min(5, Math.Max(1, (nextPacketTicks - now) * 1_000 / Stopwatch.Frequency));
+                Thread.Sleep(sleepMs);
+                continue;
+            }
+
+            int emitted = 0;
+            while (now >= nextPacketTicks && emitted < 4)
+            {
+                EmitMixedPacket(playbackSamples, microphoneSamples);
+                nextPacketTicks += packetTicks;
+                emitted++;
+            }
+
+            if (now - nextPacketTicks > packetTicks * 4)
+            {
+                Plugin.Log!.Warning("[Audio] Mixer clock fell behind; resynchronizing packet cadence.");
+                nextPacketTicks = now + packetTicks;
+            }
+        }
+    }
+
+    private Exception? TryStartMicrophoneCapture(WaveFormat waveFormat)
+    {
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            _microphoneDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Multimedia);
+            _microphoneCapture = new AutoConvertWasapiCapture(_microphoneDevice, loopback: false)
+            {
+                WaveFormat = waveFormat,
+            };
+            _microphoneCapture.DataAvailable += OnMicrophoneDataAvailable;
+            _microphoneCapture.RecordingStopped += OnRecordingStopped;
+            _microphoneCapture.StartRecording();
+            _mixedMicrophoneActive = true;
+            Plugin.Log!.Info($"[Audio] Default microphone started: format={MixedSampleRate}Hz {MixedChannels}ch float.");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log!.Warning($"[Audio] Default microphone could not start: {ex.Message}");
+            try { _microphoneCapture?.Dispose(); } catch { }
+            _microphoneCapture = null;
+            try { _microphoneDevice?.Dispose(); } catch { }
+            _microphoneDevice = null;
+            return ex;
+        }
+    }
+
+    private Exception? TryStartSystemMixCapture(WaveFormat waveFormat)
+    {
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            _mixedPlaybackDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            _mixedPlaybackCapture = new AutoConvertWasapiCapture(_mixedPlaybackDevice, loopback: true)
+            {
+                WaveFormat = waveFormat,
+            };
+            _mixedPlaybackCapture.DataAvailable += OnMixedPlaybackDataAvailable;
+            _mixedPlaybackCapture.RecordingStopped += OnRecordingStopped;
+            _mixedPlaybackCapture.StartRecording();
+            _mixedPlaybackActive = true;
+            Plugin.Log!.Info($"[Audio] System loopback ready for microphone mix: format={MixedSampleRate}Hz {MixedChannels}ch float.");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log!.Warning($"[Audio] System audio could not start: {ex.Message}");
+            try { _mixedPlaybackCapture?.Dispose(); } catch { }
+            _mixedPlaybackCapture = null;
+            try { _mixedPlaybackDevice?.Dispose(); } catch { }
+            _mixedPlaybackDevice = null;
+            return ex;
+        }
+    }
+
+    private static string BuildSourceStartFailure(Exception? microphoneError, Exception? playbackError)
+    {
+        if (microphoneError != null && playbackError != null)
+            return $"麦克风和回放音频都无法启动。麦克风: {microphoneError.Message}; 回放: {playbackError.Message}";
+        if (microphoneError != null)
+            return $"默认麦克风无法启动: {microphoneError.Message}";
+        if (playbackError != null)
+            return $"回放音频无法启动: {playbackError.Message}";
+        return "没有可用的音频来源。";
+    }
+
+    private void OnMixedPlaybackDataAvailable(object? sender, WaveInEventArgs e)
+    {
+        if (_running && e.BytesRecorded > 0)
+            QueuePlaybackMixAudio(e.Buffer, e.BytesRecorded);
+    }
+
+    private void OnMicrophoneDataAvailable(object? sender, WaveInEventArgs e)
+    {
+        if (_running && e.BytesRecorded > 0)
+            QueueMicrophoneMixAudio(e.Buffer, e.BytesRecorded);
+    }
+
+    private void QueuePlaybackMixAudio(byte[] buffer, int byteCount)
+    {
+        long dropped = QueueMixedAudio(_playbackMixBuffer, buffer, byteCount);
+        if (dropped > 0)
+            Interlocked.Add(ref _mixPlaybackDroppedValues, dropped);
+    }
+
+    private void QueueMicrophoneMixAudio(byte[] buffer, int byteCount)
+    {
+        long dropped = QueueMixedAudio(_microphoneMixBuffer, buffer, byteCount);
+        if (dropped > 0)
+            Interlocked.Add(ref _mixMicrophoneDroppedValues, dropped);
+    }
+
+    private static int QueueMixedAudio(FloatRingBuffer? destination, byte[] buffer, int byteCount)
+    {
+        if (destination == null || byteCount < sizeof(float))
+            return 0;
+
+        int alignedByteCount = Math.Min(byteCount, buffer.Length) / sizeof(float) * sizeof(float);
+        ReadOnlySpan<float> samples = MemoryMarshal.Cast<byte, float>(buffer.AsSpan(0, alignedByteCount));
+        return destination.Write(samples);
+    }
+
+    private void EmitMixedPacket(float[] playback, float[] microphone)
+    {
+        Array.Clear(playback);
+        Array.Clear(microphone);
+
+        int playbackRead = _mixedPlaybackActive && _playbackMixBuffer != null
+            ? _playbackMixBuffer.Read(playback)
+            : 0;
+        int microphoneRead = _mixedMicrophoneActive && _microphoneMixBuffer != null
+            ? _microphoneMixBuffer.Read(microphone)
+            : 0;
+
+        if (_mixedPlaybackActive && playbackRead < playback.Length)
+            Interlocked.Add(ref _mixPlaybackMissingValues, playback.Length - playbackRead);
+        if (_mixedMicrophoneActive && microphoneRead < microphone.Length)
+            Interlocked.Add(ref _mixMicrophoneMissingValues, microphone.Length - microphoneRead);
+
+        byte[] bytes = new byte[playback.Length * sizeof(float)];
+        Span<float> mixed = MemoryMarshal.Cast<byte, float>(bytes.AsSpan());
+        for (int i = 0; i < mixed.Length; i++)
+        {
+            float sample = playback[i] + microphone[i];
+            mixed[i] = Math.Clamp(sample, -1f, 1f);
+        }
+
+        EmitOwnedAudio(bytes);
+    }
+
     private void CaptureProcessLoopback(CancellationToken ct)
+    {
+        WaveFormat wf = WaveFormat.CreateIeeeFloatWaveFormat(48_000, 2);
+        SampleRate = wf.SampleRate;
+        Channels = wf.Channels;
+        BitsPerSample = wf.BitsPerSample;
+        _isFloat = true;
+
+        ProcessLoopbackReader reader = StartProcessLoopback(wf);
+
+        Plugin.Log!.Info($"[Audio] Game process loopback: pid={_targetProcessId}, {SampleRate}Hz, {Channels}ch, {BitsPerSample}bit, bufferFrames={reader.BufferFrameCount}");
+
+        Initialized = true;
+        _totalSamples = 0;
+
+        Plugin.Log.Info("[Audio] Game process loopback recording started successfully.");
+
+        while (_running && !ct.IsCancellationRequested)
+        {
+            Thread.Sleep(20);
+            ReadProcessLoopbackPackets(reader.Capture, reader.Buffer, reader.BytesPerFrame, EmitAudio);
+        }
+    }
+
+    private ProcessLoopbackReader StartProcessLoopback(WaveFormat waveFormat)
     {
         if (_targetProcessId <= 0)
             throw new InvalidOperationException("无法确定游戏进程 ID。");
@@ -168,42 +470,27 @@ internal sealed class AudioCaptureService : IDisposable
         _processAudioClient = ActivateProcessLoopbackAsync(_targetProcessId)
             .GetAwaiter()
             .GetResult();
-
-        WaveFormat wf = WaveFormat.CreateIeeeFloatWaveFormat(48_000, 2);
-        SampleRate = wf.SampleRate;
-        Channels = wf.Channels;
-        BitsPerSample = wf.BitsPerSample;
-        _isFloat = true;
-
         _processAudioClient.Initialize(
             AudioClientShareMode.Shared,
             AudioClientStreamFlags.Loopback | AudioClientStreamFlags.AutoConvertPcm | AudioClientStreamFlags.SrcDefaultQuality,
             ReftimesPerMillisecond * 100,
             0,
-            wf,
+            waveFormat,
             Guid.Empty);
 
-        int bufferFrameCount = SampleRate / 10;
-        int bytesPerFrame = wf.BlockAlign;
-        byte[] recordBuffer = new byte[Math.Max(bytesPerFrame, bufferFrameCount * bytesPerFrame)];
-
-        Plugin.Log!.Info($"[Audio] Game process loopback: pid={_targetProcessId}, {SampleRate}Hz, {Channels}ch, {BitsPerSample}bit, bufferFrames={bufferFrameCount}");
-
-        Initialized = true;
-        _totalSamples = 0;
-
-        var capture = _processAudioClient.AudioCaptureClient;
+        int bufferFrameCount = waveFormat.SampleRate / 10;
+        int bytesPerFrame = waveFormat.BlockAlign;
+        byte[] buffer = new byte[Math.Max(bytesPerFrame, bufferFrameCount * bytesPerFrame)];
+        AudioCaptureClient capture = _processAudioClient.AudioCaptureClient;
         _processAudioClient.Start();
-        Plugin.Log.Info("[Audio] Game process loopback recording started successfully.");
-
-        while (_running && !ct.IsCancellationRequested)
-        {
-            Thread.Sleep(20);
-            ReadProcessLoopbackPackets(capture, recordBuffer, bytesPerFrame);
-        }
+        return new ProcessLoopbackReader(capture, buffer, bytesPerFrame, bufferFrameCount);
     }
 
-    private void ReadProcessLoopbackPackets(AudioCaptureClient capture, byte[] recordBuffer, int bytesPerFrame)
+    private void ReadProcessLoopbackPackets(
+        AudioCaptureClient capture,
+        byte[] recordBuffer,
+        int bytesPerFrame,
+        Action<byte[], int> emit)
     {
         int packetSize = capture.GetNextPacketSize();
         int recordBufferOffset = 0;
@@ -222,7 +509,7 @@ internal sealed class AudioCaptureService : IDisposable
 
             if (recordBuffer.Length - recordBufferOffset < bytesAvailable && recordBufferOffset > 0)
             {
-                EmitAudio(recordBuffer, recordBufferOffset);
+                emit(recordBuffer, recordBufferOffset);
                 recordBufferOffset = 0;
             }
 
@@ -240,7 +527,7 @@ internal sealed class AudioCaptureService : IDisposable
         }
 
         if (recordBufferOffset > 0)
-            EmitAudio(recordBuffer, recordBufferOffset);
+            emit(recordBuffer, recordBufferOffset);
     }
 
     private void OnDataAvailable(object? sender, WaveInEventArgs e)
@@ -255,17 +542,21 @@ internal sealed class AudioCaptureService : IDisposable
 
     private void EmitAudio(byte[] sourceBuffer, int bytesRecorded)
     {
+        byte[] buffer = new byte[bytesRecorded];
+        Array.Copy(sourceBuffer, buffer, bytesRecorded);
+        EmitOwnedAudio(buffer);
+    }
+
+    private void EmitOwnedAudio(byte[] buffer)
+    {
         long captureTicks = Stopwatch.GetTimestamp();
         // 计算时间戳（基于已采集样本数）
         int blockAlign = Channels * BitsPerSample / 8;
         if (blockAlign <= 0) return;
 
-        byte[] buffer = new byte[bytesRecorded];
-        Array.Copy(sourceBuffer, buffer, bytesRecorded);
+        AnalyzeAudio(buffer, buffer.Length);
 
-        AnalyzeAudio(sourceBuffer, bytesRecorded);
-
-        long samplesInPacket = bytesRecorded / blockAlign;
+        long samplesInPacket = buffer.Length / blockAlign;
         long timestampHns = _totalSamples * 10_000_000L / SampleRate;
         _totalSamples += samplesInPacket;
 
@@ -280,6 +571,8 @@ internal sealed class AudioCaptureService : IDisposable
 
     private void ResetDiagnostics()
     {
+        _mixedPlaybackActive = false;
+        _mixedMicrophoneActive = false;
         _diagnosticPackets = 0;
         _diagnosticSampleValues = 0;
         _diagnosticSilentPackets = 0;
@@ -288,6 +581,10 @@ internal sealed class AudioCaptureService : IDisposable
         _wasapiSilentBuffers = 0;
         _wasapiDiscontinuities = 0;
         _wasapiTimestampErrors = 0;
+        _mixPlaybackDroppedValues = 0;
+        _mixMicrophoneDroppedValues = 0;
+        _mixPlaybackMissingValues = 0;
+        _mixMicrophoneMissingValues = 0;
         _diagnosticSumSquares = 0;
         _diagnosticPeak = 0;
         _diagnosticsLogged = 0;
@@ -393,7 +690,12 @@ internal sealed class AudioCaptureService : IDisposable
             $"rms={rms:0.000000}, peak={_diagnosticPeak:0.000000}, silentPackets={_diagnosticSilentPackets}, " +
             $"clippedValues={_diagnosticClippedValues}, invalidValues={_diagnosticInvalidValues}, " +
             $"wasapiSilentBuffers={_wasapiSilentBuffers}, " +
-            $"wasapiDiscontinuities={_wasapiDiscontinuities}, wasapiTimestampErrors={_wasapiTimestampErrors}";
+            $"wasapiDiscontinuities={_wasapiDiscontinuities}, wasapiTimestampErrors={_wasapiTimestampErrors}" +
+            (_captureMicrophone
+                ? $", mixPlaybackActive={_mixedPlaybackActive}, mixMicrophoneActive={_mixedMicrophoneActive}, " +
+                  $"mixPlaybackDroppedValues={_mixPlaybackDroppedValues}, mixMicrophoneDroppedValues={_mixMicrophoneDroppedValues}, " +
+                  $"mixPlaybackMissingValues={_mixPlaybackMissingValues}, mixMicrophoneMissingValues={_mixMicrophoneMissingValues}"
+                : string.Empty);
         _diagnosticSummary = summary;
         Plugin.Log!.Info($"[Audio] Signal diagnostics: {summary}");
         Diagnostics.RecordingDiagnosticLog.WriteIfEnabled("Audio", $"signal diagnostics: {summary}");
@@ -415,6 +717,84 @@ internal sealed class AudioCaptureService : IDisposable
     {
         Stop();
     }
+
+    private sealed class AutoConvertWasapiCapture : WasapiCapture
+    {
+        private readonly bool _loopback;
+
+        public AutoConvertWasapiCapture(MMDevice device, bool loopback)
+            : base(device, true, 20)
+        {
+            _loopback = loopback;
+        }
+
+        protected override AudioClientStreamFlags GetAudioClientStreamFlags()
+        {
+            AudioClientStreamFlags flags = AudioClientStreamFlags.AutoConvertPcm |
+                                           AudioClientStreamFlags.SrcDefaultQuality;
+            if (_loopback)
+                flags |= AudioClientStreamFlags.Loopback;
+            return flags;
+        }
+    }
+
+    private sealed class FloatRingBuffer
+    {
+        private readonly object _sync = new();
+        private readonly float[] _buffer;
+        private int _readIndex;
+        private int _count;
+
+        public FloatRingBuffer(int capacity)
+        {
+            _buffer = new float[Math.Max(1, capacity)];
+        }
+
+        public int Write(ReadOnlySpan<float> samples)
+        {
+            int dropped = 0;
+            lock (_sync)
+            {
+                foreach (float sample in samples)
+                {
+                    if (_count == _buffer.Length)
+                    {
+                        _readIndex = (_readIndex + 1) % _buffer.Length;
+                        _count--;
+                        dropped++;
+                    }
+
+                    int writeIndex = (_readIndex + _count) % _buffer.Length;
+                    _buffer[writeIndex] = float.IsFinite(sample) ? sample : 0f;
+                    _count++;
+                }
+            }
+
+            return dropped;
+        }
+
+        public int Read(Span<float> destination)
+        {
+            lock (_sync)
+            {
+                int readCount = Math.Min(destination.Length, _count);
+                for (int i = 0; i < readCount; i++)
+                {
+                    destination[i] = _buffer[_readIndex];
+                    _readIndex = (_readIndex + 1) % _buffer.Length;
+                }
+
+                _count -= readCount;
+                return readCount;
+            }
+        }
+    }
+
+    private readonly record struct ProcessLoopbackReader(
+        AudioCaptureClient Capture,
+        byte[] Buffer,
+        int BytesPerFrame,
+        int BufferFrameCount);
 
     private static async Task<AudioClient> ActivateProcessLoopbackAsync(int targetProcessId)
     {

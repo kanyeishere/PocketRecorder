@@ -10,6 +10,7 @@ internal sealed record RecordingRequest(
     int VideoBitrate,
     int TargetFps,
     AudioCaptureMode AudioCaptureMode,
+    bool CaptureMicrophone,
     string VideoCodec,
     string EncoderPreset,
     bool UseHardwareEncoder,
@@ -18,6 +19,8 @@ internal sealed record RecordingRequest(
     bool ForceFFmpegRecording,
     GameGraphicsDeviceProbeResult GameGraphicsDevice)
 {
+    public bool HasAudio => AudioCaptureMode != AudioCaptureMode.Off || CaptureMicrophone;
+
     public VideoFormat ToVideoFormat(VideoFrame frame)
     {
         VideoOutputDimensions output = GetOutputDimensions(frame.Width, frame.Height);
