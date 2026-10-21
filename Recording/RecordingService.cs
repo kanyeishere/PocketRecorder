@@ -23,8 +23,6 @@ internal sealed class RecordingService : IDisposable
     private readonly object _sync = new();
     private readonly SoftFpsGovernor _softFps;
     private readonly NativeRecorderStartupGate _nativeStartupGate = new();
-    private readonly VideoCaptureService _videoCaptureService;
-    private readonly CancellationTokenSource _presentHookWarmupCts = new();
 
     private VideoCaptureService? _videoCapture;
     private AudioCaptureService? _audioCapture;
@@ -45,8 +43,6 @@ internal sealed class RecordingService : IDisposable
     private bool _currentRecordingStarred;
     private RecordingTelemetryContext? _telemetryContext;
     private Action<RecordingFinishedEventArgs>? _finishedCallback;
-    private Thread? _presentHookWarmupThread;
-    private int _presentHookWarmupStarted;
 
     // 配置缓存（录制开始时快照）
     private int _videoWidth;
@@ -103,57 +99,6 @@ internal sealed class RecordingService : IDisposable
         _backendSelector = new RecordingBackendSelector(environment.Log);
         _finalizer = new RecordingFinalizer(environment.Log);
         _softFps = new SoftFpsGovernor(message => _environment.Log.Info(message));
-        _videoCaptureService = new VideoCaptureService(
-            _gameInterop,
-            OnVideoFrame,
-            ShouldCaptureVideoFrame);
-    }
-
-    public void StartPresentHookWarmup()
-    {
-        if (Interlocked.Exchange(ref _presentHookWarmupStarted, 1) != 0)
-            return;
-
-        _presentHookWarmupThread = new Thread(PresentHookWarmupWorker)
-        {
-            IsBackground = true,
-            Name = "Recorder-PresentHookWarmup",
-        };
-        _presentHookWarmupThread.Start();
-    }
-
-    private void PresentHookWarmupWorker()
-    {
-        const int maxAttempts = 20;
-        TimeSpan retryDelay = TimeSpan.FromMilliseconds(500);
-        Stopwatch sw = Stopwatch.StartNew();
-
-        for (int attempt = 1; attempt <= maxAttempts && !_presentHookWarmupCts.IsCancellationRequested; attempt++)
-        {
-            try
-            {
-                bool ready = Plugin.Framework
-                    .RunOnFrameworkThread(() => _videoCaptureService.PreinstallPresentHook())
-                    .GetAwaiter()
-                    .GetResult();
-
-                if (ready)
-                {
-                    _environment.Log.Info($"[Video] Present hook preinstalled disabled after {attempt} attempt(s), elapsed={sw.ElapsedMilliseconds}ms.");
-                    return;
-                }
-
-                if (attempt == 1 || attempt == maxAttempts)
-                    _environment.Log.Info($"[Video] Present hook preinstall attempt {attempt}/{maxAttempts} not ready.");
-            }
-            catch (Exception ex)
-            {
-                _environment.Log.Warning($"[Video] Present hook preinstall attempt {attempt}/{maxAttempts} failed: {ex.Message}");
-            }
-
-            if (_presentHookWarmupCts.Token.WaitHandle.WaitOne(retryDelay))
-                return;
-        }
     }
 
     public void ToggleRecording()
@@ -326,7 +271,13 @@ internal sealed class RecordingService : IDisposable
             audioCapture.Start();
         }
 
-        videoCapture = _videoCaptureService;
+        // Resolve and hook the live Present chain for each recording. Keeping a disabled
+        // hook installed across sessions can retain a stale ReShade/overlay trampoline and
+        // later restore the wrong target when another capture provider changes the chain.
+        videoCapture = new VideoCaptureService(
+            _gameInterop,
+            OnVideoFrame,
+            ShouldCaptureVideoFrame);
         videoCapture.IncludeOverlay = request.IncludeOverlay;
         videoCapture.PreferD3D11TextureFrames = backendPlan.PrefersD3D11TextureFrames;
 
@@ -336,7 +287,7 @@ internal sealed class RecordingService : IDisposable
             {
                 audioCapture?.Stop();
                 audioCapture?.Dispose();
-                videoCapture.Stop();
+                videoCapture.Dispose();
                 return false;
             }
 
@@ -357,7 +308,7 @@ internal sealed class RecordingService : IDisposable
                 }
             }
 
-            try { videoCapture.Stop(); } catch { }
+            DisposeVideoCapture(videoCapture);
             StopAndDisposeAudioCapture(audioCapture);
 
             _environment.Log.Warning("[Record] Video capture could not start; recording aborted.");
@@ -992,7 +943,7 @@ internal sealed class RecordingService : IDisposable
         try { videoCapture?.RequestStop(); } catch { }
         var job = new RecordingFinalizationJob(
             videoCapture,
-            DisposeVideoCapture: false,
+            DisposeVideoCapture: true,
             audioCapture,
             writer,
             outputPath,
@@ -1042,6 +993,7 @@ internal sealed class RecordingService : IDisposable
         }
 
         try { videoCapture?.Stop(); } catch { }
+        DisposeVideoCapture(videoCapture);
         StopAndDisposeAudioCapture(audioCapture);
         AmdRecordingDiagnosticLog.FinishSession("start aborted");
         RecordingDiagnosticLog.FinishSession("start aborted");
@@ -1116,13 +1068,14 @@ internal sealed class RecordingService : IDisposable
         try { audioCapture?.Dispose(); } catch { }
     }
 
+    private static void DisposeVideoCapture(VideoCaptureService? videoCapture)
+    {
+        try { videoCapture?.Dispose(); } catch { }
+    }
+
     public void Dispose()
     {
         StopRecording(waitForFinalize: true);
-        _presentHookWarmupCts.Cancel();
-        try { _presentHookWarmupThread?.Join(1_000); } catch { }
-        _videoCaptureService.Dispose();
-        _presentHookWarmupCts.Dispose();
     }
 }
 

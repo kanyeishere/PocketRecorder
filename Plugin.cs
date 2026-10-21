@@ -74,7 +74,6 @@ public sealed class Plugin : IDalamudPlugin
 
         StartBackgroundWarmup();
         GameGraphicsDeviceProbeCache.StartWarmup();
-        RecordingService.StartPresentHookWarmup();
         PocketBackendClient.QueueHeartbeat("startup", new
         {
             targetFps = Config.TargetFps,
