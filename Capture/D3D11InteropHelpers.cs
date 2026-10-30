@@ -89,7 +89,7 @@ internal static unsafe class D3D11InteropHelpers
                 return false;
             }
 
-            adapterInfo = new D3D11AdapterInfo(
+            D3D11AdapterInfo reportedAdapterInfo = new(
                 desc.VendorId,
                 desc.DeviceId,
                 desc.SubSysId,
@@ -97,6 +97,28 @@ internal static unsafe class D3D11InteropHelpers
                 ReadAdapterDescription(desc),
                 desc.AdapterLuidHighPart,
                 desc.AdapterLuidLowPart);
+
+            // A DXGI proxy may spoof the adapter description. Treat only its LUID as
+            // identity, then read the canonical description from the System32 factory.
+            if (!TryFindSystemAdapterByLuid(
+                    reportedAdapterInfo,
+                    out IntPtr systemAdapterPtr,
+                    out D3D11AdapterInfo systemAdapterInfo,
+                    out string findError))
+            {
+                error = $"Could not resolve the game D3D11 device through its adapter LUID: {findError}";
+                return false;
+            }
+
+            try
+            {
+                adapterInfo = systemAdapterInfo;
+            }
+            finally
+            {
+                Marshal.Release(systemAdapterPtr);
+            }
+
             return true;
         }
         finally
