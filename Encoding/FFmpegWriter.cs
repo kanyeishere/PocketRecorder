@@ -45,8 +45,6 @@ internal sealed class FFmpegWriter : IOutputSink
     private Thread? _audioWriterThread;
     private const int MaxQueueSize = 10; // 限制队列深度，避免内存暴涨
     private const int MaxAudioQueueSize = 100;
-    private const int VideoInputThreadQueueSize = 32;
-    private const int AudioInputThreadQueueSize = 512;
     private const int NativeCopyPressureWindowMs = 1_000;
 
     private readonly string _ffmpegPath;
@@ -106,7 +104,6 @@ internal sealed class FFmpegWriter : IOutputSink
 
         // ── 视频输入：stdin rawvideo ──
         args.Add("-use_wallclock_as_timestamps"); args.Add("1");
-        args.Add("-thread_queue_size"); args.Add(VideoInputThreadQueueSize.ToString(CultureInfo.InvariantCulture));
         args.Add("-rtbufsize"); args.Add("200M");
         args.Add("-f"); args.Add("rawvideo");
         args.Add("-pix_fmt"); args.Add(GetFFmpegPixelFormat(video.PixelFormat));
@@ -142,7 +139,6 @@ internal sealed class FFmpegWriter : IOutputSink
             args.Add("-f"); args.Add(audioFmt);
             args.Add("-ar"); args.Add($"{audio.SampleRate}");
             args.Add("-ac"); args.Add($"{audio.Channels}");
-            args.Add("-thread_queue_size"); args.Add(AudioInputThreadQueueSize.ToString(CultureInfo.InvariantCulture));
             args.Add("-i"); args.Add($"\\\\.\\pipe\\{pipeName}");
 
             Plugin.Log!.Info($"[FFmpeg] Audio: {audioFmt} {audio.SampleRate}Hz {audio.Channels}ch");

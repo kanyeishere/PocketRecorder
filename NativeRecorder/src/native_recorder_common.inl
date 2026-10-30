@@ -563,8 +563,14 @@ HRESULT find_adapter_by_vendor(UINT vendor_id, std::string* adapter_name, IDXGIA
     if (adapter_out != nullptr)
         *adapter_out = nullptr;
 
+    auto create_factory = get_system_create_dxgi_factory1();
+    if (create_factory == nullptr)
+        return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+
     ComPtr<IDXGIFactory1> factory;
-    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    HRESULT hr = create_factory(
+        __uuidof(IDXGIFactory1),
+        reinterpret_cast<void**>(factory.GetAddressOf()));
     if (FAILED(hr))
         return hr;
 
@@ -708,19 +714,35 @@ HRESULT get_device_adapter_info(
     if (FAILED(hr))
         return hr;
 
-    DXGI_ADAPTER_DESC desc{};
-    hr = adapter->GetDesc(&desc);
+    DXGI_ADAPTER_DESC reported_desc{};
+    hr = adapter->GetDesc(&reported_desc);
+    if (FAILED(hr))
+        return hr;
+
+    // A DXGI proxy may spoof the adapter description. Resolve the LUID through
+    // the System32 factory before choosing a vendor-specific encoder backend.
+    std::string system_adapter_name;
+    ComPtr<IDXGIAdapter> system_adapter;
+    hr = find_system_adapter_by_luid(
+        reported_desc.AdapterLuid,
+        &system_adapter_name,
+        &system_adapter);
+    if (FAILED(hr) || !system_adapter)
+        return FAILED(hr) ? hr : DXGI_ERROR_NOT_FOUND;
+
+    DXGI_ADAPTER_DESC system_desc{};
+    hr = system_adapter->GetDesc(&system_desc);
     if (FAILED(hr))
         return hr;
 
     if (vendor_id != nullptr)
-        *vendor_id = desc.VendorId;
+        *vendor_id = system_desc.VendorId;
     if (adapter_name != nullptr)
-        *adapter_name = wide_to_utf8(desc.Description);
+        *adapter_name = system_adapter_name;
     if (adapter_luid != nullptr)
-        *adapter_luid = desc.AdapterLuid;
+        *adapter_luid = system_desc.AdapterLuid;
     if (adapter_out != nullptr)
-        *adapter_out = adapter.Detach();
+        *adapter_out = system_adapter.Detach();
 
     return S_OK;
 }
